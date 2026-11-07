@@ -57,7 +57,8 @@ jobs:
           rustup toolchain install "$rust" --profile minimal
           mkdir -p .tools/rust
           ln -s "$(dirname "$(rustup which --toolchain "$rust" cargo)")" .tools/rust/bin
-          CARGO_HOME="$GITHUB_WORKSPACE/.cache/cargo" .tools/rust/bin/cargo install --locked \
+          export PATH="$GITHUB_WORKSPACE/.tools/rust/bin:$PATH"
+          CARGO_HOME="$GITHUB_WORKSPACE/.cache/cargo" cargo install --locked \
             --git https://github.com/horizon-rust/horizon-mixins.git --rev "$mixins" \
             --root "$RUNNER_TEMP/horizon-mixins" horizon-mixins-cli
           echo "mixins=$mixins" >> "$GITHUB_OUTPUT"
