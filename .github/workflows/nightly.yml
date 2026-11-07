@@ -1,0 +1,87 @@
+name: Horizon Nightly compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horizon-nightly-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build on Horizon Nightly (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve the published Nightly
+        id: nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          revision="$(gh api repos/horizon-rust/horizon/releases/tags/nightly --jq .target_commitish)"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The Nightly release does not identify a full Horizon commit."
+            exit 1
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          printf 'Building Create against Horizon Nightly `%s`.\n' "$revision" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@v4
+        with:
+          repository: horizon-rust/horizon
+          ref: ${{ steps.nightly.outputs.revision }}
+          path: .local/nightly-source
+          persist-credentials: false
+      - name: Set up Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev pkg-config
+      - name: Install Rust and the pinned Horizon Mixins
+        id: toolchain
+        run: |
+          rust="$(jq -er .rust_version compatibility.json)"
+          mixins="$(jq -er .horizon_mixins_revision compatibility.json)"
+          rustup toolchain install "$rust" --profile minimal
+          mkdir -p .tools/rust
+          ln -s "$(dirname "$(rustup which --toolchain "$rust" cargo)")" .tools/rust/bin
+          CARGO_HOME="$GITHUB_WORKSPACE/.cache/cargo" .tools/rust/bin/cargo install --locked \
+            --git https://github.com/horizon-rust/horizon-mixins.git --rev "$mixins" \
+            --root "$RUNNER_TEMP/horizon-mixins" horizon-mixins-cli
+          echo "mixins=$mixins" >> "$GITHUB_OUTPUT"
+      - name: Build the native client with Create
+        env:
+          MIXINS_REVISION: ${{ steps.toolchain.outputs.mixins }}
+        run: |
+          if ! python3 tools/dev_build.py --horizon .local/nightly-source \
+            --mixins "$RUNNER_TEMP/horizon-mixins/bin/horizon-mixins" \
+            --mixins-revision "$MIXINS_REVISION" --base nightly --online; then
+            for log in .local/dev-native-*/{mixins,cargo}.log; do
+              if [[ -f "$log" ]]; then tail -n 60 "$log"; fi
+            done
+            exit 1
+          fi
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-nightly-build-logs
+          path: |
+            .local/dev-native-*/result.json
+            .local/dev-native-*/mixins.log
+            .local/dev-native-*/cargo.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
