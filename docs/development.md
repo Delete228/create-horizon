@@ -20,6 +20,14 @@ Run `python3 tools/content.py` after editing generated content. To compare
 behavior with Java, check out the pinned Create source at `../Create` or set
 `CREATE_SOURCE`, then run the relevant `tools/*_oracle.py` check with a JDK.
 
+[Rust core](../.github/workflows/core.yml) runs the standalone tests, Clippy
+and Java behavior oracles on pushes and pull requests.
+[Horizon Nightly compatibility](../.github/workflows/nightly.yml) builds the
+native client with Create against the latest published Nightly on pull requests
+to `main`, pushes to `main`, a daily schedule, or from the Actions tab.
+The job records the exact Horizon commit and keeps build logs for seven days.
+It builds with the bundled resources and does not need a Create JAR.
+
 To build the native client, use the pinned Horizon and Mixins checkouts with
 `python3 tools/dev_build.py --help`. For a distributable archive, run
 `python3 tools/package.py --cli /path/to/cargo-horizon-mod` with the pinned
