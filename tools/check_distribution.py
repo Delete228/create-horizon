@@ -31,12 +31,18 @@ def main():
     missing_models = required - actual.keys()
     assert not missing_models, "Missing built-in models: " + ", ".join(sorted(missing_models))
     for block in BLOCKS:
-        item = json.loads(actual[model_prefix + f'item/{block}.json'])
-        rotation = item['display']['gui']['rotation']
+        display = json.loads(actual[model_prefix + f'item/{block}.json'])['display']
+        rotation = display['gui']['rotation']
         assert rotation[0] % 90 and rotation[1] % 90, (block, rotation)
-        ground = item['display']['ground']
-        expected_scale = .1 if block == 'large_water_wheel' else .25
-        assert ground['scale'] == [expected_scale] * 3, (block, ground)
+        large_wheel = block == 'large_water_wheel'
+        scales = {
+            'ground': .1 if large_wheel else .25,
+            'firstperson_righthand': .18 if large_wheel else .4,
+            'firstperson_lefthand': .18 if large_wheel else .4,
+            'thirdperson_righthand': .12 if large_wheel else .375,
+        }
+        for context, scale in scales.items():
+            assert display[context]['scale'] == [scale] * 3, (block, context, display[context])
     textures = set()
     for name, text in actual.items():
         if name.startswith(model_prefix) and name.endswith(".json"):

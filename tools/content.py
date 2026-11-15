@@ -44,9 +44,18 @@ def write(path, value):
         display.setdefault("gui", {
             "rotation": [30, 225, 0], "scale": [.625, .625, .625],
         })
-        # Create's block items inherit the ground transform from minecraft:block/block.
+        # Create's block items inherit these transforms from minecraft:block/block.
         # The independent models can end their parent chain before that template.
         display.setdefault("ground", {"translation": [0, 3, 0], "scale": [.25, .25, .25]})
+        display.setdefault("firstperson_righthand", {
+            "rotation": [0, 45, 0], "scale": [.4, .4, .4],
+        })
+        display.setdefault("firstperson_lefthand", {
+            "rotation": [0, 225, 0], "scale": [.4, .4, .4],
+        })
+        display.setdefault("thirdperson_righthand", {
+            "rotation": [75, 45, 0], "translation": [0, 2.5, 0], "scale": [.375, .375, .375],
+        })
     target = CONTENT / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
