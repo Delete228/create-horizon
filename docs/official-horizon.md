@@ -1,16 +1,14 @@
 # Official Horizon compatibility
 
-Create 0.9.0 builds on the unmodified official Horizon commit `4e5296d`
-with Minecraft 26.3 resources. It was built with the pinned Horizon Mixins
-tool. The native client loaded both resource sets, restored a lit Blaze
-Burner after restart, and matched the Java reference across 460 ticks of
-Precision Mechanism assembly, including a restart after operation seven.
-[Pinned source](https://github.com/horizon-rust/horizon/commit/4e5296d1800b3f89f2ae48dfd99d431801df4d46)
+Create 0.9.0 pins the November 13 Horizon Nightly (`9f42064`) with Minecraft
+26.3 resources. The earlier November 8 Nightly (`fdc87ae`) preceded #11098,
+#11116, and #11068, which are all in the November 13 source.
+[Pinned Nightly source](https://github.com/horizon-rust/horizon/tree/nightly-source/2026-11-13-9f42064)
 
-The official Nightly tagged `nightly-source/2026-11-08-fdc87ae` precedes
-#11098, #11116 and #11068. Applying the full mod to that source fails at
-`native_stateful_block_entity`. All three changes are in the 0.9.0 pin.
-[Nightly source](https://github.com/horizon-rust/horizon/tree/nightly-source/2026-11-08-fdc87ae)
+On the earlier preview at `4e5296d`, the native client loaded both resource
+sets, restored a lit Blaze Burner after restart, and matched the Java
+reference across 460 ticks of Precision Mechanism assembly, including a
+restart after operation seven.
 
 ## Merged engine changes
 

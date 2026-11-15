@@ -5,6 +5,7 @@
 fn create_crafter_hopper_eject(
     game: &mut crate::game::Game<'_>,
     pos: (i32, i32, i32),
+    state: horizon_world::registry::BlockStateId,
     hopper: &crate::game::machines::View,
 ) -> std::ops::ControlFlow<bool> {
     use crate::containers::ModContainer;
@@ -14,7 +15,6 @@ fn create_crafter_hopper_eject(
     if !game.native_on("create") {
         return ControlFlow::Continue(());
     }
-    let state = game.world.block(pos.0, pos.1, pos.2);
     let Some(facing) = game
         .containers()
         .prop(state, "facing")

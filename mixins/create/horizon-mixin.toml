@@ -3,7 +3,7 @@ id = "create"
 version = "0.9.0"
 
 [compatibility]
-horizon_revision = "4e5296d1800b3f89f2ae48dfd99d431801df4d46"
+horizon_revision = "9f42064c11efe7ef3e5ed2baad7ddc2a3b36eea0"
 
 [[crate]]
 id = "engine"
@@ -224,18 +224,8 @@ bindings = [
 
 [[injection]]
 id = "local-assets"
-target = "horizon_client::game::resource_load::load_resources"
-kind = "HEAD"
-helper = "assets_startup.rs"
-bindings = [{ name = "root", ty = "&mut std::path::PathBuf", value = "&mut root" }]
-
-[[injection]]
-id = "local-assets-reload"
-target = "horizon_client::game::packs::stage_pack"
-kind = "MODIFY_VARIABLE"
-variable = { name = "root", ordinal = 1, at = "STORE" }
-require = 1
-ordinal = 0
+target = "horizon_client::game::mods::content_root"
+kind = "RETURN"
 helper = "assets_root.rs"
 bindings = [
   { name = "root", ty = "std::path::PathBuf", value = "$value" },
@@ -918,7 +908,7 @@ bindings = [
 # Include tank edits from this tick in the normal level attachment save.
 [[injection]]
 id = "fluid-tank-before-save"
-target = "horizon_client::game::Game<'_>::save_level"
+target = "horizon_client::game::saving::Game<'_>::save_level"
 kind = "HEAD"
 helper = "fluid_tank_before_save.rs"
 bindings = [{name="game",ty="&mut crate::game::Game<'_>",value="&mut *self"}]
@@ -1504,7 +1494,7 @@ bindings = [
 
 [[injection]]
 id = "transmission-next-tick"
-target = "horizon_client::game::Game<'_>::tick_blocks"
+target = "horizon_client::game::block_ticks::Game<'_>::tick_blocks"
 kind = "HEAD"
 helper = "transmission_tick.rs"
 bindings = [
@@ -1565,13 +1555,14 @@ source = "portable_storage_runtime.rs"
 # Connected Crafter inputs choose one physical slot before vanilla ejectItems.
 [[injection]]
 id = "crafter-linked-hopper"
-target = "horizon_client::game::machines::Game<'_>::hopper_eject"
+target = "horizon_client::game::machines::Game<'_>::hopper_eject_with_state"
 kind = "HEAD"
 cancellable = true
 helper = "crafter_linked_hopper.rs"
 bindings = [
  {name="game",ty="&mut crate::game::Game<'_>",value="&mut *self"},
  {name="pos",ty="(i32,i32,i32)",value="pos"},
+ {name="state",ty="horizon_world::registry::BlockStateId",value="state"},
  {name="hopper",ty="&crate::game::machines::View",value="hopper"},
 ]
 
@@ -1773,7 +1764,7 @@ source = "contraption_item_motion.rs"
 
 [[injection]]
 id = "contraption-item-motion-tick"
-target = "horizon_client::game::Game<'_>::tick_items"
+target = "horizon_client::game::item_entities::Game<'_>::tick_items"
 kind = "WRAP_OPERATION"
 selector = "self.tick_dropped_items"
 ordinal = 0

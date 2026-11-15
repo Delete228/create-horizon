@@ -26,12 +26,11 @@ Captured in Horizon 26.3 with the built-in models and textures.
 
 ## Install
 
-1. Create a Horizon instance for Minecraft 26.3.
+1. Create a Horizon instance with Nightly `9f42064` for Minecraft 26.3.
 2. Open **Mods → Add from GitHub** and enter `https://github.com/Delete228/create-horizon/tree/main`.
 3. Build the native mod, then start the instance.
 
-The **0.9.0** source build pins official Horizon commit `4e5296d`. Nightly
-`fdc87ae` predates the stateful block-entity and state-dependent light changes.
+The **0.9.0** source build pins the official Horizon Nightly from November 13.
 The Horizon registry has its own published version.
 [Installation guide](docs/installation.md) · [Registry listing](https://playhorizon.dev/mods/create)
 

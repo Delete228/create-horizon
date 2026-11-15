@@ -257,9 +257,16 @@ fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<Cont
         carrier.shapes().iter().copied(),
         0.0,
     );
-    if (!response.surface && response.separation == [0.0; 3] && response.impact_fraction == 1.0)
-        || item.inside_block(&game.world, game.collision)
-    {
+    if !response.surface && response.separation == [0.0; 3] && response.impact_fraction == 1.0 {
+        return None;
+    }
+    let entities = carrier.obstacles.get_or_init(|| {
+        with_collision_filter((Some(record.controller), false), || {
+            game.item_entity_collisions()
+        })
+    });
+    let border = game.border.geometry();
+    if item.inside_block(&game.world, game.collision, entities, Some(border)) {
         return None;
     }
     if carrier.has_slime
@@ -276,11 +283,6 @@ fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<Cont
     if !response.surface && response.separation == [0.0; 3] {
         return None;
     }
-    let entities = carrier.obstacles.get_or_init(|| {
-        with_collision_filter((Some(record.controller), false), || {
-            game.item_entity_collisions()
-        })
-    });
     let mut world = EntityCollisions {
         blocks: SceneCollisions {
             world: &game.world,
@@ -288,7 +290,7 @@ fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<Cont
             subject: None,
         },
         entities,
-        border: Some((game.border.geometry(), [item.position.x, item.position.z])),
+        border: Some((border, [item.position.x, item.position.z])),
     };
     let mut position = item.position;
     let context = CollisionContext::for_entity(
