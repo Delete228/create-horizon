@@ -8,7 +8,7 @@ use super::create_port_block_entity_revision::EntityRevision as _;
 use super::create_port_basin_recipes::Recipe;
 use super::{Game, create_port_basin as basin, native_block_entity_draw::BlockEntityDraw};
 use crate::containers::{BlockEntity, ModBlockEntity, ModRevision};
-use create_engine::{basin as rules, kinetics::Axis, transport::SessionCache};
+use create_engine::{basin as rules, fluid_transport::Fluid, kinetics::Axis, transport::SessionCache};
 use horizon_client::random_source;
 use horizon_client_render::sound_engine::{SoundInstance, Sounds};
 use horizon_core::random::RandomSource;
@@ -329,7 +329,11 @@ pub(super) fn draw(
     true
 }
 pub(super) fn client_tick(game: &mut Game<'_>) {
-    if !game.native_window() || game.remote.is_none() || !game.native_on("create") {
+    if !game.native_window()
+        || game.remote.is_none()
+        || !game.native_on("create")
+        || !game.clock.runs_normally()
+    {
         return;
     }
     let time = game.world.game_time;
@@ -415,33 +419,95 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
                 game.audio.play_instance(sound, false);
             }
         }
-        let stacks = basin::read(game, [pos[0], pos[1] - 2, pos[2]])
-            .map(|b| {
-                b.input
-                    .iter()
-                    .chain(&b.output)
-                    .flatten()
-                    .filter(|s| s.count > 0)
-                    .map(basin::native_stack)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for stack in stacks {
-            let angle = game.particles.level_random().next_float() * 360.0;
-            let offset = rotate_y([0.0, 0.0, 0.25], angle);
-            let mut target = rotate_y(offset, if rpm > 0.0 { 25.0 } else { -25.0 });
-            target[1] += 0.25;
-            let velocity = std::array::from_fn(|i| {
-                target[i] - offset[i]
-                    + f64::from((game.particles.level_random().next_float() - 0.5) * 2.0 / 128.0)
-            });
-            let center = [
-                f64::from(pos[0]) + 0.5 + offset[0],
-                f64::from(pos[1]) + 0.5 + offset[1] - 1.75,
-                f64::from(pos[2]) + 0.5 + offset[2],
-            ];
+        let Some((items, fluids)) =
+            basin::mixer_particle_contents(game, [pos[0], pos[1] - 2, pos[2]])
+        else {
+            continue;
+        };
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        let trace =
+            *TRACE.get_or_init(|| std::env::var_os("CREATE_HORIZON_PARTICLE_TRACE").is_some());
+        for stack in items {
+            let (at, motion) = spill(game, pos, rpm);
             let options = game.item_particle(&stack);
-            game.particles.add(&options, center, velocity);
+            let previous = trace.then(|| {
+                game.particles
+                    .made()
+                    .get(options.ty.name())
+                    .copied()
+                    .unwrap_or(0)
+            });
+            game.particles.add(&options, at, motion);
+            if let Some(previous) = previous {
+                let accepted = game
+                    .particles
+                    .made()
+                    .get(options.ty.name())
+                    .copied()
+                    .unwrap_or(0)
+                    > previous;
+                let sprite = options.item.as_deref().and_then(|sprites| sprites.first());
+                log::info!(
+                    "Create mixer particle: {}",
+                    serde_json::json!({
+                        "tick": time, "position": at, "velocity": motion,
+                        "fluid": false, "accepted": accepted, "sprite": sprite,
+                    })
+                );
+            }
+        }
+        for fluid in fluids.into_iter().flatten() {
+            let (at, motion) = spill(game, pos, rpm);
+            let (sprite, tint, luminous) = match fluid {
+                Fluid::Water => ("block/water_still", 0x3f76e4, false),
+                Fluid::Lava => ("block/lava_still", 0xffffff, true),
+                _ => {
+                    let Some((sprite, tint)) =
+                        super::create_port_fluid_render::custom_style(game, fluid)
+                    else {
+                        continue;
+                    };
+                    (sprite, tint, false)
+                }
+            };
+            let particle =
+                horizon_client_render::particles::create_fluid_jet::nearby_sprite_particle(
+                    &mut game.particles,
+                    at,
+                    motion,
+                    sprite,
+                    tint,
+                    luminous,
+                );
+            if trace {
+                let quad = particle
+                    .as_ref()
+                    .and_then(|p| game.particles.snapshot(p).quad);
+                log::info!(
+                    "Create mixer particle: {}",
+                    serde_json::json!({
+                        "tick": time, "position": at, "velocity": motion, "fluid": true,
+                        "accepted": particle.is_some(), "sprite": quad.as_ref().map(|q| &q.sprite),
+                        "rgba": quad.map(|q| q.rgba),
+                    })
+                );
+            }
+            if let Some(particle) = particle {
+                game.particles.push(particle);
+            }
         }
     }
+}
+
+fn spill(game: &mut Game<'_>, pos: Pos, rpm: f32) -> ([f64; 3], [f64; 3]) {
+    let random = game.particles.level_random();
+    let offset = rotate_y([0.0, 0.0, 0.25], random.next_float() * 360.0);
+    let mut target = rotate_y(offset, if rpm > 0.0 { 25.0 } else { -25.0 });
+    target[1] += 0.25;
+    let motion = std::array::from_fn(|i| {
+        target[i] - offset[i] + f64::from((random.next_float() - 0.5) * 2.0 / 128.0)
+    });
+    let mut at = std::array::from_fn(|i| f64::from(pos[i]) + 0.5 + offset[i]);
+    at[1] -= 1.75;
+    (at, motion)
 }

@@ -5,6 +5,7 @@
 use super::{Game, create_port_chassis as chassis, create_port_chute as chute};
 use crate::containers::{BlockEntity, ModBlockEntity};
 use create_engine::contraption::chassis::MAX_RANGE;
+use horizon_client::mod_api::NativeServerPlayer;
 use horizon_world::nbt::Tag;
 use std::{cell::RefCell, path::PathBuf};
 
@@ -105,14 +106,38 @@ enum Setting {
     },
 }
 impl Setting {
-    fn allowed(self, game: &mut Game<'_>, player: u128, pos: [i32; 3]) -> bool {
-        match self {
-            Self::Motor { .. } => game.create_motor_configuration_allowed(player, pos),
-            Self::Motion { .. } | Self::FilterAmount { .. } | Self::FilterTap { .. } => {
-                game.create_value_configuration_allowed(player, pos, false)
-            }
-            Self::Chassis { .. } => game.create_value_configuration_allowed(player, pos, true),
+    fn allowed(self, game: &mut Game<'_>, player: &NativeServerPlayer, pos: [i32; 3]) -> bool {
+        if player.health <= 0.0
+            || !matches!(player.game_mode, 0 | 1)
+            || (self.filter() && player.sneaking)
+            || (matches!(self, Self::Chassis { .. })
+                && !game
+                    .native_held_stack(player.uuid)
+                    .is_some_and(|stack| chassis::wrench(game, &stack)))
+        {
+            return false;
         }
+        // The integrated server can retain the owner's UUID in level.dat
+        // without having that player's live body in place. Read the joined
+        // server player and their attributes without swapping player bodies.
+        let mut eye = player.position;
+        eye[1] += f64::from(player.eye_height);
+        let reach = game
+            .native_attribute(player.uuid, "minecraft:block_interaction_range")
+            .map_or(
+                if player.game_mode == 1 { 5.0 } else { 4.5 },
+                |(_, value)| value,
+            );
+        let distance_squared: f64 = eye
+            .into_iter()
+            .zip(pos)
+            .map(|(eye, coordinate)| {
+                let min = f64::from(coordinate);
+                (eye - eye.clamp(min, min + 1.0)).powi(2)
+            })
+            .sum();
+        // Create's BlockEntityConfigurationPacket uses canInteractWithBlock(pos, 20).
+        distance_squared < (reach + 20.0).powi(2)
     }
 
     fn filter(self) -> bool {
@@ -204,7 +229,7 @@ pub(super) fn receive(game: &mut Game<'_>, player: u128, channel: &str, data: &[
     else {
         return;
     };
-    if (setting.filter() && p.sneaking) || !setting.allowed(game, player, pos) {
+    if !setting.allowed(game, &p, pos) {
         return;
     }
     REQUESTS.with_borrow_mut(|requests| {
@@ -249,10 +274,7 @@ pub(super) fn level_tick(game: &mut Game<'_>) {
         else {
             continue;
         };
-        if setting.filter() && actor.sneaking {
-            continue;
-        }
-        if !setting.allowed(game, player, pos) || !game.world.loaded(pos[0], pos[2]) {
+        if !setting.allowed(game, actor, pos) || !game.world.loaded(pos[0], pos[2]) {
             continue;
         }
         match setting {

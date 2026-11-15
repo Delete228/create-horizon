@@ -1,12 +1,18 @@
 // Copyright (c) 2026 create-horizon contributors
 // SPDX-License-Identifier: MIT
 
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+};
 
-use super::{Game, create_port_contraption::mirror_sync};
+use super::{
+    Game, create_port_contraption::mirror_sync,
+    create_port_contraption_item_motion::{SLIME_BLOCK, upright_slime_bounce},
+};
 use create_engine::{
     contraption::{
-        Rotation,
+        Rotation, cargo_bounds,
         contact::{
             ContactBox, linear_face_separation, linear_overlap_response, linear_top_motion,
             rotary_top_motion,
@@ -17,8 +23,8 @@ use create_engine::{
 };
 use horizon_client::collisions::{EntityCollisions, LookupCollisions, SceneCollisions};
 use horizon_client_render::create_contraption_scene::{
-    KEY, POSE_KEY, Pos, Record, dry_slab_type, dry_straight_stair, full_cube_payload, read,
-    upright_side_payload,
+    KEY, POSE_KEY, Pos, Record, dry_slab_type, dry_straight_stair, full_cube_payload,
+    payload_collision_shape, read, upright_side_payload,
 };
 use horizon_core::geometry::{Aabb, Vec3};
 use horizon_world::{
@@ -37,6 +43,8 @@ struct ContactClip {
 thread_local! {
     static CONTACT_CLIP: Cell<Option<ContactClip>> = const { Cell::new(None) };
     static PENDING: RefCell<Vec<Transition>> = const { RefCell::new(Vec::new()) };
+    static RIDER_ROTORS: RefCell<BTreeMap<Pos, RotorContact>> = const { RefCell::new(BTreeMap::new()) };
+    static DEFERRED: RefCell<Option<DeferredContact>> = const { RefCell::new(None) };
     static INTERPOLATION: Cell<Option<Interpolation>> = const { Cell::new(None) };
 }
 
@@ -55,19 +63,92 @@ struct Transition {
     current: Vec<Record>,
 }
 
+struct DeferredContact {
+    tick: u64,
+    before_move: Vec3,
+    rotors: Vec<RotorContact>,
+}
+
+#[derive(Clone)]
+struct RotorContact {
+    from: f32,
+    record: Record,
+    bounds: Option<Aabb>,
+}
+
+impl RotorContact {
+    fn new(record: Record, previous: Option<&Record>) -> Self {
+        let from = previous
+            .filter(|previous| {
+                previous.same_geometry(&record) && previous.angle == record.previous_angle
+            })
+            .map_or(record.angle, |previous| previous.angle);
+        Self {
+            from,
+            bounds: Self::bounds(&record),
+            record,
+        }
+    }
+
+    fn begin_tick(&mut self) {
+        // In the absence of a new pose, keep the same collision hull without
+        // replaying the last transfer.
+        self.from = self.record.angle;
+    }
+
+    fn receive(&mut self, record: Record, previous: Option<&Record>) {
+        let same = self.record.same_geometry(&record);
+        let duplicate = same && self.record.angle == record.angle;
+        let continuous = same
+            && previous.is_some_and(|previous| {
+                self.record.angle == previous.angle
+                    && previous.angle == record.previous_angle
+                    && previous.same_geometry(&record)
+            });
+        if !duplicate && !continuous {
+            // A replacement snapshot or a discontinuity supplies support at
+            // its new pose. It supplies no trustworthy transfer path.
+            self.from = record.angle;
+        }
+        if !same {
+            self.bounds = Self::bounds(&record);
+        }
+        self.record = record;
+    }
+
+    fn bounds(record: &Record) -> Option<Aabb> {
+        let axis = [Axis::X, Axis::Y, Axis::Z][record.axis];
+        let [min, max] = cargo_bounds::local_bounds(
+            record.blocks.iter().map(|(local, _)| *local),
+            cargo_bounds::Motion::Rotary(axis),
+        )?;
+        let world = |point: [f64; 3]| {
+            let [x, y, z] = std::array::from_fn(|i| point[i] + f64::from(record.anchor[i]));
+            Vec3::new(x, y, z)
+        };
+        Some(
+            Aabb::new(world(min), world(max))
+                .inflate(Vec3::new(2.0, 2.0, 2.0))
+                .expand_towards(Vec3::new(0.0, 32.0, 0.0)),
+        )
+    }
+}
+
 enum Contact {
     Carry([f64; 3], Option<Pos>),
     Push([f64; 3], Option<Pos>),
+    Bounce(Vec3),
     Tilted {
         response: RotaryContact,
-        previous: Rotation,
-        current: Rotation,
+        transforms: Option<(Rotation, Rotation)>,
         controller: Pos,
     },
 }
 
 pub(super) fn reset() {
     PENDING.with(|queue| queue.borrow_mut().clear());
+    RIDER_ROTORS.with(|rotors| rotors.borrow_mut().clear());
+    DEFERRED.set(None);
     INTERPOLATION.set(None);
 }
 
@@ -96,6 +177,44 @@ pub(super) fn player_collision_filter(game: &Game<'_>) -> (Option<Pos>, Option<A
             .bounds(player.position)
     });
     (None, standing)
+}
+
+pub(super) fn suppress_ordinary_collision(game: &Game<'_>, record: &Record) -> bool {
+    if game.remote.is_none()
+        || CONTACT_CLIP.get().is_some()
+        || (record.axis == Axis::Y.index() && !game.clock.runs_normally())
+    {
+        return false;
+    }
+    DEFERRED.with(|deferred| {
+        deferred.borrow().as_ref().is_some_and(|deferred| {
+            deferred.tick == game.ticks
+                && deferred
+                    .rotors
+                    .binary_search_by_key(&record.controller, |rotor| rotor.record.controller)
+                    .ok()
+                    .is_some_and(|index| {
+                        let current = &deferred.rotors[index].record;
+                        current.angle == record.angle && current.same_geometry(record)
+                    })
+        })
+    })
+}
+
+fn exact_rider_rotor(record: &Record) -> bool {
+    record.stroke.is_none()
+        && record.clock_hand.is_none()
+        && !record.return_home
+        && if record.axis == Axis::Y.index() {
+            // The centered Slime payload uses exact impact response without
+            // changing contact on the larger standing-platform path.
+            matches!(record.blocks.as_ref(), [([0, 0, 0], state)] if state.name == SLIME_BLOCK)
+        } else {
+            record
+                .blocks
+                .iter()
+                .all(|(_, state)| full_cube_payload(state))
+        }
 }
 
 fn entity_collisions(game: &Game<'_>, excluded_controller: Option<Pos>) -> Vec<Aabb> {
@@ -139,9 +258,15 @@ pub(super) fn sync(game: &mut Game<'_>, data: &[u8]) {
 
 pub(super) fn begin_tick(game: &mut Game<'_>) {
     let pending = PENDING.take();
+    DEFERRED.set(None);
     let Some(before) = local_contact_player(game).map(|player| player.position) else {
+        RIDER_ROTORS.with(|rotors| rotors.borrow_mut().clear());
         return;
     };
+    let mut rotors = RIDER_ROTORS.take();
+    for rotor in rotors.values_mut() {
+        rotor.begin_tick();
+    }
     for transition in pending {
         // A teleport, unload or disassembly can invalidate a buffered update.
         if transition.tick != game.ticks || transition.player != before {
@@ -159,21 +284,107 @@ pub(super) fn begin_tick(game: &mut Game<'_>) {
             .current
             .iter()
             .filter(|record| resident.iter().any(|latest| latest.same_geometry(record)));
-        let current = current.cloned().collect::<Vec<_>>();
-        carry(game, &transition.previous, &current);
+        let mut early = Vec::new();
+        for record in current {
+            if !exact_rider_rotor(record)
+                || (record.previous_angle == record.angle
+                    && !rotors.contains_key(&record.controller))
+            {
+                early.push(record.clone());
+                continue;
+            }
+            let previous = transition
+                .previous
+                .iter()
+                .find(|previous| previous.same_geometry(record));
+            match rotors.entry(record.controller) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().receive(record.clone(), previous);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(RotorContact::new(record.clone(), previous));
+                }
+            }
+        }
+        if !early.is_empty() {
+            carry(game, &transition.previous, &early, false);
+        }
     }
-    if let Some(player) = local_contact_player(game)
-        && before != player.position
-    {
+    // Snapshots and unloads need not enqueue a move. Revalidate the actual
+    // loaded geometry before replacing coarse collision for this tick.
+    rotors.retain(|controller, rotor| {
+        let column = (controller[0] >> 4, controller[2] >> 4);
+        let Some(resident) = game
+            .world
+            .chunks
+            .get(&column)
+            .and_then(|chunk| read(chunk).ok())
+        else {
+            return false;
+        };
+        let Some(latest) = resident
+            .iter()
+            .find(|record| record.controller == *controller)
+        else {
+            return false;
+        };
+        if !rotor.record.same_geometry(latest) && !exact_rider_rotor(latest) {
+            return false;
+        }
+        rotor.receive(latest.clone(), None);
+        true
+    });
+    let Some(before_move) = local_contact_player(game).map(|player| player.position) else {
+        return;
+    };
+    let tick = game.ticks + 1;
+    if !rotors.is_empty() {
+        // Java resolves active rotor contacts after the normal local player
+        // move. Leave these shapes out of its ordinary terrain collision.
+        DEFERRED.set(Some(DeferredContact {
+            tick,
+            before_move,
+            rotors: rotors.values().cloned().collect(),
+        }));
+    }
+    RIDER_ROTORS.set(rotors);
+    if before != before_move {
         INTERPOLATION.set(Some(Interpolation {
-            tick: game.ticks + 1,
+            tick,
             before,
-            carried: player.position,
+            carried: before_move,
         }));
     }
 }
 
 pub(super) fn finish_tick(game: &mut Game<'_>) {
+    if let Some(deferred) = DEFERRED.take()
+        && deferred.tick == game.ticks
+        && deferred.before_move == game.previous_position
+        && local_contact_player(game).is_some()
+    {
+        for RotorContact {
+            from,
+            mut record,
+            bounds,
+        } in deferred.rotors
+        {
+            if record.axis == Axis::Y.index() && !game.clock.runs_normally() {
+                continue;
+            }
+            if !bounds.is_some_and(|bounds| {
+                game.player
+                    .as_ref()
+                    .is_some_and(|player| bounds.intersects(player.bounds()))
+            }) {
+                continue;
+            }
+            let mut previous = record.clone();
+            previous.angle = from;
+            record.previous_angle = from;
+            carry(game, &[previous], &[record], true);
+        }
+    }
     if let Some(sample) = INTERPOLATION.take()
         && sample.tick == game.ticks
         && sample.carried == game.previous_position
@@ -205,7 +416,7 @@ fn previous_records(game: &Game<'_>, data: &[u8]) -> Option<((i32, i32), Vec<Rec
     Some((column, records))
 }
 
-fn carry(game: &mut Game<'_>, previous: &[Record], current: &[Record]) {
+fn carry(game: &mut Game<'_>, previous: &[Record], current: &[Record], post_move: bool) {
     let max_step = game
         .player
         .as_mut()
@@ -246,6 +457,7 @@ fn carry(game: &mut Game<'_>, previous: &[Record], current: &[Record]) {
         match (before.stroke, record.stroke) {
             (None, None)
                 if record.axis == 1
+                    && !post_move
                     && before.angle == record.previous_angle
                     && before.angle != record.angle =>
             {
@@ -282,7 +494,8 @@ fn carry(game: &mut Game<'_>, previous: &[Record], current: &[Record]) {
                 None
             }
             (None, None)
-                if before.angle == record.previous_angle && before.angle != record.angle =>
+                if before.angle == record.previous_angle
+                    && (before.angle != record.angle || post_move) =>
             {
                 let axis = [Axis::X, Axis::Y, Axis::Z][record.axis];
                 let response = rotary_contact(
@@ -294,10 +507,29 @@ fn carry(game: &mut Game<'_>, previous: &[Record], current: &[Record]) {
                     payload_colliders(game, record, [0.0; 3], |_| true),
                     max_step,
                 );
+                if axis == Axis::Y
+                    && !player.shift_key_down
+                    && let Some(velocity) = upright_slime_bounce(
+                        record,
+                        player.position,
+                        bounds,
+                        player.velocity,
+                        response,
+                    )
+                {
+                    return Some(Contact::Bounce(velocity));
+                }
+                let transforms = if before.angle == record.angle {
+                    None
+                } else {
+                    Some((
+                        Rotation::new(record.anchor, axis, before.angle)?,
+                        Rotation::new(record.anchor, axis, record.angle)?,
+                    ))
+                };
                 (response.surface || response.separation != [0.0; 3]).then_some(Contact::Tilted {
                     response,
-                    previous: Rotation::new(record.anchor, axis, before.angle)?,
-                    current: Rotation::new(record.anchor, axis, record.angle)?,
+                    transforms,
                     controller: record.controller,
                 })
             }
@@ -347,6 +579,14 @@ fn carry(game: &mut Game<'_>, previous: &[Record], current: &[Record]) {
     let (motion, separate, excluded) = match contact {
         Contact::Carry(motion, excluded) => (motion, false, excluded),
         Contact::Push(motion, excluded) => (motion, true, excluded),
+        Contact::Bounce(velocity) => {
+            let at = player.position.components();
+            if let Some(player) = game.player.as_mut() {
+                player.velocity = velocity;
+            }
+            game.audio.play("minecraft:block.slime_block.fall", Some(at), 0.5, 1.0);
+            return;
+        }
         Contact::Tilted {
             response,
             controller,
@@ -386,23 +626,26 @@ fn carry(game: &mut Game<'_>, previous: &[Record], current: &[Record]) {
     };
     if let Contact::Tilted {
         response,
-        previous,
-        current,
+        transforms: Some((previous, current)),
         ..
     } = contact
         && response.surface
     {
         let corrected = from.add_vector(allowed);
         let next = current.to_world(previous.to_local(corrected.components()));
-        // Java applies only the horizontal contact-point transfer. Vertical
-        // motion comes from the separation and the in-tick impact response.
-        let transfer = Vec3::new(next[0] - corrected.x, 0.0, next[2] - corrected.z);
+        // Java clips the full transfer against terrain, then keeps the
+        // rider's Y from separation and the in-tick impact response.
+        let transfer = Vec3::new(
+            next[0] - corrected.x,
+            next[1] - corrected.y,
+            next[2] - corrected.z,
+        );
         let Ok(clipped) =
             world.resolve_with_context(bounds.move_by(allowed), transfer, 0.0, false, context)
         else {
             return;
         };
-        allowed = allowed.add_vector(clipped);
+        allowed = allowed.add_vector(clipped.horizontal());
     }
     if let Some(player) = &mut game.player {
         let to = from.add_vector(allowed);
@@ -451,11 +694,7 @@ fn payload_colliders<'a>(
                 block: &|_, _, _| game.world.air,
                 binding: game.collision,
             };
-            game.pack
-                .assets
-                .registry
-                .id(state)
-                .and_then(|id| game.collision.collision_shape(&mut lookup, id, *local).ok())
+            payload_collision_shape(game.collision, &mut lookup, state, *local)
         } else {
             None
         };
@@ -471,4 +710,76 @@ fn payload_colliders<'a>(
             })
         }))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(previous_angle: f32, angle: f32) -> Record {
+        Record {
+            controller: [0, 64, 0],
+            anchor: [1, 64, 0],
+            axis: 0,
+            angle,
+            previous_angle,
+            rpm: 8.0,
+            stalled: false,
+            return_home: false,
+            stroke: None,
+            clock_hand: None,
+            blocks: vec![(
+                [0; 3],
+                BlockState {
+                    name: "minecraft:stone".into(),
+                    properties: Default::default(),
+                },
+            )]
+            .into(),
+        }
+    }
+
+    #[test]
+    fn absent_updates_keep_the_hull_without_replaying_displacement() {
+        let initial = sample(0.0, 0.0);
+        let mut rotor = RotorContact::new(sample(0.0, 2.4), Some(&initial));
+        assert_eq!((rotor.from, rotor.record.angle), (0.0, 2.4));
+        for _ in 0..3 {
+            rotor.begin_tick();
+            rotor.receive(sample(0.0, 2.4), None);
+            assert_eq!((rotor.from, rotor.record.angle), (2.4, 2.4));
+        }
+    }
+
+    #[test]
+    fn one_client_tick_coalesces_contiguous_updates_and_ignores_duplicates() {
+        let initial = sample(0.0, 0.0);
+        let first = sample(0.0, 2.4);
+        let second = sample(2.4, 4.8);
+        let third = sample(4.8, 7.2);
+        let mut rotor = RotorContact::new(first.clone(), Some(&initial));
+        rotor.begin_tick();
+        rotor.receive(second.clone(), Some(&first));
+        rotor.receive(third.clone(), Some(&second));
+        rotor.receive(third, None);
+        assert_eq!((rotor.from, rotor.record.angle), (2.4, 7.2));
+    }
+
+    #[test]
+    fn broken_predecessor_or_replaced_geometry_uses_only_the_new_hull() {
+        let initial = sample(0.0, 0.0);
+        let mut rotor = RotorContact::new(sample(0.0, 2.4), Some(&initial));
+        let unknown = sample(4.8, 7.2);
+        rotor.receive(unknown.clone(), Some(&sample(2.4, 4.8)));
+        assert_eq!((rotor.from, rotor.record.angle), (7.2, 7.2));
+
+        let mut replacement = sample(7.2, 9.6);
+        replacement.anchor[0] += 1;
+        rotor.receive(replacement.clone(), Some(&unknown));
+        assert_eq!((rotor.from, rotor.record.angle), (9.6, 9.6));
+        let mut following = sample(9.6, 12.0);
+        following.anchor = replacement.anchor;
+        rotor.receive(following, Some(&replacement));
+        assert_eq!((rotor.from, rotor.record.angle), (9.6, 12.0));
+    }
 }

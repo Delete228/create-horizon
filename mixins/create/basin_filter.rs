@@ -23,7 +23,7 @@ pub(super) fn read(game: &Game<'_>, entity: &ModBlockEntity) -> Option<Option<It
         Some(Tag::Compound(tag)) if tag.is_empty() => Some(None),
         Some(tag) => {
             let stack = item_from_nbt(tag)?;
-            (ordinary_filter_item(game, &stack) && item_to_nbt(&stack) == *tag)
+            (ordinary_filter_item(game.items(), &stack) && item_to_nbt(&stack) == *tag)
                 .then_some(Some(stack))
         }
     }
@@ -115,7 +115,7 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
         matches!(
             item.item.as_ref(),
             "create:wrench" | "create:mechanical_arm"
-        ) || !ordinary_filter_item(game, item)
+        ) || !ordinary_filter_item(game.items(), item)
     }) || current(game, pos).is_none()
     {
         return true;

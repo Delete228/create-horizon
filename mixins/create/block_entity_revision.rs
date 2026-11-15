@@ -4,12 +4,16 @@
 use crate::containers::ModRevision;
 
 pub(super) trait EntityRevision {
+    fn create_entity_identity(self) -> u64;
     fn is_same_create_entity(self, other: ModRevision) -> bool;
 }
 
 impl EntityRevision for ModRevision {
+    fn create_entity_identity(self) -> u64 {
+        *self.__horizon_mixins_create_block_entity_identity()
+    }
+
     fn is_same_create_entity(self, other: ModRevision) -> bool {
-        self.__horizon_mixins_create_block_entity_identity()
-            == other.__horizon_mixins_create_block_entity_identity()
+        self.create_entity_identity() == other.create_entity_identity()
     }
 }

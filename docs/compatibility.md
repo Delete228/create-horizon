@@ -19,6 +19,10 @@ remaining differences. It adds limited schematic placement, bare-belt transport,
 Basin/Mixer/fluid/heat processing and Press compacting, not complete Create parity.
 
 For the new Press adapter, `Mode` retains WORLD=0, BELT=1 and BASIN=2.
+The `[recipes]` option `bulkPressing` in `config/create-server.toml` defaults
+to `false`. Set it to `true` to press the full stack on a Depot or Belt, and
+all recipe-matching grounded stacks in range in World mode. A config reload
+changes the setting for Presses already in the world.
 `ParticleItems` is consumed once by client-update construction and is not saved;
 empty later updates clear the client's retained field. The active recipe object
 is transient and retained through datapack reload, not encoded as a new recipe
@@ -61,7 +65,7 @@ implementing each feature, and test save/reload inside Horizon.
 | `create:large_cogwheel` | `create:simple_kinetic` | `axis`, `waterlogged` (default false) |
 | `create:flywheel` | `create:flywheel` | `axis` (default Y) and common kinetic data. Wheel speed and angle are client-side and are not saved. |
 | `create:creative_motor` | `create:motor` | `facing`; `ScrollValue` int, default 16 |
-| `create:mechanical_press` | `create:mechanical_press` | horizontal `facing`; `Running`, `Finished` bytes; `Ticks`, `Mode` ints (WORLD=0, BELT=1) |
+| `create:mechanical_press` | `create:mechanical_press` | horizontal `facing`; `Running`, `Finished` bytes; `Ticks`, `Mode` ints (WORLD=0, BELT=1, BASIN=2) |
 | `create:depot` | `create:depot` | `waterlogged` (default false), no facing/open state; `HeldItem`, `OutputBuffer` |
 | `create:gearbox` | `create:gearbox` | `axis` |
 | `create:clutch`, `create:gearshift` | corresponding block ID | `axis`, `powered` |
@@ -77,9 +81,31 @@ implementing each feature, and test save/reload inside Horizon.
 | `create:crushing_wheel_controller` | `create:crushing_wheel_controller` | Internal `facing` and `valid` states, `Speed` float and 32-slot `Inventory` with the original processing fields |
 | `create:brass_funnel` | `create:funnel` | Dry vertical placement; `extracting`, `powered`, `waterlogged`, plain `Filter`, `FilterAmount`, `UpTo` and `TransferCooldown` |
 | `create:item_drain` | `create:item_drain` | 1500 mB `Tanks`, transported `HeldItem` and `ProcessingTicks` |
+| `create:basin` | `create:basin` | `facing`, `InputItems`, `OutputItems`, `InputTanks`, `OutputTanks`, `Overflow`, `FluidOverflow`, `PreferredSpoutput` and `DisabledSpoutput` |
 | `create:mechanical_crafter` | `create:mechanical_crafter` | Horizontal `facing`, `pointing`, `Inventory`, `ConnectedInput`, `GroupedItems.Grid`, `Phase` and `CountDown`; 2 SU/RPM |
 | `create:encased_fan` | `create:encased_fan` | six-way `facing`, default `north`; common kinetic `Speed` |
 | `create:mechanical_drill` | `create:drill` | six-way `facing`, `waterlogged`; defaults `north`, false; `Progress`, `NextTick`, `Breaking` |
+
+A Basin's side spout feeds items, water, lava, honey and chocolate into a Basin
+one block lower and one block to the side. A clear space between the two openings lets the source choose
+the route automatically. Wrench the active side away from the filter to
+disable it, or Wrench another side to prefer it. A full receiver keeps the
+finished stacks in the source across saves. When space opens, the source
+transfers the items that fit and keeps the remainder. It waits for room for
+each complete fluid batch. Opening a side route moves existing output fluid
+into the queue, and a return to the downward position clears the fluid queue.
+Other receivers and the spout's output effects remain open.
+
+A heated Mixer melts a Honey Block into 1,000 mB of honey or a Bar of
+Chocolate into 250 mB of chocolate. A Press compacts those amounts back
+into the corresponding item. The stock `c:honey` ingredient matches
+`create:honey`. Custom fluid tag overrides and milk mixing remain open.
+Use a Honey Bottle on the Basin below its filter slot to pour 250 mB.
+Survival returns a Glass Bottle. An empty Glass Bottle cannot draw honey
+back out of the Basin.
+An ordinary Water Bottle also pours 250 mB. Use a Glass Bottle to draw
+that amount of water and receive a Water Bottle in Survival. Creative
+keeps the held bottle while changing the stored volume.
 
 Static casings/storage blocks and alloy/metal/wrench items retain their upstream
 `create:*` IDs. Encased shafts unwrap to and drop `create:shaft`.
@@ -109,12 +135,15 @@ can be packed into its original storage block.
 
 The downward Crushing Wheel pair takes supported inputs from a dry Chute
 or catches falling stacks. It looks up Crushing recipes before Milling
-recipes. The 45 bundled crushing recipes include supported raw metals and
-their storage blocks, ores, Obsidian, Wool and Tuff. The wheels eject into
-open space or transfer onto a Depot, where the top stack and output buffer
-control backpressure. Unported items
-stay in the Chute. The controller retains its original inventory and cycle
-fields through a restart, and loose outputs retain the original bypass
+recipes. The bundled crushing recipes include supported raw metals and
+their storage blocks, ores, Obsidian, Wool, Tuff and the standalone Diorite
+recipe from the stock Java installation without Ex Nihilo. The wheels eject
+into open space or transfer onto a Depot, where the top stack and output buffer
+control backpressure. An item without a recipe runs the original 100-duration
+cycle and yields no items whether it falls into the wheels or arrives through
+a Chute. Inputs with an unported recipe such as Netherrack remain upstream.
+The controller retains its original inventory
+and cycle fields through a restart, and loose outputs retain the original bypass
 data. The Experience Nugget currently drops as an item. Consuming it,
 entity-specific collision and damage, and other directions and output
 destinations are pending.
@@ -124,12 +153,51 @@ default configuration pulls up to 64 matching items at once. A powered
 Chute parks its cargo halfway along the block and resumes after the signal
 clears. The filter and cargo survive a restart. Hold use over the filter when
 the Chute feeds an inventory to choose Up to or Exactly. The board uses the
-sample item's stack limit. Special filters remain open.
+sample item's stack limit. Smart Chutes and Brass Funnels load a legacy zero
+as Up to the saved sample's stack limit. Replacing the sample keeps that
+amount. An ordinary Hopper can feed a dry Smart Chute from above or the side.
+The chute refuses mismatches, powered transfers and additional cargo while
+occupied. Special filters and airflow remain open.
 
 Ordinary dry Chutes connect diagonally in four directions. A complete empty
 line can be pasted from a source schematic with a horizontal rotation or
 mirror. Loaded Chutes, airflow and partial diagonal routes need their own
-import policy.
+import policy. Stationary vertical Chutes also carry ordinary inventory
+cargo while waterlogged, including from an upper Barrel or side Hopper.
+A Hopper can also feed an empty ordinary angled Chute in air or water.
+Placing a Chute into a water source preserves the source in the block state.
+
+An upward-facing Encased Fan below a straight run of ordinary dry Chutes
+passes its signed speed through the column. A side Hopper can feed cargo for
+upward transport into a barrel. A full receiver holds the stack halfway,
+including across a restart. Changing the Fan's direction reverses the item
+motion. A downward-facing Fan above a straight run pulls loose items or
+extracts from an ordinary container below. The collision shape under the
+Chute determines how far it can reach. Cargo parks halfway below the Fan and
+falls back when power stops. A single bottom Fan can also feed one straight
+and one angled branch in a dry ordinary run. The two branches each inherit
+half the push and the straight branch wins a tie. An occupied straight branch
+can send the stack through the angled branch across a loaded chunk boundary.
+These straight runs and the single lower-Fan fork also work through waterlogged
+ordinary Chutes. Both branches of the fork preserve their cargo and delivery
+timing across a cold restart. The original collision geometry still limits
+upper suction.
+The same upper Fan can extract a stack from a stopped horizontal Belt under
+an ordinary Chute. The stack must be less than half a block from the segment
+center, within the collision-limited reach. A dry ordinary Chute can also
+draw the full held stack from a Depot directly below it or across one air
+block, leaving the Depot output buffer intact. A solid block stops the
+transfer. A bare dry Fan leaves the Depot stack in place. Sloped Belts,
+paired Fans, larger airflow networks, and powered Smart Chutes remain open.
+
+Powered Chutes use their own airflow billboards in the window and the clear
+space they blow into or draw from. These particles use Minecraft's generic
+sprites in both resource modes. The current Horizon particle controller omits
+these billboards on Minimal. Java still shows occasional ones at that setting.
+Vertical Chutes render cargo in their windows and below an opaque Chute with
+suction. The item remains visible when the Chute itself is outside the frame.
+The client interpolates its pose between authoritative item offsets and holds
+its final pose when the cargo parks.
 
 Horizontal Mechanical Belts can feed dry Chutes and receive their downward
 output, even when the receiving Belt is stopped. An incomplete Belt or a
@@ -150,8 +218,16 @@ The finished stack drops at the front of the last Crafter or enters a Depot.
 The phase, countdown and component-bearing grouped items can resume after
 a restart. The 21-Crafter test matches all 62 Java ticks. A full 5×5 grid
 can use a redstone pulse or four Crafter Slot Covers for its empty corners.
-The finished stack can also feed down into an ordinary container or horizontal
-Belt. A blocked receiver or stopped Belt keeps the remainder after a restart.
+The finished stack can feed into a Chest, Trapped Chest, Barrel or Hopper
+above, below or beside the Crafter. The transfer fills matching stacks before
+empty slots. The Crafter also feeds a horizontal Belt from above or from the
+side. A stopped Belt retains the result in the Crafter. A solid target
+without a receiving inventory causes the result to drop at the Crafter's
+front.
+A dry Chute or Smart Chute can also receive the finished stack. The Crafter
+keeps the result while the Chute is occupied or the Smart Chute is locked.
+It retries an open Chute every tick and a stacked Chute on its ordinary
+lazy tick.
 Ordinary shaped and shapeless recipes use the loaded crafting table's recipe
 order, within a 3×3 occupied area. Mirrored patterns and empty cells follow
 the normal crafting rules. A recipe marked `_manual_only` stays manual.
@@ -164,10 +240,29 @@ each row. Covered and busy slots are skipped, and empty-hand pickup stays
 local. The group keeps Create's controller and relative offsets across saves.
 Player removal repairs the surviving loaded members. Removal by commands
 and disconnected groups with unloaded members remain pending.
+A vanilla Hopper pointed at a linked member feeds the same slot order and
+skips covered, occupied and busy slots. It keeps its eight-tick transfer
+cooldown. A Hopper underneath cannot extract these ingredients.
+A Chute above a linked member and an upward collecting Funnel also feed the
+group. A finished Crafter can feed a differently facing linked group. Each
+available member receives one item and the source keeps any remainder.
 The animation shows ingredients merging and the finished item turning, with
-the export and crafting particles. Scrolling on the Crafter's small belts,
-linked hopper and machine input, edge outlines and connected textures, special
-recipes, mixed remainders and side insertion into a Belt remain open.
+the export and crafting particles. With the original JAR, the small belt uses
+Create's four-frame export animation. Two crafters pointing at each other show
+arrows. Further automation, edge outlines, connected textures, special recipes
+and mixed remainders remain open.
+
+Right-click the front of a stopped Deployer to swap your entire held stack
+with its hand, including item components and tool damage. An empty hand
+takes the stored stack. The ghost filter stays in place and can differ from
+the stored item. This also works in Adventure mode. A front Wrench click
+switches Use or Attack while keeping the stored stack.
+
+A stationary downward Deployer uses supported saplings and bone meal with
+item data such as custom markers and enchantment glint. It consumes one when
+the vanilla action accepts it and preserves the remaining stack, including
+through a restart. Its front hand accepts this stock while turning when it
+passes the ghost filter. Item-driven block state overrides still need support.
 
 A downward Deployer can apply the original small and large cogwheel recipes
 to cargo on a Depot or bare horizontal Belt. It also has the original
@@ -196,52 +291,159 @@ The source retains cargo while the funnel is powered or its filter rejects
 it. Airborne intake, special filter items and Belt Funnel variants remain
 open.
 
-An Item Drain accepts water or lava buckets from a bare horizontal Belt,
-stores 1000 mB and sends the empty bucket to a neighboring Depot or Belt.
+An Item Drain accepts water and lava buckets, Honey Bottles and ordinary
+Water Bottles from a bare horizontal Belt. It stores 1,000 mB from a bucket
+or 250 mB from a bottle and sends the empty container to a neighboring Depot
+or Belt.
 With an incompatible or full tank, it waits at the pour position. With a
-blocked Depot or stopped outgoing Belt, it holds the bucket at the exit.
+blocked Depot or stopped outgoing Belt, it holds the container at the exit.
 The checked flows match the pinned Java tick traces and survive a restart.
-Right-click with either full bucket to pour directly into the tank. Survival
-returns an empty bucket, Creative keeps the full bucket, and a refused pour
-keeps the bucket and its components. An empty hand retrieves an item waiting
+Right-click with a supported full container to pour directly into the tank.
+Survival returns an empty container. Creative and a refused pour both keep
+the full container and its components. An empty hand retrieves an item waiting
 on the Drain. A comparator reads the tank's fill level, including through one
 solid conductor. Java and Horizon match the two-tick delay after the checked
-conveyor or hand pour. Other containers and pipe
-connections are pending. The original JAR supplies the body model.
-The bucket's highlight and its overlap with the stream still differ slightly.
+conveyor or hand pour. A pipe can extract from the bottom or any side.
+It cannot fill the Drain, and the top does not expose fluid storage.
+Other item containers are pending. The original JAR supplies the body model.
+The container highlights and their overlap with the stream still differ.
 
-A standalone Fluid Tank stores up to 8,000 mB of water or lava. In Creative,
-right-click with a filled bucket to add 1,000 mB or an empty bucket to drain
-1,000 mB. The held bucket stays the same. Survival uses vanilla bucket
-interactions. A Wrench toggles the tank's windows, and a comparator reads
-its fill level. The tank uses Create's original `TankContent` save format
-and exposes the same storage on every side through Horizon's fluid capability.
-The original JAR supplies the tank models and textures. The built-in model
-uses vanilla copper and glass.
+With the reference Create defaults, ordinary Fluid Tanks form complete
+square layers one to three blocks wide and up to 32 layers tall. Each block
+contributes 8,000 mB. The controller at
+minimum X, Y and Z owns the fluid. All parts expose that storage on every
+side, including parts across a loaded chunk boundary. In Creative, a full
+or empty bucket moves 1,000 mB and stays in the player's hand. Survival
+uses vanilla bucket interactions. A Wrench toggles the entire structure's
+windows. Comparators and Engineer's Goggles read the shared fill level
+and capacity from any part. The Item Drain also shows its fluid contents
+in the goggles overlay.
 
-Tank placement that would form a vertical stack or a wider tank is refused.
-Boilers, moving tanks, goggles tooltips, splash particles and world light
-from lava are pending.
+The save uses Create's `TankContent`, `Size`, `Height` and member
+`Controller` fields. Breaking a block redistributes fluid over surviving
+parts before they reconnect. Formation keeps incompatible fluids apart
+and only absorbs complete existing tanks. A deferred split survives a
+clean restart while part of the footprint is unloaded. Recovery after an
+interruption during chunk writes has separate requirements.
 
-Fluid Pipes and a Mechanical Pump can move water or lava between two
-standalone tanks on a dry straight line. The pump takes power from a cog and
-pushes in the direction it faces. Use a Wrench to reverse the pump. Each side
-can reach a tank through up to 15 pipes, including across loaded chunks.
-After the line fills, a pump at 32 RPM moves 16 mB per tick. A full tank or one
+A normal placement against the top or bottom of a wider tank fills in
+the rest of that layer when the player has enough blocks and the space
+is clear. Sneaking and side placement place just the clicked block.
+Lava gives off light according to the level in the windowed tank. A
+Wrench closes the windows and removes that light. The surface geometry
+uses the controller's width and height. With the original JAR, the roof
+and side textures join within the same tank and keep their borders where
+separate tanks touch. Interior lighting is darker in Horizon. Creative
+schematic paste restores complete tanks through rotations and reflections,
+with empty storage as in Java. A vertical Mechanical Bearing can capture
+a complete ordinary tank in one loaded chunk column. The tank keeps its
+shell, windows, water or lava during movement and gets a new controller
+at its rotated corner when placed. The bearing waits if the destination
+is blocked, including across a restart. The restored lava tank lights
+its surroundings again. A dry Rope Pulley can also lift or lower a complete
+tank within one loaded chunk column. Empty tanks and tanks carrying water,
+honey or chocolate preserve their members and contents through a restart
+and landing in the tested layouts. New groups use `fluids.fluidTankMaxHeight`
+(32 by default). New tank inventories use `fluids.fluidTankCapacity`
+(8 buckets per block by default). An already initialized inventory keeps
+its physical limit when the setting changes. The goggles use the current
+setting for their displayed capacity, including after restarting the world.
+A controller rebuilt on load takes the current setting as its new physical limit.
+A tank can load an amount above its fill limit. It
+refuses additional fluid until space becomes available and can still
+drain the saved amount. Virtual lighting inside moving cargo, boilers
+and moving tanks spanning chunk columns remain open.
+
+Fluid Pipes and a Mechanical Pump can move water or lava between tanks
+and Basins on horizontal or vertical routes. A waterlogged pipe keeps its
+external water. A Basin fills its input tanks and drains its output tanks
+first. The pump takes power from a cog and pushes in the direction it faces.
+Use a Wrench to reverse the pump. The default `fluids.mechanicalPumpRange`
+of 16 reaches a tank through up to 15 pipes on each side, including across
+loaded chunks. A pipe just inside the range retains pressure even when its
+branch has no reachable tank. Shorter branches continue to transfer fluid.
+Co-directed pumps can work in series through a single path between each
+pair. The pressures add between pumps and the source face still sets the
+rate of transfer. Short capped arms leave that path working and have no
+pressure. Both pumps need power for sustained delivery.
+With one or two closed side tanks between two co-directed pumps, both pumps
+contribute pressure to the connecting network. Each side tank can receive or
+supply fluid as flows change direction. The Java comparisons cover water with
+unequal and equal RPM, empty side tanks, and drive changes.
+After a simple line fills, one unbranched inlet at 32 RPM supplies 16 mB per
+tick. A full tank or one
 containing another fluid blocks the transfer. The supported lines resume after
-a restart. The original JAR supplies the pipe connections and tank collars.
+a restart. With a single source, a pump can feed multiple closed outlets.
+The first outlet to receive fluid can start transferring while another
+branch fills. Once more than one outlet is ready, they share the supply.
+Unused capacity on one branch goes to an outlet that can still accept it.
+Multiple closed inlets can share a junction. Each inlet has its own rate
+from its local pressure and starts when its flow reaches an outlet. If
+water and lava meet inside the junction, it becomes cobblestone and drops
+the pipe. The pump rebuilds pressure and the tanks retain their contents
+in the tested layouts. Between co-directed pumps, a second side tank can
+remain connected after the junction breaks. It regains pressure and resumes
+filling with the surviving supply, including after a restart.
+Two closed inlets and two closed outlets can operate together, including
+uneven path lengths or a tank close to empty or full.
+The original JAR supplies the pipe connections and tank collars. The
+pump can emit vanilla water or lava drips at its active rims. One open
+inlet can supply one or more closed outlets. A network with a closed
+inlet can release fluid through separate open outlets and keep supplying its
+other branches. The pipe keeps up to 1,000 mB at the open end while
+transferring, including after a restart. A regenerating water source
+stays in place and the pipe can empty a waterlogged block.
+An open source can feed an open outlet on a separate world cell. One
+cauldron can leave 500 mB in each of two outlet buffers.
+Full water and lava cauldrons supply 1,000 mB. Partial cauldrons cannot
+supply a pipe, and a pump cannot refill a cauldron through an open end.
+Full bee nests and beehives supply 250 mB of honey and reset their honey
+level. A partially filled hive stays unchanged. Open inlets can share a
+closed outlet and retain independent buffers. A junction can draw from two
+cauldrons or hives without pausing when those blocks empty.
+When discharged into the other fluid, water turns a lava source into
+obsidian and lava turns a water source into stone. Either combination
+with flowing liquid yields cobblestone. These reactions leave the source
+tank's fluid amount unchanged.
+In the Nether, water discharged from an open end evaporates with an
+extinguish sound and lava forms a normal source block.
+Set `fluids.pipesPlaceFluidSourceBlocks = false` in `config/create-server.toml`
+or the world's `serverconfig/create-server.toml` to discard full outlet
+buffers instead of placing source blocks. The default is `true`.
+An open end shows a moving stream with the original fluid tint.
 
-A supported line can include one `create:fluid_valve`. Drive its perpendicular
-shaft with positive RPM to open it or negative RPM to close it. At zero RPM
+Closed routes can carry Honey and Chocolate between Fluid Tanks and
+Basins. They retain the original fluid IDs and separate incompatible
+contents. Fluid Tanks show both through their windows and in the Goggles.
+The local JAR supplies the two original still textures. Honey and Chocolate
+world source blocks and flowing terrain need custom world fluids.
+In Creative, use a Honey Bottle on a normal Fluid Tank to add 250 mB
+while keeping the held bottle. In Survival it remains in your hand and
+the tank stays unchanged. An empty Glass Bottle cannot draw honey from
+the tank.
+An ordinary Water Bottle and a Glass Bottle add or remove 250 mB of
+water in Creative, with the same capacity checks. Other potion fluids,
+including splash, lingering and custom-effect potions, remain open.
+
+A supported line can include `create:fluid_valve` on a branch, with an
+independent shaft for each valve. Drive the perpendicular shaft with positive
+RPM to open it or negative RPM to close it. At zero RPM
 the pointer stays where it is, and the valve keeps its last fully open or
 closed state. A closed valve still carries pressure and stops fluid transfer.
 The save uses `enabled` and Create's `Pointer` compound. The Wrench rotates
 the casing and changes the shaft and pipe axes as in Java while retaining
 the pointer position. The original JAR supplies the block and pointer
-models. Subtick pointer interpolation is pending.
+models. The pointer moves between server ticks as it opens and closes.
+Other branches resume after the pressure rebuild when a valve changes state.
 
-Bends, branches, waterlogged pipes, open ends, multiple pumps on one line and
-connections to other fluid machines are pending.
+Loops, more than two active side tanks between pumps, open side endpoints
+between pumps, shared open outlet cells and additional fluid machines remain
+open. Opposing pumps on a closed line without middle storage keep pressure
+on their exterior legs and leave the middle idle. Opposing pumps sharing
+an active side endpoint remain open. The supported water and lava
+effects include dousing exposed entities and blocks, setting fire to
+entities and igniting arrows. Remote visuals for burning items and world
+effects for custom fluids still need work.
 
 The four sheet items retain `create:iron_sheet`, `create:golden_sheet` and
 `create:copper_sheet` and `create:brass_sheet`. Kinetic entities retain `Speed` as a float. Depot data
@@ -337,6 +539,23 @@ hand collection takes output first, or input if no output exists. Recipe-filtere
 automation, landed items, per-item probability rolls and timer handling are
 implemented; native integration and save/reload coverage are recorded separately
 in `VALIDATION.md`.
+The Millstone pauses if any output slot holds 99 items, the NeoForge handler
+limit. A normal 64-item stack still permits milling into the other slots.
+Both modern milling results and legacy single-stack `item` results keep their
+item components and leave the input's crafting remainder in the output buffer.
+Millstone item particles follow the client processing timer. The retry arm
+tick is quiet, and a running timer emits around the original half-block ring
+with the tangent reversed when the rotation reverses.
+
+An upward Mechanical Saw normally takes one item at a time. Set
+`recipes.bulkCutting = true` in `config/create-server.toml` or the world's
+`serverconfig/create-server.toml` for stack input from a Belt, dry Chute or
+landed item. Bulk recipes use the original batch duration. Set
+`recipes.allowStonecuttingOnSaw = false` to disable vanilla Stonecutting
+recipes while keeping Create cutting recipes available.
+Existing Saws keep their input limit until the block entity reloads or is
+replaced. After a Saw has looked up recipes, run `/reload` to apply a change
+to `allowStonecuttingOnSaw`.
 
 The fan's shaft is opposite `facing`; both directions and all six orientations
 are represented. Airflow range, push/pull choice, processing segments, partial
@@ -355,6 +574,11 @@ supported source entries; unavailable Create blocks are omitted. Until the API
 exposes fluid-tag queries, the adapter recognizes vanilla water/lava IDs and
 waterlogged blocks explicitly. This is not arbitrary mod-fluid compatibility.
 Recipe caches refresh when server data loads or reloads.
+
+The `[kinetics.encasedFan]` table in `create-server.toml` supports Create's
+`fanPushDistance`, `fanPullDistance`, `fanBlockCheckRate`, `fanRotationArgmax`
+and `fanProcessingTime` settings. Distance selection follows the signed RPM.
+The configured processing time applies when a stack starts a new cycle.
 
 Depot-held progress uses `HeldItem.FanProcessingType` and
 `HeldItem.FanProcessingTime`. Dropped-item progress now uses the original

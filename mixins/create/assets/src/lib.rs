@@ -16,13 +16,17 @@ pub const CREATE_VERSION: &str = "6.0.10+mc1.21.1 (NeoForge)";
 pub const JAR_SHA256: &str = "ef87fe5709f1ba1f5b8bb20a2925b5afb4669e178fd6d8bf10c167759eefe37a";
 // Bump whenever the import catalog changes: the cache key pins the JAR, not
 // BLOCKS/ITEMS/PARTS, so an older valid cache lacks newly required resources.
-const SCHEMA: u32 = 49;
+const SCHEMA: u32 = 53;
 const MAX_JAR: u64 = 128 << 20;
 const MAX_FILE: u64 = 16 << 20;
 const MAX_TOTAL: usize = 64 << 20;
 const MAX_ENTRIES: usize = 65_536;
 const MAX_BUNDLED_FILES: usize = 2048;
+const FLUID_SPRITES: &[&str] = &["create:fluid/honey_still", "create:fluid/chocolate_still"];
+pub const FLUID_SPRITE_MODEL: &str = "create:block/fluid/render_sprites";
+const FLUID_SPRITE_MODEL_PATH: &str = "assets/create/models/block/fluid/render_sprites.json";
 mod catalog;
+mod tank_ct;
 pub use catalog::{BLOCKS, EXTRA_BLOCKSTATES, EXTRA_MODELS, ITEMS, PARTS};
 pub const WOODS: &[&str] = &[
     "oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "bamboo",
@@ -115,6 +119,8 @@ const PIPE_MODELS: [[&str; 6]; 4] = [
     pipe_faces!("drain"),
 ];
 
+pub const PIPE_CASING: &str = "create:block/fluid_pipe/casing";
+
 impl PipeAttachment {
     pub fn model(self, side: usize) -> &'static str {
         PIPE_MODELS[self as usize][side]
@@ -122,7 +128,7 @@ impl PipeAttachment {
 }
 
 pub fn pipe_attachment_models() -> impl Iterator<Item = &'static str> {
-    PIPE_MODELS.into_iter().flatten()
+    PIPE_MODELS.into_iter().flatten().chain([PIPE_CASING])
 }
 
 #[derive(Debug)]
@@ -157,7 +163,11 @@ pub fn bundled_content(game_dir: &Path, bytes: &[u8], textures: &[u8]) -> io::Re
                             | "data/minecraft/tags/block/convertable_to_mud.json"
                             | "data/minecraft/tags/item/enchantable/durability.json"
                     )
-                    || name.starts_with("data/c/tags/item/"))
+                    || name.starts_with("data/c/tags/item/")
+                    || matches!(
+                        name.as_str(),
+                        "data/c/tags/fluid/honey.json" | "data/c/tags/fluid/chocolate.json"
+                    ))
                 || value.len() > MAX_FILE as usize
         })
     {
@@ -357,7 +367,11 @@ fn import(jar: &Path, cache: &Path, format: (i64, i64), expected: &str) -> io::R
         "pack": {
             "description": "Create resources imported from your local JAR (All Rights Reserved)",
             "min_format": [format.0, format.1], "max_format": [format.0, format.1]
-        }
+        },
+        "overlays": {"entries": [{
+            "directory": tank_ct::DIRECTORY,
+            "min_format": [format.0, format.1], "max_format": [format.0, format.1]
+        }]}
     }))?;
     fs::write(pack.join("pack.mcmeta"), &metadata)?;
     let hashes: BTreeMap<_, _> = files
@@ -403,7 +417,18 @@ fn valid_cache(target: &Path, hash: &str, format: (i64, i64)) -> Option<usize> {
         return None;
     }
     let files = receipt["files"].as_object()?;
-    if files.is_empty() || files.len() > MAX_ENTRIES {
+    if files.is_empty()
+        || files.len() > MAX_ENTRIES
+        || !tank_ct::in_cache(files)
+        || !files.contains_key("assets/minecraft/atlases/blocks.json")
+        || !files.contains_key(FLUID_SPRITE_MODEL_PATH)
+        || !FLUID_SPRITES.iter().all(|sprite| {
+            resource_path(sprite, "textures", "png")
+                .ok()
+                .flatten()
+                .is_some_and(|path| files.contains_key(&path))
+        })
+    {
         return None;
     }
     if !BLOCKS
@@ -690,6 +715,28 @@ fn collect(bytes: Vec<u8>) -> io::Result<BTreeMap<String, Vec<u8>>> {
         let state = reader.json(&format!("assets/create/blockstates/{block}.json"))?;
         reader.blockstate_models(&state)?;
     }
+    tank_ct::add_overlay(&mut reader)?;
+    let mut sprites = Vec::with_capacity(FLUID_SPRITES.len());
+    for &sprite in FLUID_SPRITES {
+        reader.texture(sprite)?;
+        sprites.push(json!({"type": "single", "resource": sprite}));
+    }
+    reader.files.insert(
+        "assets/minecraft/atlases/blocks.json".into(),
+        serde_json::to_vec(&json!({"sources": sprites})).map_err(io::Error::other)?,
+    );
+    // Horizon's terrain texture array bakes the sprites referenced by models.
+    // This standalone model registers both still sprites without drawing a block.
+    reader.files.insert(
+        FLUID_SPRITE_MODEL_PATH.into(),
+        serde_json::to_vec(&json!({
+            "textures": {"honey": FLUID_SPRITES[0], "chocolate": FLUID_SPRITES[1]},
+            "elements": [{"from": [0, 0, 0], "to": [1, 1, 1], "faces": {
+                "north": {"texture": "#honey"}, "south": {"texture": "#chocolate"}
+            }}]
+        }))
+        .map_err(io::Error::other)?,
+    );
     for item in BLOCKS.iter().chain(ITEMS) {
         reader.model(&format!("create:item/{item}"))?;
     }

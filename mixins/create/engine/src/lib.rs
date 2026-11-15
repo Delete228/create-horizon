@@ -69,6 +69,9 @@ pub mod audio;
 #[path = "core/basin.rs"]
 pub mod basin;
 
+#[path = "core/fluid_tank.rs"]
+pub mod fluid_tank;
+
 #[path = "core/fluid_transport.rs"]
 pub mod fluid_transport;
 

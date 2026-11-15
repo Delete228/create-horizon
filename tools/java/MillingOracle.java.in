@@ -21,14 +21,16 @@ public class MillingOracle {
         ItemStack[] stacks;
         ItemStackHandler(int size){stacks=new ItemStack[size];Arrays.setAll(stacks,i->new ItemStack(0));}
         int getSlots(){return stacks.length;}
-        int getSlotLimit(int slot){return 64;}
+        // NeoForge 21.1.227 ItemStackHandler.getSlotLimit.
+        int getSlotLimit(int slot){return 99;}
         ItemStack getStackInSlot(int slot){return stacks[slot];}
         void setStackInSlot(int slot,ItemStack stack){stacks[slot]=stack;}
     }
     static class ItemHandlerHelper {
         static void insertItemStacked(ItemStackHandler inventory,ItemStack stack,boolean simulate){
             int remaining=stack.count;
-            for(var s:inventory.stacks){int moved=Math.min(remaining,64-s.count);s.count+=moved;remaining-=moved;}
+            // The probe's result item itself stacks to 64.
+            for(var s:inventory.stacks){int moved=Math.min(remaining,Math.max(0,64-s.count));s.count+=moved;remaining-=moved;}
         }
     }
     static class RecipeWrapper {ItemStackHandler inventory;RecipeWrapper(ItemStackHandler i){inventory=i;}}

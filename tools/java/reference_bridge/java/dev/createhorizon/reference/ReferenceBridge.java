@@ -7,6 +7,7 @@ package dev.createhorizon.reference;
 import com.google.gson.*;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.simibubi.create.AllDataComponents;
+import com.simibubi.create.content.schematics.SchematicExport;
 import com.simibubi.create.content.schematics.SchematicItem;
 import com.simibubi.create.content.schematics.packet.SchematicPlacePacket;
 import com.simibubi.create.foundation.utility.CreatePaths;
@@ -117,6 +118,10 @@ public final class ReferenceBridge {
         NeoForge.EVENT_BUS.addListener(RenderFrameEvent.Post.class, event -> afterFrame(Minecraft.getInstance()));
         NeoForge.EVENT_BUS.addListener(ClientTickEvent.Pre.class, event -> beginTap());
         NeoForge.EVENT_BUS.addListener(ClientTickEvent.Post.class, event -> endTap());
+        NeoForge.EVENT_BUS.addListener(net.neoforged.neoforge.event.tick.EntityTickEvent.Pre.class,
+            event -> RiderObservation.tick(event.getEntity(), true));
+        NeoForge.EVENT_BUS.addListener(net.neoforged.neoforge.event.tick.EntityTickEvent.Post.class,
+            event -> RiderObservation.tick(event.getEntity(), false));
         NeoForge.EVENT_BUS.addListener(ServerTickEvent.Post.class, event -> observeServerTick(event.getServer()));
         Runtime.getRuntime().addShutdownHook(new Thread(() -> http.stop(0)));
     }
@@ -199,7 +204,16 @@ public final class ReferenceBridge {
             case "/ui" -> await(client(Observations::ui));
             case "/burner_models" -> await(client(BurnerRenderObservation::models));
             case "/deployer_actor_frames" -> DeployerActorObservation.snapshot();
+            case "/rider_pose" -> await(client(() -> RiderObservation.sample(pos(body, "pos"))));
+            case "/block_light" -> await(client(() -> {
+                var level = Minecraft.getInstance().level;
+                if (level == null) throw new IllegalStateException("No reference client level");
+                var result = new JsonObject();
+                result.addProperty("block_light", level.getBrightness(LightLayer.BLOCK, pos(body, "pos")));
+                return result;
+            }));
             case "/particles" -> await(client(() -> Observations.particles(body)));
+            case "/chute_motion" -> await(client(() -> Observations.chuteMotion(pos(body, "pos"))));
             case "/damage" -> await(server().submit(() -> Observations.damage(server(), body)));
             case "/entities" -> await(server().submit(() -> Observations.entities(player(server()).serverLevel(), body)));
             case "/command" -> await(server().submit(() -> command(server(), body.get("command").getAsString())));
@@ -211,6 +225,7 @@ public final class ReferenceBridge {
             case "/capture" -> capture(body);
             case "/input" -> await(client(() -> input(body)));
             case "/language" -> language(body);
+            case "/schematic_export" -> await(server().submit(() -> schematicExport(body)));
             case "/schematic" -> await(server().submit(() -> schematic(body)));
             case "/quit" -> {client(() -> {Minecraft.getInstance().stop(); return null;}); yield object("status", "stopping");}
             default -> throw new IllegalArgumentException("Unknown reference method " + path);
@@ -630,6 +645,24 @@ public final class ReferenceBridge {
         Property<?> property = state.getBlock().getStateDefinition().getProperty(name);
         if (property == null) throw new IllegalArgumentException("Unknown property " + name);
         return applyProperty(state,property,value);
+    }
+
+    private JsonObject schematicExport(JsonObject body) {
+        var player = player(server());
+        if (!player.isCreative()) throw new IllegalStateException("Reference export requires creative mode");
+        String name = body.get("file").getAsString();
+        if (!name.matches("[a-zA-Z0-9_-]{1,64}\\.nbt")) throw new IllegalArgumentException("Use a plain .nbt filename");
+        Path file = bounded("schematics", name);
+        BlockPos first = pos(body, "first");
+        BlockPos second = pos(body, "second");
+        if (Math.abs((long) first.getX() - second.getX()) >= 64
+            || Math.abs((long) first.getY() - second.getY()) >= 64
+            || Math.abs((long) first.getZ() - second.getZ()) >= 64) {
+            throw new IllegalArgumentException("Reference export sides must be at most 64 blocks");
+        }
+        var result = SchematicExport.saveSchematic(file.getParent(), name, false, player.serverLevel(), first, second);
+        if (result == null) throw new IllegalStateException("Create could not export the schematic");
+        return object("path", result.file().toString());
     }
 
     private JsonObject schematic(JsonObject body) {

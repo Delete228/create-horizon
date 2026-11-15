@@ -5,6 +5,9 @@
 use super::Game;
 use crate::{containers::ModBlockEntity, items::ItemStack};
 use create_engine::placement::Direction;
+use horizon_core::random::RandomSource;
+use horizon_items::item_nbt::item_to_nbt;
+use horizon_world::nbt::Tag;
 pub(super) fn catch(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
     if entity.items.iter().any(Option::is_some) {
         return;
@@ -53,38 +56,95 @@ pub(super) struct Input {
     pub position: [f64; 3],
     pub stack: ItemStack,
 }
-pub(super) fn inputs(game: &Game<'_>, press: [i32; 3]) -> Vec<Input> {
+/// The idle scan deflates the block box by an eighth of a block. The actual
+/// stroke uses the full box and still considers items without a recipe.
+pub(super) fn inputs(game: &Game<'_>, press: [i32; 3], margin: f64) -> Vec<Input> {
     let min = [
         f64::from(press[0]),
         f64::from(press[1] - 1),
         f64::from(press[2]),
     ];
-    game.native_item_entities(game.dim.id(), min, min.map(|v| v + 1.0))
-        .into_iter()
-        .filter(|item| game.dropped.iter().any(|e| e.id == item.id && e.on_ground))
-        .map(|item| Input {
-            id: item.id,
-            position: item.position,
-            stack: item.stack,
-        })
-        .collect()
+    game.native_item_entities(
+        game.dim.id(),
+        min.map(|v| v + margin),
+        min.map(|v| v + 1.0 - margin),
+    )
+    .into_iter()
+    .filter(|item| game.dropped.iter().any(|e| e.id == item.id && e.on_ground))
+    .map(|item| Input {
+        id: item.id,
+        position: item.position,
+        stack: item.stack,
+    })
+    .collect()
 }
-pub(super) fn press(game: &mut Game<'_>, input: Input, output: ItemStack) {
+pub(super) fn strike(game: &mut Game<'_>, pos: [i32; 3], bulk: bool) -> (bool, Vec<Tag>) {
+    // PressingBehaviour.applyInWorld stops at the first grounded item in
+    // nonbulk mode, regardless of whether it has a recipe.
+    let limit = if bulk { usize::MAX } else { 1 };
+    let inputs = inputs(game, pos, 0.0);
+    let grounded = !inputs.is_empty();
+    let particles = inputs
+        .into_iter()
+        .take(limit)
+        .filter_map(|input| {
+            let outputs = super::create_port::press_outputs(game, &input.stack, bulk)?;
+            let particles = press(game, input, outputs, bulk)?;
+            Some(item_to_nbt(&particles))
+        })
+        .collect();
+    (grounded, particles)
+}
+
+fn press(
+    game: &mut Game<'_>,
+    input: Input,
+    outputs: Vec<ItemStack>,
+    bulk: bool,
+) -> Option<ItemStack> {
     let dim = game.dim.id().to_owned();
-    if !game
+    let velocity = game
         .dropped
         .iter()
-        .any(|e| e.id == input.id && e.stack == input.stack && e.on_ground)
-    {
-        return;
-    }
-    if input.stack.count == 1 {
-        game.native_set_item_entity(&dim, input.id, output);
+        .find(|e| e.id == input.id && e.stack == input.stack && e.on_ground)?
+        .velocity;
+    let mut particle = input.stack;
+    let mut outputs = outputs.into_iter();
+    let output = outputs.next()?;
+    if bulk || particle.count == 1 {
+        // RecipeApplier keeps the original entity for the first result and
+        // gives extra result entities its current movement.
+        if !game.native_set_item_entity(&dim, input.id, output) {
+            return None;
+        }
+        for extra in outputs {
+            game.spawn_item(
+                extra,
+                input.position,
+                [velocity.x, velocity.y, velocity.z],
+                0,
+            );
+        }
     } else {
-        let mut rest = input.stack;
-        rest.count -= 1;
-        if game.native_set_item_entity(&dim, input.id, rest) {
-            game.spawn_item(output, input.position, [0.0, 0.05, 0.0], 10);
+        // Java stores the live source stack for particles, then shrinks it.
+        particle.count -= 1;
+        if !game.native_set_item_entity(&dim, input.id, particle.clone()) {
+            return None;
+        }
+        for stack in std::iter::once(output).chain(outputs) {
+            let motion = std::array::from_fn(|_| {
+                f64::from((game.world.random.next_float() - 0.5) * 2.0 * 0.05)
+            });
+            game.spawn_item(stack, input.position, motion, 10);
+            if std::env::var_os("CREATE_HORIZON_TRACE").is_some() {
+                log::info!(
+                    "Create press world split: {}",
+                    serde_json::json!({
+                        "position": input.position, "motion": motion, "pickup_delay": 10,
+                    })
+                );
+            }
         }
     }
+    Some(particle)
 }

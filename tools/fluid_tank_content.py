@@ -12,8 +12,13 @@ def fluid_tank(write, model):
         'item': True,
         'properties': {'occludes': False},
         'state_properties': {'top': {'type': 'boolean'}, 'bottom': {'type': 'boolean'},
-                             'shape': {'type': 'enum', 'values': SHAPES}},
-        'default_state': {'top': 'true', 'bottom': 'true', 'shape': 'window'},
+                             'shape': {'type': 'enum', 'values': SHAPES},
+                             'create_light': {'type': 'enum', 'values': ('0', '1', '12')},
+                             'create_connections': {'type': 'enum', 'values': (
+                                 '0', '5', '6', '7', '9', '10', '11', '13', '14', '15')}},
+        'state_light': {'properties': ['create_light'], 'values': {'0': 0, '1': 1, '12': 12}},
+        'default_state': {'top': 'true', 'bottom': 'true', 'shape': 'window', 'create_light': '0',
+                          'create_connections': '0'},
     })
     model(f'{BLOCK}/block_single', [([0, 0, 0], [16, 16, 16])], 'minecraft:block/copper_block')
     sides = ('down', 'up', 'north', 'south', 'west', 'east')

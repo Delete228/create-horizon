@@ -29,9 +29,11 @@ TAG_SAMPLES = {'minecraft:wool': 'minecraft:cyan_wool',
                'create:stone_types/diorite': 'create:cut_diorite'}
 
 
-def fixtures():
+def fixtures(only=None):
     cases = []
     for path in sorted(RECIPES.glob('*.json')):
+        if only is not None and path.stem != only:
+            continue
         # No supported decorative Tuff item exercises this recipe separately
         # from the plain Tuff recipe, which wins for minecraft:tuff in Java.
         if path.stem == 'tuff_recycling':
@@ -115,7 +117,7 @@ def summarize(trace, lanes):
     return phases
 
 
-def java_run(work):
+def java_run(work, only=None):
     host = Original()
     manifest = json.loads((BASE / 'manifest.json').read_text())
     assert manifest['create_sha256'] == CREATE_SHA256
@@ -128,7 +130,7 @@ def java_run(work):
         x, y, z = CENTRE
         host.command(f'tp @s {x}.5 {y} {z}.5')
         host.call('observe_ticks', {'positions': [CENTRE], 'ticks': 30})
-        for lanes in fixtures():
+        for lanes in fixtures(only):
             points = [(X, y, z) for z, *_ in lanes for y in (Y, Y + 1)]
 
             def observe(ticks):
@@ -146,8 +148,8 @@ def java_run(work):
         (work / 'transcript.json').write_text(json.dumps(host.trace, indent=2) + '\n')
 
 
-def native_run(session):
-    for group, lanes in enumerate(fixtures(), 1):
+def native_run(session, only=None):
+    for group, lanes in enumerate(fixtures(only), 1):
         batch = Batch()
         batch.load(CENTRE)
         setup(batch.command, batch.tick, lanes)
@@ -165,21 +167,23 @@ def native_run(session):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--java', action='store_true')
-    for name in ('game', 'resources', 'ctl', 'reference'):
+    parser.add_argument('--recipe', choices=sorted(p.stem for p in RECIPES.glob('*.json')
+                                                   if p.stem != 'tuff_recycling'))
+    for name in ('game', 'resources', 'ctl', 'reference', 'create-jar'):
         parser.add_argument('--' + name, type=Path)
     args = parser.parse_args()
     if args.java:
         work = Path(tempfile.mkdtemp(prefix='crusher-recipes-java-', dir=ROOT / '.local'))
-        runs = java_run(work)
+        runs = java_run(work, args.recipe)
     else:
         if not all((args.game, args.resources, args.ctl, args.reference)):
             parser.error('Horizon needs --game, --resources, --ctl and --reference')
         reference = json.loads(args.reference.read_text())
         assert reference['passed'] and reference['create'] == PINS['create_revision']
-        session = NativeCheckSession(args.game, args.resources, args.ctl, None, graphics=False,
+        session = NativeCheckSession(args.game, args.resources, args.ctl, args.create_jar, graphics=False,
                                      name='crusher-recipes-native', world='CrusherRecipes')
         work = session.scratch
-        runs = native_run(session)
+        runs = native_run(session, args.recipe)
     phases = {}
     try:
         for group, (lanes, trace) in enumerate(runs, 1):
@@ -189,7 +193,7 @@ def main():
         runs.close()
         if not args.java:
             session.control_temp.cleanup()
-            for path in (session.resources, work / '.horizon-cache'):
+            for path in (session.resources, work / '.horizon-cache', work / 'horizon-mods'):
                 shutil.rmtree(path, ignore_errors=True)
     if not args.java:
         assert phases.keys() == reference['phases'].keys()

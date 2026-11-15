@@ -23,13 +23,16 @@ public class RotaryContactOracle {
         Vec3 pivot = new Vec3(.5, .5, .5);
         try (Scanner input = new Scanner(System.in).useLocale(Locale.ROOT)) {
             while (input.hasNextInt()) {
+                boolean item = input.nextInt() == 1;
                 int axis = input.nextInt();
                 float angle = input.nextFloat();
                 double x = input.nextDouble();
                 double y = input.nextDouble();
                 double z = input.nextDouble();
                 Vec3 velocity = new Vec3(input.nextDouble(), input.nextDouble(), input.nextDouble());
-                AABB bounds = new AABB(x - .3, y, z - .3, x + .3, y + 1.8, z + .3);
+                double radius = item ? .125 : .3;
+                double height = item ? .25 : 1.8;
+                AABB bounds = new AABB(x - radius, y, z - radius, x + radius, y + height, z + radius);
                 Matrix3d matrix = new Matrix3d();
                 float radians = AngleHelper.rad(-angle);
                 switch (axis) {
@@ -38,16 +41,20 @@ public class RotaryContactOracle {
                     case 2 -> matrix.asZRotation(radians);
                     default -> throw new IllegalArgumentException("Unknown axis " + axis);
                 }
-                Vec3 center = bounds.getCenter();
-                Vec3 local = matrix.transform(center.subtract(pivot)).add(pivot);
-                OrientedBB body = new OrientedBB(bounds.contract(0, 2 / 16f, 0)
-                    .move(local.subtract(center)).inflate(1e-7));
+                Vec3 feet = bounds.getBottomCenter();
+                Vec3 centerY = new Vec3(0, bounds.getYsize() / 2, 0);
+                Vec3 local = matrix.transform(feet.add(centerY).subtract(pivot)).add(pivot);
+                OrientedBB body = new OrientedBB((item ? bounds : bounds.contract(0, 2 / 16f, 0))
+                    .move(local.subtract(centerY).subtract(feet)).inflate(1e-7));
                 body.setRotation(matrix);
                 var result = ContinuousOBBCollider.collideMany(shapes, candidates, body,
-                    matrix.transform(velocity), .6f, axis == 1);
+                    matrix.transform(velocity), item ? 0 : .6f, axis == 1);
                 Vec3 world = matrix.transformTransposed(result.collisionResponse);
-                System.out.printf(Locale.ROOT, "contact %s %s %s %s %d%n", world.x, world.y,
-                    world.z, result.temporalResponse, result.surfaceCollision ? 1 : 0);
+                Vec3 normal = matrix.transformTransposed(result.normal).normalize();
+                Vec3 location = matrix.transformTransposed(result.location);
+                System.out.printf(Locale.ROOT, "contact %s %s %s %s %d %s %s %s %s %s %s%n", world.x, world.y,
+                    world.z, result.temporalResponse, result.surfaceCollision ? 1 : 0,
+                    normal.x, normal.y, normal.z, location.x, location.y, location.z);
             }
         }
     }

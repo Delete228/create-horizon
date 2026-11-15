@@ -42,6 +42,54 @@ pub fn mix_colors(a: u32, b: u32, amount: f32) -> u32 {
 pub fn offset_randomly(random: &mut impl ParticleRandom, range: f32) -> [f64; 3] {
     std::array::from_fn(|_| f64::from((random.next_float() - 0.5) * 2.0 * range))
 }
+
+/// `FluidFX.spawnRimParticles` for vanilla dripping water and lava.
+pub fn fluid_rim(
+    pos: Pos,
+    side: Direction,
+    random: &mut impl ParticleRandom,
+) -> ([f64; 3], [f64; 3]) {
+    const RADIUS: f64 = 1.0 / 4.0 + 1.0 / 64.0;
+    let mut offset = offset_randomly(random, 1.0);
+    let length = offset.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if length < 1e-4 {
+        offset = [0.0; 3];
+    } else {
+        offset = offset.map(|v| (v / length).clamp(-RADIUS, RADIUS));
+    }
+    let normal = side.vector().map(f64::from);
+    let axial = 0.45 + f64::from(random.next_float() / 16.0);
+    let offset: [f64; 3] =
+        std::array::from_fn(|i| offset[i] * (1.0 - normal[i].abs()) + normal[i] * axial);
+    let mut at = std::array::from_fn(|i| f64::from(pos[i]) + 0.5 + offset[i]);
+    at[1] -= 1.0 / 16.0;
+    (at, offset.map(|v| v * f64::from(0.05f32)))
+}
+
+/// `FluidFX.spawnPouringLiquid` uses opposite velocity at an intake.
+pub fn fluid_jet(
+    pos: Pos,
+    side: Direction,
+    inbound: bool,
+    random: &mut impl ParticleRandom,
+) -> ([f64; 3], [f64; 3]) {
+    let normal = side.vector().map(f64::from);
+    let center = pos.map(|coordinate| f64::from(coordinate) + 0.5);
+    let offset = offset_randomly(random, (1.0 / 4.0 + 1.0 / 64.0) * 0.75);
+    let axial = 0.5 + f64::from(random.next_float() / 4.0);
+    let radial: [f64; 3] =
+        std::array::from_fn(|i| offset[i] * (1.0 - normal[i].abs()) + normal[i] * axial);
+    let mut motion = radial.map(|v| v / 4.0);
+    let mut at = std::array::from_fn(|i| center[i] + radial[i]);
+    if inbound {
+        for i in 0..3 {
+            at[i] += motion[i];
+            motion[i] = (center[i] + normal[i] * 0.5 - at[i]) / 16.0;
+        }
+    }
+    at[1] -= 1.0 / 16.0;
+    (at, motion)
+}
 /// SuperGlueItem.spawnParticles with fullBlock set, as used on the first click.
 pub fn glue_face(
     pos: Pos,

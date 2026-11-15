@@ -114,6 +114,21 @@
         }
       ]
     },
+    "create/recipe/compacting/chocolate.json": {
+      "type": "create:compacting",
+      "ingredients": [
+        {
+          "type": "neoforge:single",
+          "amount": 250,
+          "fluid": "create:chocolate"
+        }
+      ],
+      "results": [
+        {
+          "id": "create:bar_of_chocolate"
+        }
+      ]
+    },
     "create/recipe/compacting/diorite_from_flint.json": {
       "type": "create:compacting",
       "ingredients": [
@@ -159,6 +174,21 @@
       "results": [
         {
           "id": "minecraft:granite"
+        }
+      ]
+    },
+    "create/recipe/compacting/honey.json": {
+      "type": "create:compacting",
+      "ingredients": [
+        {
+          "type": "neoforge:tag",
+          "amount": 1000,
+          "tag": "c:honey"
+        }
+      ],
+      "results": [
+        {
+          "id": "minecraft:honey_block"
         }
       ]
     },
@@ -2340,6 +2370,21 @@
         {
           "chance": 0.125,
           "id": "minecraft:cobblestone"
+        }
+      ]
+    },
+    "create/recipe/crushing/diorite.json": {
+      "type": "create:crushing",
+      "ingredients": [
+        {
+          "item": "minecraft:diorite"
+        }
+      ],
+      "processing_time": 350,
+      "results": [
+        {
+          "chance": 0.25,
+          "id": "minecraft:quartz"
         }
       ]
     },
@@ -4824,6 +4869,23 @@
         "id": "minecraft:diorite"
       }
     },
+    "create/recipe/emptying/honey_bottle.json": {
+      "type": "create:emptying",
+      "ingredients": [
+        {
+          "item": "minecraft:honey_bottle"
+        }
+      ],
+      "results": [
+        {
+          "id": "minecraft:glass_bottle"
+        },
+        {
+          "amount": 250,
+          "id": "create:honey"
+        }
+      ]
+    },
     "create/recipe/granite_from_stone_types_granite_stonecutting.json": {
       "type": "minecraft:stonecutting",
       "ingredient": {
@@ -6158,6 +6220,21 @@
         }
       ]
     },
+    "create/recipe/mixing/chocolate_melting.json": {
+      "type": "create:mixing",
+      "heat_requirement": "heated",
+      "ingredients": [
+        {
+          "item": "create:bar_of_chocolate"
+        }
+      ],
+      "results": [
+        {
+          "amount": 250,
+          "id": "create:chocolate"
+        }
+      ]
+    },
     "create/recipe/mixing/dough_by_mixing.json": {
       "type": "create:mixing",
       "ingredients": [
@@ -6173,6 +6250,21 @@
       "results": [
         {
           "id": "create:dough"
+        }
+      ]
+    },
+    "create/recipe/mixing/honey.json": {
+      "type": "create:mixing",
+      "heat_requirement": "heated",
+      "ingredients": [
+        {
+          "item": "minecraft:honey_block"
+        }
+      ],
+      "results": [
+        {
+          "amount": 1000,
+          "id": "create:honey"
         }
       ]
     },
@@ -9356,6 +9448,28 @@
           "id": "autumnity:sap_bottle",
           "required": false
         }
+      ]
+    },
+    "c/tags/fluid/honey.json": {
+      "replace": false,
+      "values": [
+        "create:honey"
+      ]
+    },
+    "c/tags/fluid/chocolate.json": {
+      "replace": false,
+      "values": [
+        "create:chocolate"
+      ]
+    },
+    "c/tags/item/foods.json": {
+      "values": [
+        "create:bar_of_chocolate"
+      ]
+    },
+    "c/tags/item/foods/chocolate.json": {
+      "values": [
+        "create:bar_of_chocolate"
       ]
     },
     "minecraft/tags/block/mineable/axe.json": {

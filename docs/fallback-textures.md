@@ -243,6 +243,7 @@ Tiles in `item/fallback/`.
 | `polished_rose_quartz` | Small rounded cube-shaped coral pink crystal with pale top facet |
 | `wheat_flour` | Little cream mound of fine flour with two scattered pale grains |
 | `dough` | Small low beige ball with soft pale cream top |
+| `bar_of_chocolate` | Diagonal dark cocoa slab with a broken corner, raised segments and warm highlights |
 | `blaze_cake` | Small round fiery pastry with orange brown body and molten warm yellow top |
 
 ## Fuel

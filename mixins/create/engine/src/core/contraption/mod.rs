@@ -6,6 +6,8 @@
 pub mod actors;
 mod assembly;
 pub mod bearing;
+pub mod cargo_bounds;
+pub mod cargo_light;
 pub mod cart_assembler;
 pub mod cart_coupling;
 pub mod chassis;

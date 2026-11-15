@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     containers::{BlockEntity, ModBlockEntity, ModContainer},
-    items::ItemStack,
+    items::{ItemStack, Items},
 };
 use create_engine::{
     chute::{self, ENTRY, Source, Step},
@@ -24,10 +24,12 @@ use horizon_world::{
     nbt::{Compound, Tag},
     registry::BlockStateId,
 };
+use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
 
 pub(super) const BLOCK: &str = "create:chute";
 pub(super) const SMART: &str = "create:smart_chute";
 const CASING: &str = "create:industrial_iron_block";
+const DRAW_PREVIOUS: &str = "create:ChutePreviousPosition";
 const HORIZONTAL: [Direction; 4] = [
     Direction::North,
     Direction::South,
@@ -61,6 +63,67 @@ const TOPOLOGY: AttachmentType<Option<Topology>> = AttachmentType {
     sync: false,
 };
 
+#[derive(Default)]
+struct LiftCache {
+    world: usize,
+    dimension: String,
+    tick: i64,
+    air: HashMap<Pos, Option<Lift>>,
+}
+thread_local! { static LIFTS: RefCell<LiftCache> = RefCell::new(LiftCache::default()); }
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Lift {
+    push: f32,
+    pull: f32,
+}
+
+impl Lift {
+    fn read(entity: &ModBlockEntity) -> Self {
+        Self {
+            push: super::create_port::number(&entity.nbt, "Push"),
+            pull: super::create_port::number(&entity.nbt, "Pull"),
+        }
+    }
+
+    fn write(self, entity: &mut ModBlockEntity) {
+        entity
+            .nbt
+            .insert("Push".into(), Tag::Float(self.push.to_bits()));
+        entity
+            .nbt
+            .insert("Pull".into(), Tag::Float(self.pull.to_bits()));
+    }
+
+    fn motion(self) -> f32 {
+        chute::motion(self.push, self.pull)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SuctionTiming {
+    air: Lift,
+    below: Option<BlockStateId>,
+    transport: Option<SuctionSource>,
+    block_check: i32,
+    entity_search: i32,
+}
+
+#[derive(Clone, Copy)]
+enum SuctionSource {
+    Belt(Pos),
+    Depot(Pos),
+}
+
+const SUCTION_TIMING: AttachmentType<SuctionTiming> = AttachmentType {
+    namespace: "create",
+    name: "chute_suction_timing",
+    default: SuctionTiming::default,
+    codec: None,
+    copy_on_death: false,
+    sync: false,
+};
+
 pub(super) fn default_nbt() -> Compound {
     Compound::from([
         ("Item".into(), Tag::Compound(Compound::new())),
@@ -83,23 +146,13 @@ pub(super) fn is_chute(block: &str) -> bool {
     matches!(block, BLOCK | SMART)
 }
 
-pub(super) fn container(block: &str) -> ModContainer {
+pub(super) fn container() -> ModContainer {
     ModContainer {
         slots: 1,
         faces: std::array::from_fn(|_| vec![0]),
-        // Native containers have no dynamic input predicate. Chute-to-Chute
-        // and landing admissions check the Smart Chute's power and filter.
-        inputs: if block == SMART { Vec::new() } else { vec![0] },
+        inputs: vec![0],
         outputs: vec![0],
         menu: None,
-    }
-}
-
-fn dry(game: &Game<'_>, pos: Pos) -> bool {
-    match game.native_block(pos).as_str() {
-        SMART => true,
-        BLOCK => game.native_block_property(pos, "waterlogged").as_deref() == Some("false"),
-        _ => false,
     }
 }
 
@@ -287,8 +340,218 @@ fn empty(entity: &ModBlockEntity) -> bool {
 }
 
 fn still_air(entity: &ModBlockEntity) -> bool {
-    super::create_port::number(&entity.nbt, "Pull") == 0.0
-        && super::create_port::number(&entity.nbt, "Push") == 0.0
+    Lift::read(entity) == Lift::default()
+}
+
+pub(super) fn visual_air(entity: &ModBlockEntity) -> Option<(f32, f32)> {
+    let air = Lift::read(entity);
+    let motion = air.motion();
+    let distance = super::create_port::number(&entity.nbt, "BottomAirFlowDistance");
+    (air != Lift::default() && motion.is_finite() && distance.is_finite())
+        .then_some((motion, distance))
+}
+
+// Java checks the block directly above, then walks North, South, West, East
+// and looks back toward the parent from each diagonal above it.
+fn input_candidates(pos: Pos) -> [(Pos, Direction); 5] {
+    let [north, south, west, east] = HORIZONTAL;
+    [
+        Direction::Down,
+        north.opposite(),
+        south.opposite(),
+        west.opposite(),
+        east.opposite(),
+    ]
+    .map(|face| (offset(pos, face, 1), face))
+}
+
+fn loaded_state<'a>(game: &'a Game<'_>, [x, y, z]: Pos) -> Option<&'a BlockState> {
+    game.world.loaded(x, z).then_some(())?;
+    game.pack.assets.registry.state(game.world.block(x, y, z))
+}
+
+fn ordinary_facing(state: &BlockState) -> Option<Direction> {
+    if state.name != BLOCK {
+        return None;
+    }
+    direction(state)
+}
+
+fn is_fan(state: &BlockState, facing: Direction) -> bool {
+    state.name == "create:encased_fan"
+        && state
+            .properties
+            .get("facing")
+            .is_some_and(|value| value == DIRECTION_NAMES[facing as usize])
+}
+
+/// One ordinary network with one end Fan. A bottom Fan can feed a single
+/// angled edge and fork, while a top Fan is restricted to a straight run.
+fn lift_run(game: &Game<'_>, seed: Pos) -> Option<(Vec<(Pos, f32)>, Lift)> {
+    let mut root = seed;
+    let below = loop {
+        let facing = ordinary_facing(loaded_state(game, root)?)?;
+        let target = offset(root, facing.opposite(), -1);
+        let state = loaded_state(game, target)?;
+        if !is_chute(&state.name) {
+            if facing != Direction::Down {
+                return None;
+            }
+            break target;
+        }
+        root = target;
+    };
+    let bottom = is_fan(loaded_state(game, below)?, Direction::Up).then_some(below);
+    let mut top = None;
+    let mut angled = false;
+    let mut run = vec![(root, 1.0)];
+    let mut current = 0;
+    while let Some(&(pos, share)) = run.get(current) {
+        current += 1;
+        if pos != root
+            && is_fan(
+                loaded_state(game, offset(pos, Direction::Down, -1))?,
+                Direction::Up,
+            )
+        {
+            return None;
+        }
+        let above = offset(pos, Direction::Up, 1);
+        if is_fan(loaded_state(game, above)?, Direction::Down) {
+            if bottom.is_some() || top.replace(above).is_some() {
+                return None;
+            }
+        }
+
+        let start = run.len();
+        for (child, facing) in input_candidates(pos) {
+            let state = loaded_state(game, child)?;
+            if direction(state) != Some(facing) {
+                continue;
+            }
+            ordinary_facing(state)?;
+            if facing != Direction::Down {
+                if angled || bottom.is_none() {
+                    return None;
+                }
+                angled = true;
+            }
+            run.push((child, share));
+        }
+        if run.len() - start == 2 {
+            // Java gives each input the parent's push divided by the number of inputs.
+            run[start..].iter_mut().for_each(|(_, share)| *share /= 2.0);
+        }
+    }
+
+    let speed = |p: Pos| match game.world.block_entities.get(&(p[0], p[1], p[2])) {
+        Some(BlockEntity::Mod(entity)) if entity.id == "create:encased_fan" => {
+            super::create_port::running_speed(game, &entity.nbt)
+        }
+        _ => 0.0,
+    };
+    let air = Lift {
+        push: bottom.map_or(0.0, speed),
+        pull: top.map_or(0.0, speed),
+    };
+    (air.push.is_finite() && air.pull.is_finite()).then_some((run, air))
+}
+
+fn cache_lifts(game: &Game<'_>, seed: Pos, changed_fan: Option<(Direction, f32)>) -> Option<Lift> {
+    LIFTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let world = std::ptr::from_ref(&game.world) as usize;
+        if cache.world != world
+            || cache.dimension != game.dim.id()
+            || cache.tick != game.world.game_time
+        {
+            cache.world = world;
+            game.dim.id().clone_into(&mut cache.dimension);
+            cache.tick = game.world.game_time;
+            cache.air.clear();
+        }
+        if changed_fan.is_none()
+            && let Some(air) = cache.air.get(&seed)
+        {
+            return *air;
+        }
+        let Some((run, mut air)) = lift_run(game, seed) else {
+            cache.air.insert(seed, None);
+            return None;
+        };
+        if let Some((facing, speed)) = changed_fan {
+            match facing {
+                Direction::Up => air.push = speed,
+                Direction::Down => air.pull = speed,
+                _ => return None,
+            }
+        }
+        cache.air.extend(run.into_iter().map(|(pos, share)| {
+            (
+                pos,
+                Some(Lift {
+                    push: air.push * share,
+                    pull: air.pull,
+                }),
+            )
+        }));
+        cache.air.get(&seed).copied().flatten()
+    })
+}
+
+fn lift_air(game: &Game<'_>, pos: Pos) -> Option<Lift> {
+    cache_lifts(game, pos, None)
+}
+
+/// EncasedFanBlockEntity.onSpeedChanged updates nearby Chute data immediately,
+/// even when those Chutes have already taken their item movement turn.
+pub(super) fn publish_fan_air(game: &mut Game<'_>, fan: Pos, speed: f32) {
+    if !speed.is_finite() {
+        return;
+    }
+    let facing = match game.native_block_property(fan, "facing").as_deref() {
+        Some("up") => Direction::Up,
+        Some("down") => Direction::Down,
+        _ => return,
+    };
+    let seed = offset(fan, facing, facing.normal()[1]);
+    if cache_lifts(game, seed, Some((facing, speed))).is_none() {
+        return;
+    }
+    let mut pending = vec![seed];
+    while let Some(pos) = pending.pop() {
+        let Some(air) = lift_air(game, pos) else {
+            continue;
+        };
+        let changed = entity_at(game, pos).is_some_and(|entity| Lift::read(entity) != air);
+        if changed {
+            game.native_with_mod_block_entity(pos, |entity| air.write(entity));
+            game.native_block_entity_sync(pos);
+        }
+        if facing == Direction::Up {
+            pending.extend(
+                input_candidates(pos)
+                    .into_iter()
+                    .filter_map(|(child, face)| {
+                        (loaded_state(game, child).and_then(ordinary_facing) == Some(face))
+                            .then_some(child)
+                    }),
+            );
+        } else {
+            let below = offset(pos, Direction::Down, -1);
+            if loaded_state(game, below).and_then(ordinary_facing) == Some(Direction::Down) {
+                pending.push(below);
+            }
+        }
+    }
+}
+
+fn entry_position(game: &Game<'_>, pos: Pos) -> f32 {
+    if lift_air(game, pos).is_some_and(|air| air.motion() > 0.0) {
+        0.0
+    } else {
+        ENTRY
+    }
 }
 
 fn set_position(entity: &mut ModBlockEntity, value: f32) {
@@ -307,6 +570,7 @@ fn item_data(entity: &ModBlockEntity) -> Tag {
 }
 
 fn set_item(entity: &mut ModBlockEntity, stack: Option<ItemStack>, position: f32) {
+    entity.clear_client_update_fields();
     if entity.items.is_empty() {
         entity.items.push(stack);
     } else {
@@ -360,40 +624,239 @@ fn enter_at(game: &mut Game<'_>, pos: Pos, stack: ItemStack, start: f32) -> bool
 }
 
 fn can_enter(game: &Game<'_>, pos: Pos, stack: &ItemStack) -> bool {
-    dry(game, pos)
+    is_chute(&game.native_block(pos))
         && entity_at(game, pos).is_some_and(|entity| {
             entity.items.len() <= 1
-                && still_air(entity)
+                && (still_air(entity) || lift_air(game, pos).is_some())
                 && empty(entity)
                 && (entity.id != SMART
-                    || (!powered(game, pos) && accepts_filter(game, entity, stack)))
+                    || (!powered(game, pos) && accepts_filter(game.items(), entity, stack)))
         })
 }
 
+pub(super) fn automation_accepts(
+    items: &Items,
+    entity: &ModBlockEntity,
+    slot: usize,
+    stack: &ItemStack,
+) -> bool {
+    // ChuteItemHandler.insertItem rejects an occupied Chute even when a
+    // matching stack could merge. Vanilla still owns its transfer and rollback.
+    slot == 0
+        && stack.count > 0
+        && entity.items.len() <= 1
+        && still_air(entity)
+        && empty(entity)
+        && accepts_filter(items, entity, stack)
+}
+
 pub(super) fn external_change(game: &mut Game<'_>, (x, y, z): (i32, i32, i32)) {
-    let Some(BlockEntity::Mod(entity)) = game.world.block_entities.get_mut(&(x, y, z)) else {
+    let pos = [x, y, z];
+    let Some(entity) = entity_at(game, pos) else {
         return;
     };
-    if !is_chute(&entity.id) {
-        return;
-    }
     let item = item_data(entity);
     if entity.nbt.get(&"Item".into()) == Some(&item) {
         return;
     }
-    entity.nbt.insert("Item".into(), item);
-    set_position(entity, ENTRY);
-    remember(game, [x, y, z], None);
-    game.native_block_entity_sync([x, y, z]);
+    let start = entry_position(game, pos);
+    if let Some(BlockEntity::Mod(entity)) = game.world.block_entities.get_mut(&(x, y, z)) {
+        entity.clear_client_update_fields();
+        entity.nbt.insert("Item".into(), item);
+        set_position(entity, start);
+    }
+    remember(game, pos, None);
+    game.native_block_entity_sync(pos);
 }
 
-fn pull(game: &mut Game<'_>, [x, y, z]: Pos, smart: Option<&ModBlockEntity>) -> Option<ItemStack> {
-    let source = [x, y + 1, z];
-    if !game.chute_source_available((x, y + 1, z)) {
+fn suction_source(game: &Game<'_>, pos: Pos, distance: f32) -> Option<SuctionSource> {
+    // Java chooses the first transported-item handler, including one in the
+    // block immediately beyond the unobstructed reach. A Depot or sloped
+    // Belt still takes precedence over a more distant horizontal Belt.
+    for depth in 1..=(distance as i32 + 1) {
+        let source = offset(pos, Direction::Down, -depth);
+        let state = loaded_state(game, source)?;
+        match state.name.as_str() {
+            "create:depot" => return Some(SuctionSource::Depot(source)),
+            "create:belt" => {
+                return state
+                    .properties
+                    .get("slope")
+                    .is_some_and(|slope| slope == "horizontal")
+                    .then_some(SuctionSource::Belt(source));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_from_belt(game: &mut Game<'_>, pos: Pos) -> Option<ItemStack> {
+    use super::create_port_belt as belt;
+    let mut captured = None;
+    let removed = belt::apply_to_each_within(game, pos, 0.5, |_, item| {
+        if captured.is_some() || item.stack.count == 0 {
+            return None;
+        }
+        captured = Some(belt::game_stack(&item.stack));
+        Some(create_engine::transport::TransportedResult::Convert {
+            outputs: Vec::new(),
+            held: None,
+        })
+    });
+    if removed == 1 { captured } else { None }
+}
+
+fn capture_transport(
+    game: &mut Game<'_>,
+    pos: Pos,
+    chute: &mut ModBlockEntity,
+    source: SuctionSource,
+) -> bool {
+    let location = match source {
+        SuctionSource::Belt(location) | SuctionSource::Depot(location) => location,
+    };
+    let start = (location[1] + 1 - pos[1]) as f32;
+    match source {
+        SuctionSource::Belt(_) => extract_from_belt(game, location).is_some_and(|stack| {
+            set_item(chute, Some(stack), start);
+            true
+        }),
+        SuctionSource::Depot(_) => {
+            let moved = game
+                .native_with_mod_block_entity(location, |depot| {
+                    if depot.id != "create:depot" || !super::create_port::inventory_supported(depot)
+                    {
+                        return None;
+                    }
+                    let Tag::Compound(held) = depot.nbt.get(&"HeldItem".into())? else {
+                        return None;
+                    };
+                    // DepotBehaviour compares the one-sided distance to centre.
+                    if 0.5 - super::create_port::number(held, "Pos") > 0.5 {
+                        return None;
+                    }
+                    let slot = depot.items.first_mut()?;
+                    let stack = slot.as_ref().filter(|stack| stack.count > 0)?;
+                    set_item(chute, Some(stack.clone()), start);
+                    *slot = None;
+                    super::create_port::depot_data(depot);
+                    Some(())
+                })
+                .flatten()
+                .is_some();
+            if moved {
+                game.native_block_entity_sync(location);
+            }
+            moved
+        }
+    }
+}
+
+fn suction_tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity, air: Lift) {
+    let below = offset(pos, Direction::Down, -1);
+    let below_state = game.world.block(below[0], below[1], below[2]);
+    let key = (pos[0], pos[1], pos[2]);
+    let Some(map) = game.world.block_entities.attachments_mut(key) else {
+        return;
+    };
+    let mut timing = map
+        .get_existing(&SUCTION_TIMING)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let block_due = timing.block_check <= 0;
+    let search_due = timing.entity_search <= 0 && empty(entity);
+    let rebuild = block_due || timing.air != air || timing.below != Some(below_state);
+    timing.block_check = if block_due {
+        super::create_port_server_config::fan().block_check_rate
+    } else {
+        timing.block_check - 1
+    };
+    timing.entity_search = if search_due {
+        5
+    } else {
+        timing.entity_search.wrapping_sub(1)
+    };
+    timing.below = Some(below_state);
+    timing.air = air;
+
+    let upwards = air.motion() > 0.0;
+    let mut distance = super::create_port::number(&entity.nbt, "BottomAirFlowDistance");
+    if upwards && rebuild {
+        let limit = chute::suction_range(air.pull - air.push);
+        let next = if limit > 0.0 && !is_chute(&game.native_block(below)) {
+            super::create_port_fan::flow_limit(
+                game,
+                pos,
+                create_engine::placement::Direction::Down,
+                limit,
+            )
+        } else {
+            0.0
+        };
+        timing.transport = if air.pull >= air.push {
+            suction_source(game, pos, next)
+        } else {
+            None
+        };
+        if distance != next {
+            distance = next;
+            entity
+                .nbt
+                .insert("BottomAirFlowDistance".into(), Tag::Float(next.to_bits()));
+            game.native_block_entity_sync(pos);
+        }
+    }
+    if let Some(map) = game.world.block_entities.attachments_mut(key) {
+        let _ = map.set(&SUCTION_TIMING, timing);
+    }
+
+    if !upwards || !empty(entity) || !distance.is_finite() {
+        return;
+    }
+    let mut captured = None;
+    if search_due {
+        let [x, y, z] = pos.map(f64::from);
+        let margin = f64::from(0.45_f32);
+        let min = [
+            x + 0.5 - margin,
+            y - f64::from(distance) - margin,
+            z + 0.5 - margin,
+        ];
+        let max = [x + 0.5 + margin, y + margin, z + 0.5 + margin];
+        let dim = game.dim.id();
+        if let Some(item) = game.native_item_entities(dim, min, max).into_iter().next()
+            && game.native_set_item_entity(dim, item.id, ItemStack::new("minecraft:air", 0))
+        {
+            captured = Some((item.stack, (item.position[1] + 0.125 - y) as f32));
+        }
+    }
+    if let Some((stack, start)) = captured {
+        set_item(entity, Some(stack), start);
+    } else if !timing
+        .transport
+        .is_some_and(|source| capture_transport(game, pos, entity, source))
+    {
+        return;
+    }
+    remember(game, pos, None);
+    game.native_block_entity_sync(pos);
+}
+
+fn pull(
+    game: &mut Game<'_>,
+    [x, y, z]: Pos,
+    source_face: Direction,
+    smart: Option<&ModBlockEntity>,
+) -> Option<ItemStack> {
+    let source = [x, y + source_face.normal()[1], z];
+    if !game.chute_source_available((source[0], source[1], source[2])) {
         return None;
     }
     let dim = game.dim.id();
-    let slots = game.native_container_slots(dim, source, Direction::Down)?;
+    let side = source_face.opposite();
+    let slots = game.native_container_slots(dim, source, side)?;
     let filter = match smart {
         Some(entity) => read_filter(game, entity)?,
         None => None,
@@ -427,7 +890,7 @@ fn pull(game: &mut Game<'_>, [x, y, z]: Pos, smart: Option<&ModBlockEntity>) -> 
     } else {
         chute::pull_plan(slots, ItemStack::same_item_same_components)
     };
-    take_from(game, source, Direction::Down, plan)
+    take_from(game, source, side, plan)
 }
 
 fn take_from(
@@ -497,6 +960,7 @@ enum Route {
     Blocked,
     Chute { target: Pos, start: f32 },
     Inventory(BelowInventory),
+    UpperInventory,
     Drop,
 }
 
@@ -509,6 +973,7 @@ enum BelowInventory {
     Crusher,
     Saw,
     Millstone,
+    Crafter,
 }
 
 impl BelowInventory {
@@ -528,7 +993,12 @@ impl BelowInventory {
                 super::create_port_belt::insert_depot_from_chute(game, below, stack, simulate)
             }
             Self::Container => {
-                return game.chute_insert((below[0], below[1], below[2]), stack, simulate);
+                return game.insert_stacked_from_side(
+                    (below[0], below[1], below[2]),
+                    Direction::Up,
+                    stack,
+                    simulate,
+                );
             }
             Self::PortableStorage => {
                 super::create_port_portable_storage::push_chute(game, below, pos, stack, simulate)
@@ -542,6 +1012,9 @@ impl BelowInventory {
             Self::Millstone => {
                 super::create_port_millstone::insert_from_transport(game, below, stack, simulate)
             }
+            Self::Crafter => super::create_port_saw_processing::crafter::insert_linked(
+                game, below, stack, simulate,
+            ),
         })
     }
 }
@@ -578,6 +1051,7 @@ fn route_below(
         super::create_port_saw_processing::crushing::CONTROLLER => BelowInventory::Crusher,
         super::create_port_drill::SAW => BelowInventory::Saw,
         super::create_port_millstone::ID => BelowInventory::Millstone,
+        super::create_port_saw_processing::crafter::BLOCK => BelowInventory::Crafter,
         _ => BelowInventory::Container,
     };
     if let Some(moved) = inventory.insert(game, pos, below, stack, true) {
@@ -617,8 +1091,76 @@ fn route(game: &mut Game<'_>, pos: Pos, below: Pos, stack: &ItemStack, facing: D
     }
 }
 
+fn route_above(game: &mut Game<'_>, pos: Pos, facing: Direction, stack: &ItemStack) -> Route {
+    let above = offset(pos, Direction::Up, 1);
+    if !super::create_port_contraption::resident(game, above) {
+        return Route::Blocked;
+    }
+    let block = game.native_block(above);
+    if open_chute(game, pos, facing)
+        && !is_chute(&block)
+        && let Some(count) = game.insert_stacked_from_side(
+            (above[0], above[1], above[2]),
+            Direction::Down,
+            stack,
+            true,
+        )
+    {
+        return if count > 0 {
+            Route::UpperInventory
+        } else {
+            Route::Blocked
+        };
+    }
+
+    let mut has_input = false;
+    let mut best = None;
+    for (target, face) in input_candidates(pos) {
+        let Some(state) = loaded_state(game, target) else {
+            return Route::Blocked;
+        };
+        if direction(state) != Some(face) {
+            continue;
+        }
+        has_input = true;
+        if can_enter(game, target, stack)
+            && let Some(air) = lift_air(game, target)
+        {
+            let motion = air.motion();
+            if motion >= 0.0 && best.is_none_or(|(_, faster)| motion > faster) {
+                best = Some((target, motion));
+            }
+        }
+    }
+    if let Some((target, _)) = best {
+        return Route::Chute { target, start: 0.0 };
+    }
+    let state = game.world.block(above[0], above[1], above[2]);
+    if has_input
+        || (funnel::is_funnel(&block)
+            && game.native_block_property(above, "facing").as_deref() == Some("up"))
+        || game.res.behaviours().is_face_sturdy(state, Direction::Down)
+    {
+        Route::Blocked
+    } else {
+        Route::Drop
+    }
+}
+
 pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
-    if !dry(game, pos) || !is_chute(&entity.id) || entity.items.len() > 1 || !still_air(entity) {
+    if entity.id == SMART {
+        restore_filter_amount(game, pos, entity);
+    }
+    if !is_chute(&game.native_block(pos)) || !is_chute(&entity.id) || entity.items.len() > 1 {
+        return;
+    }
+    let air = lift_air(game, pos);
+    if let Some(next) = air {
+        if next != Lift::read(entity) {
+            next.write(entity);
+            game.native_block_entity_sync(pos);
+        }
+    } else if !still_air(entity) {
         return;
     }
     let Some(facing) = update_shape(game, pos) else {
@@ -626,28 +1168,38 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
     };
     let smart = entity.id == SMART;
     let powered = smart && refresh_power(game, pos);
+    let motion = air.unwrap_or_default().motion();
+    if let Some(air) = air {
+        suction_tick(game, pos, entity, air);
+    }
     let Some(stack) = entity
         .items
         .first()
         .and_then(Option::as_ref)
         .filter(|stack| stack.count > 0)
     else {
-        if powered {
+        if powered || motion == 0.0 {
             return;
         }
         let above = [pos[0], pos[1] + 1, pos[2]];
-        let pulled =
-            if !smart && game.native_block(above) == super::create_port_portable_storage::BLOCK {
-                super::create_port_portable_storage::pull_chute(game, above, |_, item| {
-                    set_item(entity, Some(item.clone()), ENTRY);
-                    true
-                })
-            } else if let Some(item) = pull(game, pos, smart.then_some(&*entity)) {
-                set_item(entity, Some(item), ENTRY);
+        let pulled = if motion > 0.0 {
+            if let Some(item) = pull(game, pos, Direction::Down, None) {
+                set_item(entity, Some(item), 0.0);
                 true
             } else {
                 false
-            };
+            }
+        } else if !smart && game.native_block(above) == super::create_port_portable_storage::BLOCK {
+            super::create_port_portable_storage::pull_chute(game, above, |_, item| {
+                set_item(entity, Some(item.clone()), ENTRY);
+                true
+            })
+        } else if let Some(item) = pull(game, pos, Direction::Up, smart.then_some(&*entity)) {
+            set_item(entity, Some(item), ENTRY);
+            true
+        } else {
+            false
+        };
         if pulled {
             remember(game, pos, None);
             game.native_block_entity_sync(pos);
@@ -659,20 +1211,38 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
         return;
     }
     let below = [pos[0], pos[1] - 1, pos[2]];
+    let above = [pos[0], pos[1] + 1, pos[2]];
     let mut output = Route::Blocked;
-    match chute::step(offset, || {
+    match chute::step(offset, motion, || {
         if !powered {
-            output = route(game, pos, below, stack, facing);
+            output = if motion > 0.0 {
+                route_above(game, pos, facing, stack)
+            } else {
+                route(game, pos, below, stack, facing)
+            };
         }
         !matches!(output, Route::Blocked)
     }) {
         Step::Position(next) => {
+            let moved = next != offset;
+            let stopped = !moved && previous(game, pos, offset) != offset;
             remember(game, pos, Some(offset));
-            if next != offset {
+            if moved {
                 set_position(entity, next);
-                if smart || game.native_block_property(pos, "shape").as_deref() == Some("window") {
-                    game.native_block_entity_sync(pos);
-                }
+            }
+            if (moved || stopped)
+                && (smart
+                    || game.native_block_property(pos, "shape").as_deref() == Some("window")
+                    || shows_suction_cargo(entity, offset.min(next)))
+            {
+                // Send the previous render endpoint on movement and reset it
+                // on the first stationary tick. The authoritative NBT remains
+                // the same Java ItemPosition field in both cases.
+                entity.set_client_update_fields(Compound::from([(
+                    DRAW_PREVIOUS.into(),
+                    Tag::Float(offset.to_bits()),
+                )]));
+                game.native_block_entity_sync(pos);
             }
         }
         Step::Output => {
@@ -682,7 +1252,7 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
                     if !enter_at(game, target, stack, start) {
                         return;
                     }
-                    set_item(entity, None, ENTRY);
+                    set_item(entity, None, if motion > 0.0 { 0.0 } else { ENTRY });
                 }
                 Route::Inventory(inventory) => {
                     let mut rest = stack;
@@ -693,20 +1263,38 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
                     let previous = previous(game, pos, offset);
                     set_item(entity, (rest.count != 0).then_some(rest), previous);
                 }
+                Route::UpperInventory => {
+                    let mut rest = stack;
+                    let moved = game
+                        .insert_stacked_from_side(
+                            (above[0], above[1], above[2]),
+                            Direction::Down,
+                            &rest,
+                            false,
+                        )
+                        .unwrap_or(0);
+                    rest.count -= moved;
+                    set_item(entity, (rest.count != 0).then_some(rest), offset);
+                }
                 Route::Drop => {
+                    let (height, velocity, start) = if motion > 0.0 {
+                        (1.0, f64::from(motion * 2.0), 0.0)
+                    } else {
+                        (-0.25, -0.25, ENTRY)
+                    };
                     game.spawn_item(
                         stack,
                         [
                             f64::from(pos[0]) + 0.5,
-                            f64::from(pos[1]) - 0.25,
+                            f64::from(pos[1]) + height,
                             f64::from(pos[2]) + 0.5,
                         ],
-                        [0.0, -0.25, 0.0],
+                        [0.0, velocity, 0.0],
                         10,
                     );
-                    set_item(entity, None, ENTRY);
+                    set_item(entity, None, start);
                 }
-                _ => return,
+                Route::Blocked => return,
             }
             remember(game, pos, None);
             game.native_block_entity_sync(pos);
@@ -714,25 +1302,37 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
     }
 }
 
+fn open_chute(game: &Game<'_>, pos: Pos, facing: Direction) -> bool {
+    facing == Direction::Down
+        || game.native_block_property(pos, "shape").as_deref() == Some("intersection")
+}
+
+pub(super) fn accepts_direct_input(game: &Game<'_>, pos: Pos) -> bool {
+    let above = offset(pos, Direction::Up, 1);
+    is_chute(&game.native_block(pos))
+        && loaded_state(game, above).and_then(direction) != Some(Direction::Down)
+        && loaded_state(game, pos)
+            .and_then(direction)
+            .is_some_and(|facing| open_chute(game, pos, facing))
+        && (!lift_air(game, pos).is_some_and(|air| air.motion() > 0.0)
+            || input_candidates(pos)
+                .into_iter()
+                .any(|(child, face)| loaded_state(game, child).and_then(direction) == Some(face)))
+}
+
 pub(super) fn insert_from_transport(game: &mut Game<'_>, pos: Pos, stack: &ItemStack) -> u32 {
-    let above = [pos[0], pos[1] + 1, pos[2]];
-    let registry = game.pack.assets.registry;
-    let state_at = |[x, y, z]: Pos| registry.state(game.world.block(x, y, z));
-    if !game.native_on("create")
-        || !dry(game, pos)
-        || state_at(above).and_then(direction) == Some(Direction::Down)
-        || !state_at(pos).is_some_and(|block| {
-            direction(block) == Some(Direction::Down)
-                || block
-                    .properties
-                    .get("shape")
-                    .is_some_and(|shape| shape == "intersection")
-        })
-        || stack.count == 0
-    {
+    if !accepts_direct_input(game, pos) {
         return 0;
     }
-    // Direct input can run before the Chute's block-entity tick. Observe
+    insert_from_inventory(game, pos, stack)
+}
+
+/// ChuteItemHandler remains available when the direct Belt entrance is closed.
+pub(super) fn insert_from_inventory(game: &mut Game<'_>, pos: Pos, stack: &ItemStack) -> u32 {
+    if !game.native_on("create") || stack.count == 0 {
+        return 0;
+    }
+    // Insertion can run before the Chute's block-entity tick. Observe
     // the current neighbor signal just as SmartChuteBlock does on change.
     if game.native_block(pos) == SMART && refresh_power(game, pos) {
         return 0;
@@ -740,6 +1340,7 @@ pub(super) fn insert_from_transport(game: &mut Game<'_>, pos: Pos, stack: &ItemS
     let count = stack
         .count
         .min(super::create_port::stack_maximum(game, stack));
+    let start = entry_position(game, pos);
     if count == 0
         || !enter_at(
             game,
@@ -748,7 +1349,7 @@ pub(super) fn insert_from_transport(game: &mut Game<'_>, pos: Pos, stack: &ItemS
                 count,
                 ..stack.clone()
             },
-            ENTRY,
+            start,
         )
     {
         return 0;
@@ -794,6 +1395,29 @@ fn filter_maximum(game: &Game<'_>, sample: Option<&ItemStack>) -> u32 {
     sample.map_or(64, |stack| super::create_port::stack_maximum(game, stack))
 }
 
+fn has_legacy_filter_amount(entity: &ModBlockEntity) -> bool {
+    super::create_port::integer(&entity.nbt, "FilterAmount") == 0
+}
+
+fn write_legacy_filter_amount(entity: &mut ModBlockEntity, amount: u32) {
+    // FilteringBehaviour.read migrates a legacy zero using the filter that
+    // was saved with it. A later filter replacement must keep this amount.
+    entity
+        .nbt
+        .insert("FilterAmount".into(), Tag::Int(amount as i32));
+    entity.nbt.insert("UpTo".into(), Tag::Byte(1));
+}
+
+fn restore_filter_amount(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
+    if has_legacy_filter_amount(entity)
+        && let Some(filter) = read_filter(game, entity)
+    {
+        let amount = filter_maximum(game, filter.as_ref());
+        write_legacy_filter_amount(entity, amount);
+        game.native_block_entity_sync(pos);
+    }
+}
+
 fn extraction_amount(entity: &ModBlockEntity, maximum: u32) -> Option<(u32, bool)> {
     match super::create_port::integer(&entity.nbt, "FilterAmount") {
         0 => Some((maximum, false)),
@@ -807,11 +1431,11 @@ fn exact_amount(entity: &ModBlockEntity) -> bool {
 }
 
 fn read_filter(game: &Game<'_>, entity: &ModBlockEntity) -> Option<Option<ItemStack>> {
-    super::create_port_saw_processing::read_filter(game, entity)
+    super::create_port_saw_processing::read_filter(game.items(), entity)
 }
 
-fn accepts_filter(game: &Game<'_>, entity: &ModBlockEntity, stack: &ItemStack) -> bool {
-    read_filter(game, entity)
+fn accepts_filter(items: &Items, entity: &ModBlockEntity, stack: &ItemStack) -> bool {
+    super::create_port_saw_processing::read_filter(items, entity)
         .is_some_and(|filter| filter.is_none_or(|filter| filter.item == stack.item))
 }
 
@@ -1012,17 +1636,24 @@ fn change_filter(game: &mut Game<'_>, pos: Pos, id: &str, sample: Option<&ItemSt
         matches!(
             stack.item.as_ref(),
             "create:wrench" | "create:mechanical_arm" | "create:clipboard"
-        ) || !super::create_port_saw_processing::ordinary_filter_item(game, stack)
-    }) || filter_entity(game, pos, id)
-        .and_then(|e| read_filter(game, e))
-        .is_none()
-    {
+        ) || !super::create_port_saw_processing::ordinary_filter_item(game.items(), stack)
+    }) {
         return true;
     }
+    let Some(entity) = filter_entity(game, pos, id) else {
+        return true;
+    };
+    let Some(current) = read_filter(game, entity) else {
+        return true;
+    };
+    let legacy = has_legacy_filter_amount(entity).then(|| filter_maximum(game, current.as_ref()));
     let maximum = sample.map(|stack| filter_maximum(game, Some(stack)) as i32);
     let sample = sample.map_or_else(|| Tag::Compound(Compound::new()), item_to_nbt);
     if game
         .native_with_mod_block_entity(pos, |entity| {
+            if let Some(amount) = legacy {
+                write_legacy_filter_amount(entity, amount);
+            }
             entity.nbt.insert("Filter".into(), sample);
             if matches!(entity.nbt.get(&"UpTo".into()), Some(Tag::Byte(0)))
                 && let (Some(max), Some(Tag::Int(count))) =
@@ -1080,7 +1711,7 @@ fn shape_change(game: &Game<'_>, pos: Pos, item: &ItemStack) -> Option<(String, 
 
 pub(super) fn predicts_use(game: &Game<'_>, pos: Pos) -> bool {
     game.native_on("create")
-        && dry(game, pos)
+        && is_chute(&game.native_block(pos))
         && (game.native_block(pos) == SMART && filter_hit(game, pos, 11.0 / 16.0)
             || game
                 .held()
@@ -1088,7 +1719,7 @@ pub(super) fn predicts_use(game: &Game<'_>, pos: Pos) -> bool {
 }
 
 pub(super) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
-    if !game.native_on("create") || !dry(game, pos) {
+    if !game.native_on("create") || !is_chute(&game.native_block(pos)) {
         return false;
     }
     if game.native_block(pos) == SMART && filter_hit(game, pos, 11.0 / 16.0) {
@@ -1138,17 +1769,38 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
     }
 }
 
+fn shows_suction_cargo(entity: &ModBlockEntity, offset: f32) -> bool {
+    offset <= 0.5 && super::create_port::number(&entity.nbt, "BottomAirFlowDistance") != 0.0
+}
+
+pub(super) fn update_render_tag(entity: &ModBlockEntity, tag: &mut Compound) {
+    let current = tag
+        .get(&"ItemPosition".into())
+        .cloned()
+        .unwrap_or(Tag::Float(0));
+    tag.insert(DRAW_PREVIOUS.into(), current);
+    tag.extend(entity.take_client_update_fields());
+}
+
 pub(super) fn draw(game: &Game<'_>, pos: Pos, entity: &ModBlockEntity, draw: &mut BlockEntityDraw) {
-    if !dry(game, pos) {
+    if !is_chute(&game.native_block(pos)) {
         return;
     }
-    let offset = super::create_port::number(&entity.nbt, "ItemPosition");
+    let current = super::create_port::number(&entity.nbt, "ItemPosition");
+    let previous = match entity.nbt.get(&DRAW_PREVIOUS.into()) {
+        Some(Tag::Float(bits)) if f32::from_bits(*bits).is_finite() => f32::from_bits(*bits),
+        _ => current,
+    };
+    let offset = previous + draw.partial * (current - previous);
     if entity.id == SMART {
         draw_filter(game, entity, draw, 11.0 / 16.0);
         if offset > 0.0 {
             return;
         }
-    } else if game.native_block_property(pos, "shape").as_deref() != Some("window") {
+    } else if game.native_block_property(pos, "facing").as_deref() != Some("down")
+        || (game.native_block_property(pos, "shape").as_deref() != Some("window")
+            && !shows_suction_cargo(entity, offset))
+    {
         return;
     }
     let Some(stack) = entity.nbt.get(&"Item".into()).and_then(item_from_nbt) else {
@@ -1156,6 +1808,14 @@ pub(super) fn draw(game: &Game<'_>, pos: Pos, entity: &ModBlockEntity, draw: &mu
     };
     if !offset.is_finite() {
         return;
+    }
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("CREATE_HORIZON_TRACE_CHUTE_CARGO").is_some()) {
+        log::info!(
+            "Create Chute cargo: {}",
+            serde_json::json!({"pos": pos, "time": draw.game_time, "count": stack.count,
+                "previous": previous, "current": current, "partial": draw.partial, "offset": offset})
+        );
     }
     draw.push();
     draw.translate([0.5, offset, 0.5]);
@@ -1206,7 +1866,8 @@ fn draw_filter(game: &Game<'_>, entity: &ModBlockEntity, draw: &mut BlockEntityD
 pub(in crate::game) mod funnel {
     use super::{
         BlockEntityDraw, Source, accepts_filter, change_filter, draw_filter, extraction_amount,
-        filter_entity, filter_hit, filter_maximum, grouped_pull_plan, read_filter, take_from,
+        filter_entity, filter_hit, filter_maximum, grouped_pull_plan, read_filter,
+        restore_filter_amount, take_from,
     };
     use crate::game::{Game, GameLevel, create_port_belt::world_direction};
     use crate::{containers::ModBlockEntity, items::ItemStack};
@@ -1294,7 +1955,11 @@ pub(in crate::game) mod funnel {
     }
 
     pub(in crate::game) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
-        if entity.id != ENTITY || property(game, pos, "waterlogged") {
+        if entity.id != ENTITY {
+            return;
+        }
+        restore_filter_amount(game, pos, entity);
+        if property(game, pos, "waterlogged") {
             return;
         }
         let cooldown = crate::game::create_port::integer(&entity.nbt, "TransferCooldown");
@@ -1405,11 +2070,16 @@ pub(in crate::game) mod funnel {
     fn insert_into(game: &mut Game<'_>, pos: Pos, block: &str, stack: &ItemStack) -> u32 {
         if block == BRASS
             && !filter_entity(game, pos, ENTITY)
-                .is_some_and(|entity| accepts_filter(game, entity, stack))
+                .is_some_and(|entity| accepts_filter(game.items(), entity, stack))
         {
             return 0;
         }
-        game.chute_insert((pos[0], pos[1] - 1, pos[2]), stack, false)
+        let below @ [x, y, z] = [pos[0], pos[1] - 1, pos[2]];
+        use crate::game::create_port_saw_processing::crafter;
+        if game.native_block(below) == crafter::BLOCK {
+            return crafter::insert_linked(game, below, stack, false);
+        }
+        game.insert_stacked_from_side((x, y, z), world_direction(Direction::Up), stack, false)
             .unwrap_or(0)
     }
 

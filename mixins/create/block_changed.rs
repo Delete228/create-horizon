@@ -17,16 +17,31 @@ fn create_changed(
         horizon_world::level::Dimension::End => "minecraft:the_end",
     };
     let pos = [pos.x, pos.y, pos.z];
+    let tank = crate::game::create_port_fluid_tank::BLOCK;
+    crate::game::create_port_fluid_tank::changed(
+        level,
+        dimension,
+        pos,
+        level.native_state_block(old) == Some(tank),
+        level.native_state_block(new) == Some(tank),
+    );
     crate::game::create_port_millstone::forget(pos);
     crate::game::create_port_fan::changed(dimension, pos);
     crate::game::create_port_particles::changed(dimension, pos);
     crate::game::create_port_drill::changed(dimension, pos);
     kinetics::invalidate();
-    if level.native_state_block(old) == Some("create:shaft")
-        && level.native_state_block(new) == Some("minecraft:air")
-        && let Some(axis) = [Axis::X, Axis::Y, Axis::Z]
+    let severed_axis = match level.native_state_block(old) {
+        Some("create:shaft") => [Axis::X, Axis::Y, Axis::Z]
             .into_iter()
-            .find(|axis| level.native_state_with_property(old, "axis", axis.name()) == Some(old))
+            .find(|axis| level.native_state_with_property(old, "axis", axis.name()) == Some(old)),
+        Some("create:creative_motor") => create_engine::placement::Direction::ALL
+            .into_iter()
+            .find(|side| level.native_state_with_property(old, "facing", side.name()) == Some(old))
+            .map(create_engine::placement::Direction::axis),
+        _ => None,
+    };
+    if let Some(axis) = severed_axis
+        && level.native_state_block(new) == Some("minecraft:air")
     {
         kinetics::shaft_cut(dimension, pos, axis);
     }

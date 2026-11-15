@@ -20,6 +20,59 @@ from encased_cog_content import BLOCKS as ENCASED_COGS
 
 
 VANILLA_LOG_FAMILIES = ['acacia', 'birch', 'cherry', 'dark_oak', 'jungle', 'mangrove', 'oak', 'spruce']
+CLOSED_FLUIDS = {'c:honey': 'create:honey', 'c:chocolate': 'create:chocolate'}
+STOCK_CLOSED_FLUID_RECIPES = {
+    'create/recipe/compacting/chocolate.json': 'create:compacting',
+    'create/recipe/compacting/honey.json': 'create:compacting',
+    'create/recipe/emptying/honey_bottle.json': 'create:emptying',
+    'create/recipe/mixing/chocolate_melting.json': 'create:mixing',
+    'create/recipe/mixing/honey.json': 'create:mixing',
+}
+
+
+def recipe_for_horizon(path, recipe):
+    """Retain the pinned Diorite branch for installations without Ex Nihilo."""
+    if 'neoforge:conditions' not in recipe:
+        return recipe
+    without_ex_nihilo = [{
+        'type': 'neoforge:not',
+        'value': {'type': 'neoforge:mod_loaded', 'modid': 'exnihilosequentia'},
+    }]
+    if (path == 'create/recipe/crushing/diorite.json'
+            and recipe.get('type') == 'create:crushing'
+            and recipe['neoforge:conditions'] == without_ex_nihilo):
+        return {key: value for key, value in recipe.items() if key != 'neoforge:conditions'}
+    return None
+
+
+def stock_closed_fluid_recipe(path, recipe):
+    expected = STOCK_CLOSED_FLUID_RECIPES.get(path)
+    return expected is not None and expected == recipe.get('type')
+
+
+def closed_fluid_ingredient(value):
+    if not isinstance(value, dict):
+        return False
+    kind, amount = value.get('type'), value.get('amount')
+    if type(amount) is not int or not 1 <= amount < (1 << 31):
+        return False
+    return (kind == 'neoforge:single' and set(value) == {'type', 'fluid', 'amount'}
+            and value['fluid'] in CLOSED_FLUIDS.values()
+            or kind == 'neoforge:tag' and set(value) == {'type', 'tag', 'amount'}
+            and value['tag'] == 'c:honey')
+
+
+def closed_fluid_tags(read):
+    """Retain the supported source variants from the pinned fluid tags."""
+    tags = {}
+    for tag, fluid in CLOSED_FLUIDS.items():
+        ns, path = tag.split(':', 1)
+        dest = f'{ns}/tags/fluid/{path}.json'
+        source = read(dest)
+        if fluid not in source['values']:
+            raise ValueError(f'Missing source fluid {fluid} from {dest}')
+        tags[dest] = {'replace': False, 'values': [fluid]}
+    return tags
 
 
 def runtime_wood_cutting():
@@ -159,7 +212,7 @@ def burner_data_maps(names, read):
     return result
 
 
-def main():
+def export_reference():
     base = 'src/generated/resources/data/'
     names = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', PINS['create_revision']], cwd=CREATE, text=True).splitlines()
     known = {'create:' + n for n in BLOCKS + ITEMS}
@@ -186,8 +239,11 @@ def main():
                            for name in IRON_PALETTE)
     for name in names:
         if not name.startswith(base + 'create/recipe/') or not name.endswith('.json'): continue
-        r = read(name)
+        path = name[len(base):]
+        r = recipe_for_horizon(path, read(name))
+        if r is None: continue
         kind = r.get('type', '')
+        stock_fluid = stock_closed_fluid_recipe(path, r)
         if kind == 'create:sequenced_assembly' and name != base + 'create/recipe/sequenced_assembly/precision_mechanism.json':
             continue
         if kind == 'create:deploying':
@@ -202,28 +258,27 @@ def main():
         if kind == 'create:mechanical_crafting' and name != base + f'create/recipe/mechanical_crafting/{CRUSHER}.json':
             continue
         palette_cut = kind == 'minecraft:stonecutting' and name in palette_recipes
-        if not palette_cut and kind not in {'minecraft:crafting_shaped', 'minecraft:crafting_shapeless', 'create:pressing', 'create:item_application', 'create:mechanical_crafting'} | processing | cooking: continue
-        if kind == 'create:mixing' and not (dry_mixing(r) or heated_mixing(r)):
-            # These two actual source flows are the bounded first native fluid
-            # integration. Other fluid/heat/component recipe codecs stay out.
+        if not stock_fluid and not palette_cut and kind not in {'minecraft:crafting_shaped', 'minecraft:crafting_shapeless', 'create:pressing', 'create:item_application', 'create:mechanical_crafting'} | processing | cooking: continue
+        if kind == 'create:mixing' and not (stock_fluid or dry_mixing(r) or heated_mixing(r)):
+            # Only the selected stock closed-fluid recipes and the water-based
+            # Dough/Mud flows are supported. Milk and world flow stay out.
             if name not in {base+'create/recipe/mixing/dough_by_mixing.json',
                             base+'create/recipe/mixing/mud_by_mixing.json'} or not fluid_mixing(r): continue
-        if kind == 'create:compacting' and not compacting(r): continue
-        # Conditional recipes depend on other mods and their ingredient codecs.
-        if 'neoforge:conditions' in r: continue
+        if kind == 'create:compacting' and not (stock_fluid or compacting(r)): continue
         output = r.get('result', {})
         output = output if isinstance(output, str) else output.get('id')
         output = output or (r.get('results') or [{}])[0].get('id')
         outputs = [v['id'] for v in r.get('results', [])] or [output]
-        if any(not isinstance(v, str) or not (v.startswith('minecraft:') or v in known) for v in outputs): continue
+        known_outputs = known.union(CLOSED_FLUIDS.values()) if stock_fluid else known
+        if any(not isinstance(v, str) or not (v.startswith('minecraft:') or v in known_outputs) for v in outputs): continue
         deps = list(dependencies(r))
         if any(not (d.startswith('minecraft:') or d in known) for d in deps): continue
         # Processing recipes legitimately return vanilla items. Also retain the
         # real vanilla cooking recipes for supported Create ingredients (dough).
-        if (output not in known and kind not in processing
+        if (not stock_fluid and output not in known and kind not in processing
                 and not (kind in cooking and any(d in known for d in deps))
                 and not palette_cut): continue
-        recipes[name[len(base):]] = r
+        recipes[path] = r
     recipes.update(runtime_wood_cutting())
     # Retain upstream tag contents. Horizon's loader drops unregistered entries,
     # as documented; this does not register or pretend to implement other items.
@@ -275,7 +330,7 @@ def main():
     def tag_refs(value):
         if isinstance(value, dict):
             for k,v in value.items():
-                if k == 'tag': yield v
+                if k == 'tag' and value.get('type') != 'neoforge:tag': yield v
                 else: yield from tag_refs(v)
         elif isinstance(value, list):
             for v in value: yield from tag_refs(v)
@@ -307,6 +362,8 @@ def main():
         if isinstance(value, dict):
             if value.get('type') == 'neoforge:single':
                 return value.get('fluid') in ('minecraft:water', 'minecraft:lava')
+            if value.get('type') == 'neoforge:tag':
+                return False
             if 'item' in value: return available(value['item'], seen)
             if 'tag' in value: return available('#'+value['tag'], seen)
             if 'id' in value: return available(value['id'], seen)
@@ -321,7 +378,11 @@ def main():
     def ingredients(r):
         if 'key' in r: return r['key'].values()
         return r.get('ingredients', [r.get('ingredient')])
-    recipes={name:r for name,r in recipes.items() if all(available(i) for i in ingredients(r))}
+    recipes = {
+        name: r for name, r in recipes.items()
+        if all(available(i) or (stock_closed_fluid_recipe(name, r) and closed_fluid_ingredient(i))
+               for i in ingredients(r))
+    }
     required=set()
     pending=intrinsic_tags + [tag for r in recipes.values() for tag in tag_refs(r)]
     while pending:
@@ -330,6 +391,13 @@ def main():
         if dest in required or dest not in tags: continue
         required.add(dest);pending.extend(tag_refs(tags[dest]))
     tags={name:t for name,t in tags.items() if name in required}
+    # Closed transport models these source IDs without their flowing variants.
+    tags.update(closed_fluid_tags(lambda path: read(base + path)))
+    for path in ('foods', 'foods/chocolate'):
+        dest = f'c/tags/item/{path}.json'
+        tag = read(base + dest)
+        tag['values'] = [entry for entry in tag['values'] if entry in known]
+        tags[dest] = tag
     zinc_blocks = {f'create:{name}' for name in ('zinc_block', *ZINC_BLOCKS)}
     for block_tag in ['mineable/axe', 'mineable/pickaxe', 'needs_iron_tool', 'beacon_base_blocks']:
         dest = f'minecraft/tags/block/{block_tag}.json'
@@ -420,9 +488,13 @@ def main():
         'create/worldgen/placed_feature/zinc_ore.json': placed,
         'create/neoforge/biome_modifier/zinc_ore.json': read(base + 'create/neoforge/biome_modifier/zinc_ore.json'),
     }
-    result = {'reference': PINS['create_revision'], 'license': 'MIT recipe/data-map/loot/worldgen data; original definitions of vanilla convention tags', 'recipes': recipes, 'tags': tags, 'data_maps':maps, 'loot_tables':loot, 'worldgen':zinc_feature}
+    return {'reference': PINS['create_revision'], 'license': 'MIT recipe/data-map/loot/worldgen data; original definitions of vanilla convention tags', 'recipes': recipes, 'tags': tags, 'data_maps':maps, 'loot_tables':loot, 'worldgen':zinc_feature}
+
+
+def main():
+    result = export_reference()
     dest = ROOT / 'tools/data/recipes.json'; dest.parent.mkdir(exist_ok=True); dest.write_text(json.dumps(result, indent=2) + '\n')
-    print('Exported', len(recipes), 'recipes,', len(tags), 'tags and',len(maps),'data maps from MIT datapack sources')
+    print('Exported', len(result['recipes']), 'recipes,', len(result['tags']), 'tags and', len(result['data_maps']), 'data maps from MIT datapack sources')
 
 
 if __name__ == '__main__': main()

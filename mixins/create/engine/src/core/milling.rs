@@ -6,11 +6,25 @@
 
 pub const INPUT_SLOTS: usize = 1;
 pub const OUTPUT_SLOTS: usize = 9;
-pub const SLOT_LIMIT: u32 = 64;
+/// `ItemStackHandler.getSlotLimit` in the pinned NeoForge release. Insertion
+/// also applies the individual item's stack limit, but tick checks this value.
+pub const SLOT_LIMIT: u32 = 99;
 
 /// This method returns one even at zero RPM; `tick` separately checks power.
 pub fn processing_speed(rpm: f32) -> i32 {
     ((rpm / 16.0).abs() as i32).clamp(1, 512)
+}
+
+/// MillstoneBlockEntity.spawnParticles and Catnip VecHelper.rotate/offsetRandomly.
+pub fn particle_vectors(angle_draw: f32, rpm: f32, jitter: [f32; 3]) -> ([f64; 3], [f64; 3]) {
+    use crate::{kinetics::Axis, source_trig::rotate};
+
+    let offset = rotate([0.0, 0.0, 0.5], angle_draw * 360.0, Axis::Y);
+    let target = rotate(offset, if rpm > 0.0 { 25.0 } else { -25.0 }, Axis::Y);
+    let velocity = std::array::from_fn(|i| {
+        target[i] - offset[i] + f64::from((jitter[i] - 0.5) * 2.0 * (1.0 / 128.0))
+    });
+    (offset, velocity)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,10 +106,10 @@ mod tests {
     fn full_output_and_missing_power_pause_without_resetting_progress() {
         let mut cycle = MillCycle { timer: 53 };
         assert_eq!(cycle.tick(0.0, [1], true, Some(200)), Action::None);
-        assert_eq!(cycle.tick(256.0, [64], true, Some(200)), Action::None);
+        assert_eq!(cycle.tick(256.0, [99], true, Some(200)), Action::None);
         assert_eq!(cycle.timer, 53);
         assert_eq!(
-            cycle.tick(-256.0, [63], true, Some(200)),
+            cycle.tick(-256.0, [64], true, Some(200)),
             Action::Processing
         );
         assert_eq!(cycle.timer, 37);
@@ -124,6 +138,39 @@ mod tests {
             64
         );
         assert_eq!(roll_count(1, 0.0, || 0.0), 1);
+    }
+
+    #[test]
+    fn particle_vectors_match_pinned_catnip_float_rounding() {
+        // Raw draws and VecHelper results from RandomSource.create(17) in
+        // Minecraft 1.21.1 with the pinned Catnip version.
+        let angle = f32::from_bits(0x3f3b_78c4);
+        let jitter = [0x3f4b_c3e2, 0x3f32_86df, 0x3f17_056c].map(f32::from_bits);
+        for (rpm, expected_velocity) in [
+            (
+                -256.0,
+                [
+                    0x3fb3_1c4a_98c1_c500,
+                    0x3f69_436f_8000_0000,
+                    0xbfca_08c4_e0bc_a5f0,
+                ],
+            ),
+            (
+                256.0,
+                [
+                    0x3f9c_648b_a8e1_6800,
+                    0x3f69_436f_8000_0000,
+                    0x3fcb_b9a5_327f_2090,
+                ],
+            ),
+        ] {
+            let (offset, velocity) = particle_vectors(angle, rpm, jitter);
+            assert_eq!(
+                offset.map(f64::to_bits),
+                [0xbfdf_cd64_2000_0000, 0, 0xbfac_697a_c000_0000]
+            );
+            assert_eq!(velocity.map(f64::to_bits), expected_velocity);
+        }
     }
 
     #[test]

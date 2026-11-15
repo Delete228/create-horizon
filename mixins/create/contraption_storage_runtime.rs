@@ -205,11 +205,13 @@ fn valid_local(pos: Pos) -> bool {
     pos.iter().all(|component| component.unsigned_abs() <= 15)
 }
 
-fn supports_pair(record: &Record) -> bool {
-    record.axis == Axis::Y.index()
-        && record.stroke.is_none()
+pub(super) fn supports_pair(record: &Record) -> bool {
+    !record.return_home
         && record.clock_hand.is_none()
-        && !record.return_home
+        && match record.stroke_kind() {
+            Some(StrokeKind::Gantry | StrokeKind::RopePulley | StrokeKind::Piston) => true,
+            None => record.axis == Axis::Y.index(),
+        }
 }
 
 pub(super) fn mounted_chest(record: &Record) -> Option<Mount> {

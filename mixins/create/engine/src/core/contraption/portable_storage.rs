@@ -129,6 +129,13 @@ pub struct Actor {
 }
 
 impl Actor {
+    pub fn resume_stall(working: Pos) -> Self {
+        Self {
+            working: Some(working),
+            stalled: true,
+        }
+    }
+
     pub fn working(self) -> Option<Pos> {
         self.working
     }
@@ -306,16 +313,50 @@ impl Station {
         true
     }
 
-    pub fn extension(self, timeout: u32) -> f32 {
+    pub fn animation_progress(self, timeout: u32) -> f32 {
         let end = window_end(timeout);
-        let progress = if self.connected(timeout) {
+        if self.connected(timeout) {
             1.0
         } else if self.timer >= end {
-            1.0 - (self.timer - end) as f32 / ANIMATION as f32
+            (1.0 - (self.timer - end) as f32 / ANIMATION as f32).max(0.0)
         } else {
             self.timer as f32 / ANIMATION as f32
-        };
-        (f64::from(progress).powi(2) * f64::from(self.distance) / 2.0) as f32
+        }
+    }
+
+    pub fn extension(self, timeout: u32) -> f32 {
+        stationary_extension(self.animation_progress(timeout), self.distance)
+    }
+}
+
+pub fn stationary_extension(progress: f32, distance: f32) -> f32 {
+    (f64::from(progress).powi(2) * f64::from(distance) / 2.0) as f32
+}
+
+/// The moving actor ticks its linear chaser before checking the current dock.
+/// A missing target leaves the previous chase in place while passing the dock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MovingHead {
+    previous: f32,
+    extension: f32,
+    target: f32,
+}
+
+impl MovingHead {
+    pub fn tick(&mut self, target: Option<f32>) {
+        self.previous = self.extension;
+        self.extension += (self.target - self.extension).clamp(-0.25, 0.25);
+        if let Some(target) = target {
+            self.target = target;
+        }
+    }
+
+    pub fn extension(self, partial: f32) -> f32 {
+        self.previous + (self.extension - self.previous) * partial
+    }
+
+    pub fn settled(self) -> bool {
+        (self.previous - self.extension).abs() < 1e-5 && (self.extension - self.target).abs() < 1e-5
     }
 }
 
@@ -327,6 +368,27 @@ fn window_end(timeout: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::{contraption::Rotation, kinetics::Axis};
+
+    #[test]
+    fn moving_head_chases_ahead_and_back_on_its_own_ticks() {
+        let mut head = MovingHead::default();
+        head.tick(Some(0.75));
+        assert_eq!(head.extension(1.0), 0.0);
+        assert!(!head.settled());
+        head.tick(None);
+        assert_eq!(head.extension(0.5), 0.125);
+        head.tick(None);
+        head.tick(None);
+        assert_eq!(head.extension(1.0), 0.75);
+        assert!(!head.settled());
+        head.tick(None);
+        assert!(head.settled());
+        head.tick(Some(0.0));
+        head.tick(None);
+        assert_eq!(head.extension(0.5), 0.625);
+        assert!(!head.settled());
+        assert_eq!(stationary_extension(0.5, 1.5), 0.1875);
+    }
 
     fn endpoint(facing: Direction) -> Endpoint {
         Endpoint {

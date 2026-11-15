@@ -38,18 +38,18 @@ POSITIONS = [p for name in CASES for p in lane(name)]
 
 
 def fluid(nbt):
-    fluid = re.search(r'\bid:\s*"(minecraft:(?:water|lava))"', nbt)
+    fluid = re.search(r'\bid:\s*"(minecraft:(?:water|lava)|create:(?:honey|chocolate))"', nbt)
     return dict(id=fluid[1], amount=int(number({'nbt': nbt}, 'amount'))) if fluid else None
 
 
-def measure(block):
+def measure(block, faces=('west', 'east')):
     raw = block['nbt']
     if block['id'] == TANK:
         return dict(block=TANK, tank=fluid(field(raw, 'TankContent')))
     assert block['id'] in (PIPE, PUMP), block
     connections = {}
-    for face in ('west', 'east'):
-        record = field(raw, face) if re.search(r'\b' + face + r'\s*:', raw) else '{}'
+    for face in faces:
+        record = field(raw, face) if re.search(r'\b' + face + r'\s*:\s*\{', raw) else '{}'
         pressure = []
         if 'Pressure:' in record:
             pressure = [float(v) for v in re.findall(r'(-?\d+(?:\.\d+)?)f', field(record, 'Pressure'))]

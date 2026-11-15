@@ -31,15 +31,19 @@ fn main() {
         let inputs = row.split_whitespace()
             .map(|value| value.parse::<f64>().expect("fixture coordinate"))
             .collect::<Vec<_>>();
-        let [axis, angle, x, y, z, vx, vy, vz] = inputs[..] else { panic!("expected eight inputs") };
+        let [item, axis, angle, x, y, z, vx, vy, vz] = inputs[..] else { panic!("expected nine inputs") };
+        let (radius, height, step) = if item == 1.0 { (0.125, 0.25, 0.0) } else { (0.3, 1.8, 0.6) };
         let body = ContactBox {
-            min: [x - 0.3, y, z - 0.3],
-            max: [x + 0.3, y + 1.8, z + 0.3],
+            min: [x - radius, y, z - radius],
+            max: [x + radius, y + height, z + radius],
         };
         let axis = [Axis::X, Axis::Y, Axis::Z][axis as usize];
-        let result = rotary_contact(axis, [0; 3], angle as f32, body, [vx, vy, vz], shapes, 0.6);
+        let result = rotary_contact(axis, [0; 3], angle as f32, body, [vx, vy, vz], shapes, step);
         let [x, y, z] = result.separation;
-        println!("contact {x} {y} {z} {} {}", result.impact_fraction, u8::from(result.surface));
+        let [nx, ny, nz] = result.normal;
+        let [lx, ly, lz] = result.location;
+        println!("contact {x} {y} {z} {} {} {nx} {ny} {nz} {lx} {ly} {lz}",
+            result.impact_fraction, u8::from(result.surface));
     }
 }
 '''
@@ -66,7 +70,8 @@ def main():
     binary = work / 'probe'
     subprocess.run([rustc, '--edition=2024', probe, '--extern', f'create_engine={library}',
                     '-o', binary], check=True)
-    cases = [(*sample[:5], *sample[5]) for sample in itertools.product(
+    cases = [(*sample[:6], *sample[6]) for sample in itertools.product(
+        (0, 1),
         (0, 1, 2),
         (-137.5, -90, -43.2, -9.6, 0, 4.8, 19.2, 43.2, 90, 195.5),
         (-0.36, 0.04, 0.27, 0.5, 0.78, 1.09, 1.42, 1.85, 2.21),

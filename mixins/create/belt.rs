@@ -1185,6 +1185,19 @@ fn save_controller(game: &mut Game<'_>, controller: Pos, inventory: &mut Content
     game.native_block_entity_sync(controller);
 }
 
+fn direct_destination(game: &Game<'_>, target: Pos) -> Option<(Pos, i32, Belt)> {
+    let (controller @ [x, y, z], index) = node_data(game, target)?;
+    let BlockEntity::Mod(entity) = game.world.block_entities.get(&(x, y, z))? else {
+        return None;
+    };
+    let target_belt = belt(game, controller, entity, number(&entity.nbt, "Speed"));
+    Some((controller, index, target_belt))
+}
+
+pub(super) fn accepts_belt_input(game: &Game<'_>, target: Pos, from: Direction) -> bool {
+    direct_destination(game, target).is_some_and(|(_, _, belt)| belt.accepts_direct(from))
+}
+
 pub(super) fn insert_belt_from_side(
     game: &mut Game<'_>,
     target: Pos,
@@ -1192,17 +1205,12 @@ pub(super) fn insert_belt_from_side(
     from: Direction,
     from_previous_belt: bool,
 ) -> bool {
-    let Some((controller, index)) = node_data(game, target) else {
+    let Some((controller, index, target_belt)) = direct_destination(game, target) else {
         return false;
     };
     let Some(mut contents) = controller_inventory(game, controller) else {
         return false;
     };
-    let [x, y, z] = controller;
-    let Some(BlockEntity::Mod(entity)) = game.world.block_entities.get(&(x, y, z)) else {
-        return false;
-    };
-    let target_belt = belt(game, controller, entity, number(&entity.nbt, "Speed"));
     if !contents.insert_direct(target_belt, index, item, from, from_previous_belt, false) {
         return false;
     }

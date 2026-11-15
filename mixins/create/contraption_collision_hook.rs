@@ -11,6 +11,7 @@ fn contraption_collision(game: &crate::game::Game<'_>, mut result: Vec<Aabb>) ->
         excluded_controller,
         None,
         exclude_upright,
+        |_| false,
     );
     result
 }

@@ -16,7 +16,7 @@ use std::{cell::RefCell, collections::BTreeMap};
 struct Current {
     facing: Option<Direction>,
     rpm: f32,
-    block_check: u8,
+    block_check: i32,
     entity_search: u8,
     dirty: bool,
     distance: f32,
@@ -136,10 +136,12 @@ fn media(game: &Game<'_>, pos: [i32; 3]) -> Option<Type> {
     .processing()
 }
 
-fn flow_limit(game: &Game<'_>, pos: [i32; 3], d: Direction, max: f32) -> f32 {
+pub(super) fn flow_limit(game: &Game<'_>, pos: [i32; 3], d: Direction, max: f32) -> f32 {
+    let height = game.dimension_type().height;
+    let build_y = height.min_y..height.min_y + height.height;
     for i in 0..max.ceil() as i32 {
         let p = add(pos, d, i + 1);
-        if !game.world.loaded(p[0], p[2]) {
+        if !build_y.contains(&p[1]) || !game.world.loaded(p[0], p[2]) {
             return i as f32;
         }
         if block_tag(game, p, "create:fan_transparent") {
@@ -225,7 +227,7 @@ fn refresh(game: &Game<'_>) {
 /// Recognized direct partial/non-fire selectors override the prototype without
 /// granting the old full-fire flag. Other tags/values stay unsupported; callers
 /// must not destroy such a stack merely because its selector cannot be mapped.
-fn blasting_fire_resistance(stack: &ItemStack, prototype: bool) -> Option<bool> {
+pub(super) fn blasting_fire_resistance(stack: &ItemStack, prototype: bool) -> Option<bool> {
     let Some(data) = stack.data() else {
         return Some(prototype);
     };
@@ -409,7 +411,7 @@ fn store_held(nbt: &mut Compound, state: Processing) {
         nbt.insert("FanProcessingTime".into(), Tag::Int(state.time));
     }
 }
-fn process_depot(game: &mut Game<'_>, pos: [i32; 3], kind: Type) {
+fn process_depot(game: &mut Game<'_>, pos: [i32; 3], kind: Type, processing_time: i32) {
     if super::create_port::inventory_blocked(game, pos) {
         return;
     }
@@ -428,7 +430,7 @@ fn process_depot(game: &mut Game<'_>, pos: [i32; 3], kind: Type) {
         return;
     };
     let output = plan(game, &stack, kind);
-    let convert = state.transported(kind, stack.count, output.is_some());
+    let convert = state.transported(kind, stack.count, output.is_some(), processing_time);
     let mut results = if convert {
         output.as_ref().map(|o| {
             roll(
@@ -490,8 +492,13 @@ fn process_depot(game: &mut Game<'_>, pos: [i32; 3], kind: Type) {
 }
 struct BeltContext<'a, 'b> {
     game: &'a mut Game<'b>,
+    processing_time: i32,
 }
 impl fan::TransportedContext<ItemStack> for BeltContext<'_, '_> {
+    fn processing_time(&self) -> i32 {
+        self.processing_time
+    }
+
     fn can_process(
         &mut self,
         stack: &create_engine::transport::Stack<ItemStack>,
@@ -522,35 +529,42 @@ impl fan::TransportedContext<ItemStack> for BeltContext<'_, '_> {
         super::create_port_belt::angle(self.game, &input.payload)
     }
 }
-fn process_belt(game: &mut Game<'_>, pos: [i32; 3], kind: Type) {
+fn process_belt(game: &mut Game<'_>, pos: [i32; 3], kind: Type, processing_time: i32) {
     // AirCurrent uses handleProcessingOnAllItems(.51f). The belt can be stopped:
     // processing is owned by the active fan, independently of belt movement.
     super::create_port_belt::apply_to_each_within(game, pos, 0.51, |game, item| {
         Some(fan::process_transported(
             item,
             kind,
-            &mut BeltContext { game },
+            &mut BeltContext {
+                game,
+                processing_time,
+            },
         ))
     });
 }
 pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity, rpm: f32) {
     refresh(game);
+    let config = super::create_port_server_config::fan();
     let dim = game.dim.id().to_owned();
     let key = (dim.clone(), pos);
     let mut current =
         CACHE.with(|cache| cache.borrow_mut().currents.remove(&key).unwrap_or_default());
     let facing = facing(game, pos);
     let push = fan::pushing(rpm, facing);
-    // EncasedFanBlockEntity checks obstructions every 31 ticks. A neighbor
+    let speed_changed = current.facing != Some(facing) || current.rpm != rpm;
+    if speed_changed {
+        super::create_port_chute::publish_fan_air(game, pos, rpm);
+    }
+    // EncasedFanBlockEntity checks obstructions every rate+1 ticks. A neighbor
     // update or speed change rebuilds immediately without moving that schedule.
     let periodic = current.block_check == 0;
     if periodic {
-        current.block_check = 30;
+        current.block_check = config.block_check_rate;
     } else {
         current.block_check -= 1;
     }
-    let rebuild = current.facing != Some(facing)
-        || current.rpm != rpm
+    let rebuild = speed_changed
         || current.dirty
         || periodic
         || entity.data.first() != Some(&AIR_CURRENT_VERSION);
@@ -561,7 +575,7 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         current.distance = if rpm == 0.0 {
             0.0
         } else {
-            flow_limit(game, pos, facing, fan::max_distance(rpm))
+            flow_limit(game, pos, facing, config.max_distance(rpm))
         };
         current.segments =
             fan::segments(current.distance, push, |i| media(game, add(pos, facing, i)));
@@ -658,7 +672,8 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
             };
             let output = plan(game, &stack, kind);
             let mut processing = dropped_state(game, *id);
-            let convert = processing.dropped(kind, stack.count, output.is_some());
+            let convert =
+                processing.dropped(kind, stack.count, output.is_some(), config.processing_time);
             store_dropped(game, *id, processing);
             if convert && let Some(output) = output {
                 let mut results = roll(
@@ -683,8 +698,8 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     // processes handlers reached by a short current, such as a wet Depot above.
     for (p, kind) in &current.handlers {
         match game.native_block(*p).as_str() {
-            "create:belt" => process_belt(game, *p, *kind),
-            "create:depot" => process_depot(game, *p, *kind),
+            "create:belt" => process_belt(game, *p, *kind, config.processing_time),
+            "create:depot" => process_depot(game, *p, *kind, config.processing_time),
             _ => {}
         }
     }
@@ -757,21 +772,20 @@ fn decode_current(data: &[i32]) -> Option<SyncedCurrent> {
     let facing = *Direction::ALL.get(usize::try_from(data[1]).ok()?)?;
     let rpm = f32::from_bits(data[2] as u32);
     let distance = f32::from_bits(data[3] as u32);
-    if !rpm.is_finite()
-        || !distance.is_finite()
-        || distance < 0.0
-        || distance > fan::max_distance(rpm)
-    {
+    // The server already clipped its configured range against the world. A
+    // client cannot validate it using its own config or the default fan range.
+    if !rpm.is_finite() || !(0.0..=i32::MAX as f32).contains(&distance) {
         return None;
     }
     let count = usize::try_from(data[4]).ok()?;
     let limit = distance.ceil() as i32;
-    if count > limit as usize || data.len() < 6 + 2 * count {
+    if count > limit as usize {
         return None;
     }
+    let (segment_data, handler_data) = data[5..].split_at_checked(count.checked_mul(2)?)?;
     let mut segments = Vec::with_capacity(count);
     let push = fan::pushing(rpm, facing);
-    for pair in data[5..5 + 2 * count].as_chunks::<2>().0 {
+    for pair in segment_data.as_chunks::<2>().0 {
         let end = pair[0];
         if !(0..=limit).contains(&end)
             || segments
@@ -797,12 +811,13 @@ fn decode_current(data: &[i32]) -> Option<SyncedCurrent> {
     {
         return None;
     }
-    let handler_count = usize::try_from(data[5 + 2 * count]).ok()?;
-    if handler_count > (limit as usize) * 2 || data.len() != 6 + 2 * count + 4 * handler_count {
+    let (&handler_count, handler_data) = handler_data.split_first()?;
+    let handler_count = usize::try_from(handler_count).ok()?;
+    if handler_count > (limit as usize) * 2 || handler_data.len() != handler_count.checked_mul(4)? {
         return None;
     }
     let mut handlers = Vec::with_capacity(handler_count);
-    for row in data[6 + 2 * count..].as_chunks::<4>().0 {
+    for row in handler_data.as_chunks::<4>().0 {
         let kind = match row[3] {
             1 => Type::Blasting,
             2 => Type::Haunting,

@@ -66,6 +66,98 @@ fn emit(game: &mut Game<'_>, extras: impl IntoIterator<Item = Extra>) {
         game.particles.add(&o, extra.position, extra.velocity);
     }
 }
+
+pub(super) fn fluid_rim(
+    game: &mut Game<'_>,
+    pos: Pos,
+    side: Direction,
+    fluid: create_engine::fluid_transport::Fluid,
+    splash: bool,
+) {
+    let idle = game.world.random.next_float() < 1.0 / 1000.0;
+    let vanilla = match fluid {
+        create_engine::fluid_transport::Fluid::Water => Some(ParticleType::DrippingWater),
+        create_engine::fluid_transport::Fluid::Lava => Some(ParticleType::DrippingLava),
+        _ => None,
+    };
+    let custom = super::create_port_fluid_render::custom_style(game, fluid);
+    for (enabled, splash) in [(idle, false), (splash, true)] {
+        if !enabled {
+            continue;
+        }
+        let (at, motion) = rules::fluid_rim(pos, side, &mut Random(&mut game.world.random));
+        if let Some(kind) = vanilla {
+            game.particles
+                .add_with(&ParticleOptions::simple(kind), at, motion, false, true);
+        } else if let Some((sprite, tint)) = custom
+            && let Some(particle) =
+                horizon_client_render::particles::create_fluid_jet::sprite_particle(
+                    &mut game.particles,
+                    at,
+                    motion,
+                    sprite,
+                    tint,
+                    false,
+                )
+        {
+            game.particles.push(particle);
+        }
+        if tracing() {
+            log::info!(
+                "Create pipe rim: {}",
+                serde_json::json!({
+                    "pos": pos, "side": side.name(), "fluid": fluid.id(), "splash": splash,
+                    "at": at, "motion": motion, "time": game.world.game_time,
+                })
+            );
+        }
+    }
+}
+
+pub(super) fn fluid_jet(
+    game: &mut Game<'_>,
+    pos: Pos,
+    side: Direction,
+    fluid: create_engine::fluid_transport::Fluid,
+    inbound: bool,
+    splash: bool,
+) {
+    let custom = inbound
+        .then(|| super::create_port_fluid_render::custom_style(game, fluid))
+        .flatten();
+    if !fluid.has_world_state() && custom.is_none() {
+        return;
+    }
+    let lava = fluid == create_engine::fluid_transport::Fluid::Lava;
+    for _ in 0..1 + u8::from(splash) {
+        let (at, motion) =
+            rules::fluid_jet(pos, side, inbound, &mut Random(&mut game.world.random));
+        use horizon_client_render::particles::create_fluid_jet as render;
+        let particle = match custom {
+            Some((sprite, tint)) => {
+                render::sprite_particle(&mut game.particles, at, motion, sprite, tint, false)
+            }
+            None => render::particle(&mut game.particles, at, motion, lava),
+        };
+        let Some(particle) = particle else {
+            continue;
+        };
+        if tracing() {
+            let quad = game.particles.snapshot(&particle).quad;
+            let (block, sky) = game.native_light(at.map(|v| v.floor() as i32));
+            let light = (u32::from(sky) << 20) | (u32::from(if lava { 15 } else { block }) << 4);
+            log::info!(
+                "Create pipe jet: {}",
+                serde_json::json!({
+                    "pos": pos, "side": side.name(), "fluid": fluid.id(), "inbound": inbound,
+                    "at": at, "motion": motion, "time": game.world.game_time,
+                    "color": particle.rgba, "light": light, "sprite": quad.map(|quad| quad.sprite),
+                })
+            );
+        }
+        game.particles.push(particle);
+    }
+}
 fn spawned(extras: Vec<Extra>) -> Vec<(ParticleOptions, [f64; 3], [f64; 3])> {
     extras
         .into_iter()
@@ -267,10 +359,14 @@ fn corners(a: horizon_core::geometry::Aabb) -> [[f64; 3]; 2] {
 fn intersects(a: [[f64; 3]; 2], b: [[f64; 3]; 2]) -> bool {
     (0..3).all(|i| a[0][i] < b[1][i] && a[1][i] > b[0][i])
 }
-fn cell_range(b: [[f64; 3]; 2]) -> impl Iterator<Item = [i32; 2]> {
+fn cell_bounds(b: [[f64; 3]; 2]) -> ([i32; 2], [i32; 2]) {
     let a = b[0].map(|v| (v.floor() as i32) >> 4);
     let b = b[1].map(|v| (v.floor() as i32) >> 4);
-    (a[0]..=b[0]).flat_map(move |x| (a[2]..=b[2]).map(move |z| [x, z]))
+    ([a[0], a[2]], [b[0], b[2]])
+}
+fn cell_range(b: [[f64; 3]; 2]) -> impl Iterator<Item = [i32; 2]> {
+    let (min, max) = cell_bounds(b);
+    (min[0]..=max[0]).flat_map(move |x| (min[1]..=max[1]).map(move |z| [x, z]))
 }
 fn type_at(origin: Pos, flow: &Flow, p: [f64; 3]) -> Option<ProcessingType> {
     let offset = fan::aligned_distance_to_face(origin, flow.facing, p);
@@ -319,6 +415,113 @@ fn airflow(game: &mut Game<'_>, origin: Pos, flow: &Flow, world: usize) {
     game.particles.set_sprite_frame(&mut p, 6);
     trace_spawn(game, &p, "air_flow", origin);
     game.particles.push(p);
+}
+
+#[derive(Clone, Debug)]
+struct ChuteAir {
+    source: Pos,
+    start: [f32; 3],
+    end: [f32; 3],
+    drag: f32,
+    radius: f32,
+    phase: f32,
+    axis: Axis,
+}
+
+impl ParticleController for ChuteAir {
+    fn tick(&mut self, p: &mut Particle, level: &ParticleLevel<'_>) -> ParticleUpdate {
+        if !p.advance_age() {
+            trace_tick(p, level, "chute_air", self.source, 7, true);
+            return ParticleUpdate::default();
+        }
+        let progress =
+            f64::from(p.age as f32 / p.lifetime as f32).powf(f64::from(self.drag)) as f32;
+        let angle = (progress * 2.0 * 360.0 + self.phase) % 360.0;
+        let twirl = create_engine::source_trig::rotate(
+            [0.0, f64::from(self.radius), 0.0],
+            angle,
+            self.axis,
+        );
+        p.position = std::array::from_fn(|i| {
+            let center = self.start[i] + progress * (self.end[i] - self.start[i]);
+            f64::from((f64::from(center) + twirl[i]) as f32)
+        });
+        p.velocity = std::array::from_fn(|i| p.position[i] - p.previous[i]);
+        let frame = (p.age * 7 / p.lifetime) as usize;
+        trace_tick(p, level, "chute_air", self.source, frame, false);
+        ParticleUpdate {
+            frame: Some(frame),
+            ..Default::default()
+        }
+    }
+}
+
+fn spawn_chute_air(game: &mut Game<'_>, source: Pos, start: f32, end: f32, speed: f32, drag: f32) {
+    let [x, y, z] = source.map(f64::from);
+    let random = &mut game.world.random;
+    let x = x + f64::from(random.next_float() * 0.5 + 0.25);
+    let z = z + f64::from(random.next_float() * 0.5 + 0.25);
+    if random.next_float() >= 2.0 * speed {
+        return;
+    }
+    let from = [x, y + f64::from(start), z];
+    let to = [x, y + f64::from(end), z];
+    let gravity = random.next_float() * 0.5;
+    let controller = ChuteAir {
+        source,
+        start: from.map(|coordinate| coordinate as f32),
+        end: to.map(|coordinate| coordinate as f32),
+        drag,
+        radius: random.next_float() / 6.0,
+        phase: random.next_float() * 360.0,
+        axis: if random.next_boolean() {
+            Axis::X
+        } else {
+            Axis::Z
+        },
+    };
+    let Some(mut particle) = game
+        .particles
+        .controlled("create:air", from, true, controller)
+    else {
+        return;
+    };
+    particle.lifetime = (((to[1] - from[1]).abs() / f64::from(speed)) as i32).min(60);
+    particle.size *= rules::QUAD_SIZE_MULTIPLIER;
+    particle.rgba[3] = 0.25;
+    particle.gravity = gravity;
+    game.particles.set_sprite_frame(&mut particle, 6);
+    trace_spawn(game, &particle, "chute_air", source);
+    game.particles.push(particle);
+}
+
+fn chute_air(game: &mut Game<'_>, pos: Pos, motion: f32, distance: f32) {
+    let vertical = game.native_block_property(pos, "facing").as_deref() == Some("down");
+    let shape = game.native_block_property(pos, "shape");
+    let [x, y, z] = pos;
+    let speed = motion.abs();
+    let up = motion > 0.0;
+    if up
+        && (vertical || shape.as_deref() == Some("intersection"))
+        && game.native_block_collision([x, y + 1, z]).is_empty()
+    {
+        spawn_chute_air(game, pos, 1.0, 2.0, speed, 0.5);
+    }
+    if !vertical {
+        return;
+    }
+    if shape.as_deref() == Some("window") {
+        let from = if up { 0.0 } else { 1.0 };
+        spawn_chute_air(game, pos, from, 1.0 - from, speed, 1.0);
+    }
+    if !up && game.native_block_collision([x, y - 1, z]).is_empty() {
+        spawn_chute_air(game, pos, 0.0, -1.0, speed, 0.5);
+    }
+    if up && distance > 0.0 {
+        for _ in 0..2 {
+            spawn_chute_air(game, pos, -distance, 0.0, speed, 2.0);
+        }
+    }
 }
 
 // The rotation event uses the ordinary one-shot native mod network channel.
@@ -726,6 +929,7 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
     }
     use super::create_port_saw_processing::crafter;
 
+    let mut chute_currents = Vec::new();
     let entries: Vec<_> = game
         .world
         .block_entities
@@ -735,12 +939,25 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
                 return None;
             };
             match entity.id.as_str() {
-                "create:encased_fan" => Some(([x, y, z], super::create_port_fan::synced_current(entity))),
+                "create:encased_fan" => {
+                    Some(([x, y, z], super::create_port_fan::synced_current(entity)))
+                }
+                super::create_port_chute::BLOCK => {
+                    if let Some((motion, distance)) = super::create_port_chute::visual_air(entity) {
+                        chute_currents.push(([x, y, z], motion, distance));
+                    }
+                    None
+                }
                 crafter::BLOCK => Some(([x, y, z], None)),
                 _ => None,
             }
         })
         .collect();
+    for (pos, motion, distance) in chute_currents {
+        if game.native_block(pos) == super::create_port_chute::BLOCK {
+            chute_air(game, pos, motion, distance);
+        }
+    }
     let mut flows = BTreeMap::new();
     for (pos, current) in entries {
         let Some(current) = current else {
@@ -821,8 +1038,14 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
                 caught.items.clear();
                 caught.horses.clear();
                 let mut seen = BTreeSet::new();
-                for cell in cell_range(flow.bounds) {
-                    for &(horse, id) in cells.get(&cell).into_iter().flatten() {
+                // Server settings can extend the flow beyond the loaded
+                // client columns. Only visit cells that actually hold entities.
+                let (min, max) = cell_bounds(flow.bounds);
+                for (cell, ids) in cells.range([min[0], i32::MIN]..=[max[0], i32::MAX]) {
+                    if !(min[1]..=max[1]).contains(&cell[1]) {
+                        continue;
+                    }
+                    for &(horse, id) in ids {
                         if !seen.insert((horse, id)) {
                             continue;
                         }

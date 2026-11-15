@@ -55,8 +55,7 @@ def java_vertical(work):
     assert state['ready'] and state['data_version'] == 3955, state
 
     def read():
-        bearing = host.call('block', {'pos': VERTICAL})
-        return dict(angle=number(bearing, 'Angle', 0), position=host.call('state', {})['position'])
+        return host.call('rider_pose', {'pos': [VERTICAL[0] + 1, *VERTICAL[1:]]})
 
     try:
         host.call('tick', {'frozen': True})
@@ -70,7 +69,7 @@ def java_vertical(work):
         host.command('tick rate 8')
         host.command(MOTOR)
         host.call('tick', {'frozen': False})
-        return before, observe_vertical(read, lambda: time.sleep(.045))
+        return before, observe_vertical(read, lambda: time.sleep(.025))
     finally:
         host.call('tick', {'frozen': True})
         host.command('tick rate 20')
@@ -81,13 +80,34 @@ def java_vertical(work):
         (work / 'java-transcript.json').write_text(json.dumps(host.trace, indent=2) + '\n')
 
 
-def native_vertical(call):
+def native_vertical(call, interrupt=False):
     def command(text):
         return call('command', text)['chat']
 
     def read():
         block = {'nbt': ' '.join(command('data get block ' + xyz(VERTICAL)))}
         return dict(angle=number(block, 'Angle', 0), position=call('state')['player']['position'])
+
+    interruptions = {}
+
+    def poll():
+        row = read()
+        if not interrupt or interruptions or row['angle'] > -55.0:
+            return row
+        call('server-hold', 'on')
+        try:
+            hold_start = read()
+            client_tick = call('state')['ticks']
+            call('wait', 3)
+            hold_end = read()
+            interruptions['hold'] = dict(start=hold_start, end=hold_end,
+                                         client_ticks=call('state')['ticks'] - client_tick)
+        finally:
+            call('server-hold', 'off')
+        stall_start = read()
+        call('stall', 375)
+        interruptions['stall'] = dict(start=stall_start, end=read())
+        return row
 
     command('tp @s 1509.5 105 296.5')
     wait_loaded(call, [VERTICAL])
@@ -100,9 +120,9 @@ def native_vertical(call):
     command('tick rate 8')
     command(MOTOR)
     command('tick unfreeze')
-    trace = observe_vertical(read, lambda: call('wait', 1))
+    trace = observe_vertical(poll, lambda: call('wait', 1))
     command('tick rate 20')
-    return player['position'], trace
+    return player['position'], trace, interruptions
 
 
 def native_horizontal(call):
@@ -150,13 +170,61 @@ def camera_metrics(rows, standing, walking):
     return dict(standing=metrics(still), walking=metrics(walking))
 
 
+def delivery_metrics(rows):
+    poses = {row['tick']: row['current_angle'] for row in rows
+             if row['controller'] == list(VERTICAL) and -125.0 <= row['current_angle'] < 0.0}
+    adjacent = [(poses[tick - 1], angle) for tick, angle in poses.items() if tick - 1 in poses]
+    nominal_step = 2.4
+    return dict(adjacent_samples=len(adjacent),
+                unchanged=sum(abs(after - before) < .001 for before, after in adjacent),
+                burst=sum(abs(after - before) > nominal_step + .001 for before, after in adjacent))
+
+
+def compare_at_angles(native, original):
+    # The Java client chases server angle updates, so its real contact angle
+    # does not generally land on the native 2.4-degree samples.
+    source = sorted(original, key=lambda row: row['angle'])
+    intervals = list(zip(source, source[1:]))
+    pairs = []
+    for row in native:
+        angle = row['angle']
+        for lower, upper in intervals:
+            if not lower['angle'] <= angle <= upper['angle']:
+                continue
+            span = upper['angle'] - lower['angle']
+            if span > 6.0:
+                break
+            progress = (angle - lower['angle']) / span
+            target = [a + (b - a) * progress
+                      for a, b in zip(lower['position'], upper['position'], strict=True)]
+            pairs.append((angle, row['position'], target))
+            break
+    descending = [(angle, abs(native[1] - java[1]))
+                  for angle, native, java in pairs if -125.0 <= angle <= -95.0]
+    assert pairs and descending, (len(pairs), len(descending))
+    distances = [math.dist(native, java) for _, native, java in pairs]
+    return dict(matched_angles=len(pairs), max_distance=max(distances),
+                mean_distance=sum(distances) / len(distances),
+                max_height_difference=max(abs(native[1] - java[1]) for _, native, java in pairs),
+                descending_samples=len(descending),
+                descending_angles=[min(angle for angle, _ in descending),
+                                   max(angle for angle, _ in descending)],
+                max_descending_height_difference=max(error for _, error in descending))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--java', action='store_true')
     parser.add_argument('--observe-only', action='store_true')
-    for name in ('game', 'resources', 'ctl', 'reference'):
+    parser.add_argument('--pose-load', action='store_true',
+                        help='Keep verbose particle and block-entity diagnostics enabled during native delivery')
+    parser.add_argument('--pose-interrupt', action='store_true',
+                        help='Hold server ticks, then stall the native window while transport continues')
+    for name in ('game', 'resources', 'ctl', 'reference', 'create-jar'):
         parser.add_argument('--' + name, type=Path)
     args = parser.parse_args()
+    if args.java and (args.pose_load or args.pose_interrupt):
+        parser.error('Pose delivery controls require a native run')
     report = {'create': PINS['create_revision']}
     if args.java:
         work = Path(tempfile.mkdtemp(prefix='vertical-rider-java-', dir=ROOT / '.local'))
@@ -164,20 +232,26 @@ def main():
     else:
         if not all((args.game, args.resources, args.ctl)):
             parser.error('Native test requires --game, --resources and --ctl')
-        session = NativeCheckSession(args.game, args.resources, args.ctl, None,
+        session = NativeCheckSession(args.game, args.resources, args.ctl, args.create_jar,
                                      name='contraption-rider', world='CreateMotionChecks',
                                      size=(640, 360), username='BearingReview')
+        if not args.pose_load:
+            session.env.pop('CREATE_HORIZON_PARTICLE_TRACE', None)
+            session.env.pop('CREATE_HORIZON_TRACE_POSES', None)
         session.env['CREATE_TRACE_CONTRAPTION_FRAMES'] = '1'
         work = session.scratch
         print(work, flush=True)
         try:
             with session:
                 standing, walking = native_horizontal(session.call)
-                before, vertical = native_vertical(session.call)
+                before, vertical, interruptions = native_vertical(session.call, args.pose_interrupt)
             rows = [json.loads(line.split(MARKER, 1)[1]) for line in session.log.read_text().splitlines()
                     if MARKER in line]
             if rows and 'camera' in rows[0]:
                 report['camera'] = camera_metrics(rows, standing, walking)
+                report['pose_delivery'] = delivery_metrics(rows)
+            if interruptions:
+                report['interruptions'] = interruptions
         finally:
             session.control_temp.cleanup()
             for path in (session.resources, work / '.horizon-cache', work / 'horizon-mods'):
@@ -186,11 +260,8 @@ def main():
     if args.reference:
         original = json.loads(args.reference.read_text())
         assert original['create'] == PINS['create_revision'], original
-        distances = [math.dist(native['position'], java['position'])
-                     for native in vertical for java in original['vertical']
-                     if abs(native['angle'] - java['angle']) < .001]
-        assert len(distances) >= 14, len(distances)
-        report['java_comparison'] = dict(matched_angles=len(distances), max_distance=max(distances))
+        assert 'previous_angle' in original['vertical'][-1], 'Collect the atomic Java client angle with --java'
+        report['java_comparison'] = compare_at_angles(vertical, original['vertical'])
     (work / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     print(work)
     print('Vertical max height:', max(row['position'][1] for row in vertical), report.get('camera'))
@@ -201,8 +272,20 @@ def main():
         if not args.java:
             assert report['camera']['standing']['largest_short_frame'] < 0.05, report['camera']
             assert report['camera']['walking']['largest_short_frame'] < 0.15, report['camera']
+        if args.pose_interrupt:
+            hold = report['interruptions']['hold']
+            stall = report['interruptions']['stall']
+            assert hold['client_ticks'] >= 3 and hold['start']['angle'] == hold['end']['angle'], hold
+            assert abs(hold['end']['position'][2] - hold['start']['position'][2]) < .01, hold
+            assert abs(stall['end']['angle'] - stall['start']['angle']) >= 4.79, stall
         if args.reference:
-            assert report['java_comparison']['max_distance'] < .45, report['java_comparison']
+            comparison = report['java_comparison']
+            assert comparison['matched_angles'] >= 26, comparison
+            assert comparison['max_distance'] < .12, comparison
+            assert comparison['descending_samples'] >= 6, comparison
+            assert comparison['descending_angles'][0] <= -120.0, comparison
+            assert comparison['descending_angles'][1] >= -100.0, comparison
+            assert comparison['max_descending_height_difference'] < .03, comparison
 
 
 if __name__ == '__main__':

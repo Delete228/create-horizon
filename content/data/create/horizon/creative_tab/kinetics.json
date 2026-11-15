@@ -103,6 +103,7 @@
     "create:crushed_raw_zinc",
     "create:copper_nugget",
     "create:powdered_obsidian",
-    "create:experience_nugget"
+    "create:experience_nugget",
+    "create:bar_of_chocolate"
   ]
 }

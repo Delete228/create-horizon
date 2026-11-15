@@ -6,6 +6,7 @@ copies, compiled bridge classes, worlds, settings and captures live in .local.
 No account files are consulted, no installer is run and no EULA is accepted.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -28,6 +29,34 @@ JAVA = PRISM / 'java/java-runtime-delta/jre.bundle/Contents/Home'
 SOURCE = ROOT / 'tools/java/reference_bridge'
 NEOFORGE = '21.1.227'
 CREATE_SHA256 = 'ef87fe5709f1ba1f5b8bb20a2925b5afb4669e178fd6d8bf10c167759eefe37a'
+
+
+@contextmanager
+def fixture_datapack(host, world, name, recipe_path, author):
+    """Install an authored recipe only in the private Java fixture world."""
+    pack = BASE / 'game' / 'saves' / world / 'datapacks' / name
+    pack.mkdir()
+    try:
+        (pack / 'pack.mcmeta').write_text(json.dumps({
+            'pack': {'pack_format': 48, 'description': 'Private Create parity fixture'},
+        }) + '\n')
+        (pack / recipe_path).mkdir(parents=True)
+        author(pack / recipe_path)
+        host.command('reload')
+        for _ in range(30):
+            status = host.command('datapack list enabled')
+            if name in ' '.join(status['messages']):
+                break
+            available = host.command('datapack list available')
+            if name in ' '.join(available['messages']):
+                host.command(f'datapack enable "file/{name}" last')
+            time.sleep(.2)
+        else:
+            raise AssertionError(status)
+        yield
+    finally:
+        host.command(f'datapack disable "file/{name}"')
+        shutil.rmtree(pack)
 
 
 def digest(path, algorithm='sha256'):

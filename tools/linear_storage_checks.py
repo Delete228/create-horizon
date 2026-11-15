@@ -303,26 +303,31 @@ def refusals(session):
     batch.load(controller)
     setup(batch.put, batch.command, case)
     x, y, z = source
-    left, right = (x, y, z - 1), (x, y, z + 1)
+    left, right, upper = (x, y, z - 1), (x, y, z + 1), (x, y + 1, z)
     batch.put(source, 'minecraft:slime_block')
     batch.put(left, CHEST)
     batch.put(right, CHEST)
+    batch.put(upper, BARREL)
     batch.command(f'item replace block {xyz(left)} container.0 with minecraft:iron_ingot 3')
     batch.command(f'item replace block {xyz(right)} container.26 with minecraft:gold_ingot 5')
+    batch.command(f'item replace block {xyz(upper)} container.9 with minecraft:diamond 7')
     batch.tick(2)
     batch.put(motor, case['power'])
     batch.tick(16)
     batch.expect(source, 'minecraft:slime_block')
     batch.expect(left, CHEST)
     batch.expect(right, CHEST)
+    batch.expect(upper, BARREL)
     batch.data(left)
     batch.data(right)
-    *positions, left_nbt, right_nbt = batch.run(session, 'gantry-refuses-two-chests')
+    batch.data(upper)
+    *positions, left_nbt, right_nbt, upper_nbt = batch.run(session, 'gantry-refuses-three-banks')
     assert all(map(matched, positions)), positions
     assert items(left_nbt, 'Items') == {'minecraft:iron_ingot': 3}, left_nbt
     assert items(right_nbt, 'Items') == {'minecraft:gold_ingot': 5}, right_nbt
+    assert items(upper_nbt, 'Items') == {'minecraft:diamond': 7}, upper_nbt
     assert saved(session, case) is None
-    return dict(wet=wet_rows, two=[left_nbt, right_nbt])
+    return dict(wet=wet_rows, three=[left_nbt, right_nbt, upper_nbt])
 
 
 def farm(session, reference):

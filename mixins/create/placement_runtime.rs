@@ -19,7 +19,7 @@ use horizon_world::{
     registry::BlockStateId,
 };
 
-fn direction(d: D) -> Direction {
+pub(super) fn direction(d: D) -> Direction {
     match d {
         D::Down => Direction::Down,
         D::Up => Direction::Up,
@@ -63,15 +63,15 @@ pub(super) fn state(
         return;
     }
     if matches!(block, super::create_port_basin::pump::PIPE | super::create_port_basin::pump::PUMP | super::create_port_basin::pump::VALVE) {
-        *answer = Some(super::create_port_basin::pump::placement(game, state, ctx, block));
-        return;
-    }
-    if block == super::create_port_basin::tank::BLOCK {
-        *answer = Some(super::create_port_basin::tank::placement(game, ctx).then_some(state));
+        *answer = Some(super::create_port_basin::pump::placement(game, state, ctx, block, fluid));
         return;
     }
     if block == super::create_port_chute::BLOCK {
-        *answer = Some(super::create_port_chute::placement(game, state, ctx));
+        let waterlogged = if fluid == FluidState::WATER { "true" } else { "false" };
+        *answer = Some(
+            super::create_port_chute::placement(game, state, ctx)
+                .and_then(|state| game.native_state_with_property(state, "waterlogged", waterlogged)),
+        );
         return;
     }
     if let Some(large) = super::create_port_interactions::encased_cog_size(block) {

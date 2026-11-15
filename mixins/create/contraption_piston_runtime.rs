@@ -5,9 +5,10 @@ use super::{
     Game,
     create_port_contraption::{
         Capture, MountedCapture, column, commit_linear_capture, commit_linear_landing, entries,
-        facing, movement_sound, resident, set_records, state,
+        drop_replaced_block, facing, movement_sound, replaceable_stone, resident, set_records, state,
     },
-    create_port_contraption_actors as actors, create_port_super_glue as glue,
+    create_port_contraption_actors as actors, create_port_portable_storage as psi,
+    create_port_super_glue as glue,
 };
 use crate::containers::ModBlockEntity;
 use create_engine::{
@@ -16,13 +17,14 @@ use create_engine::{
         linear::{Action, LinearActuator, Mode, Motion},
         piston::{self, Layout, Part},
     },
-    kinetics::Pos,
+    kinetics::{Axis, Pos},
     placement::Direction,
 };
 use horizon_client_render::create_contraption_scene::{
-    MAX_BLOCKS, MAX_RECORDS, Record, Stroke, StrokeKind,
+    MAX_BLOCKS, MAX_PACKED_BLOCKS, MAX_RECORDS, Record, Stroke, StrokeKind, plain_packed_state,
 };
 use horizon_world::{chunk::BlockState, level::flags, nbt::Tag};
+use std::collections::BTreeSet;
 
 pub(super) const NORMAL: &str = "create:mechanical_piston";
 pub(super) const STICKY: &str = "create:sticky_mechanical_piston";
@@ -140,8 +142,15 @@ fn capture(game: &mut Game<'_>, pos: Pos, facing: Direction, rpm: f32) -> Option
         facing.opposite()
     };
     let volumes = glue::read(game, key).ok()?;
+    // Java inserts the moving head and pole train before checking cargo size.
+    let vertical = facing.axis() == Axis::Y;
+    let capacity = if vertical {
+        MAX_PACKED_BLOCKS
+    } else {
+        MAX_BLOCKS
+    };
     let payload = Assembly::capture_from(
-        &MountedCapture::for_linear(game, &volumes),
+        &MountedCapture::for_linear(game, &volumes, vertical),
         origin,
         seeds,
         |p| {
@@ -152,10 +161,16 @@ fn capture(game: &mut Game<'_>, pos: Pos, facing: Direction, rpm: f32) -> Option
                     .any(|part| layout.world_cell(part.local, layout.initial_offset) == Ok(p))
         },
         Some(movement),
-        MAX_BLOCKS - layout.parts.len(),
+        capacity.checked_sub(layout.parts.len())?,
     )
     .ok()?;
     let mut blocks = payload.blocks().to_vec();
+    if (blocks.len() + layout.parts.len() > MAX_BLOCKS
+        && blocks.iter().any(|(_, state)| !plain_packed_state(state)))
+        || psi::has_multiple(&blocks)
+    {
+        return None;
+    }
     for entry in &layout.parts {
         blocks.push((entry.local, part_state(game, entry.part, facing)?));
     }
@@ -255,16 +270,26 @@ pub(super) fn collides_at(
             .id(block)
             .is_none_or(|id| game.collision.may_collide(id))
     };
+    let packed_faces = (record.blocks.len() > MAX_BLOCKS).then(|| {
+        record
+            .blocks
+            .iter()
+            .filter_map(|(at, block)| collidable(block).then_some(*at))
+            .collect::<BTreeSet<_>>()
+    });
     record.blocks.iter().any(|(local, block)| {
         if !collidable(block) {
             return false;
         }
         let neighbour = std::array::from_fn(|i| local[i] + movement[i]);
-        if record
-            .blocks
-            .iter()
-            .any(|(at, other)| *at == neighbour && collidable(other))
-        {
+        let internal = match &packed_faces {
+            Some(faces) => faces.contains(&neighbour),
+            None => record
+                .blocks
+                .iter()
+                .any(|(at, other)| *at == neighbour && collidable(other)),
+        };
+        if internal {
             return false;
         }
         let p = std::array::from_fn(|i| leading[i] + local[i]);
@@ -305,10 +330,12 @@ fn land(game: &mut Game<'_>, pos: Pos, grid_offset: u32, owned: bool) -> bool {
     };
     let record = records.remove(index);
     let mut edits = Vec::new();
+    let mut replaced = Vec::new();
     for (local, block) in record.blocks.iter() {
         let p = world_cell(&record, *local, grid_offset);
         let before = state(game, p);
-        let after = if owned && p == pos {
+        let is_base = owned && p == pos;
+        let after = if is_base {
             let Some(part) = part(block) else {
                 return false;
             };
@@ -319,18 +346,34 @@ fn land(game: &mut Game<'_>, pos: Pos, grid_offset: u32, owned: bool) -> bool {
             };
             base_state(game, before, state)
         } else {
-            if !game.res.facts().is_air(before) {
-                return false;
-            }
             game.pack.assets.registry.id(block)
         };
         let Some(after) = after else { return false };
+        if !is_base && !game.res.facts().is_air(before) {
+            if part(block).is_some() || !replaceable_stone(game, p, before, after) {
+                return false;
+            }
+            replaced.push((p, before));
+        }
         edits.push((p, before, after));
+    }
+    if !replaced.is_empty()
+        && super::create_port_glue_transfer::blocked(
+            game,
+            key,
+            replaced.iter().map(|&(position, _)| position),
+        )
+    {
+        return false;
     }
     let origin = world_cell(&record, [0; 3], grid_offset);
     if !commit_linear_landing(game, key, records, &record, origin, &edits) {
         return false;
     }
+    for (position, before) in replaced {
+        drop_replaced_block(game, position, before);
+    }
+    psi::remove(game, pos);
     movement_sound(game, pos, false);
     true
 }
@@ -489,6 +532,9 @@ fn make_sticky(game: &mut Game<'_>, pos: Pos) -> bool {
 }
 
 fn write(entity: &mut ModBlockEntity, running: bool, offset: f32) {
+    if !running {
+        psi::save_dock(entity, None);
+    }
     entity
         .nbt
         .insert(RUNNING.into(), Tag::Byte(i8::from(running)));
@@ -542,10 +588,13 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity, r
     if mode_changed {
         actuator.mode_changed();
     }
-    let mut stalled = actors::stalled(game, pos);
+    let dock = psi::advance(game, record, psi::saved_dock(entity));
+    let docked = dock.is_some();
+    let mut stalled = actors::stalled(game, pos) || docked;
     if rpm != record.rpm && actuator.speed_changed(record.rpm, rpm, stalled, None) {
         actors::remove(game, pos);
-        stalled = false;
+        psi::stop_motion(game, pos);
+        stalled = docked;
     }
     // Java returns on Waiting before it consumes AssembleNextTick.
     if !actuator.waiting() && entity.nbt.remove(&REQUEST.into()).is_some() {
@@ -595,6 +644,7 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity, r
     record.stalled = stalled;
     let current = record.clone();
     if set_records(game, key, records).is_ok() {
+        psi::save_dock(entity, dock);
         write(entity, true, actuator.offset());
         actors::tick(game, &previous, &current);
     }

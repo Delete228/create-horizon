@@ -48,6 +48,45 @@ fn fixture(change: impl FnOnce(&mut BTreeMap<String, Vec<u8>>)) -> Vec<u8> {
             "elements": [{"from": [0, 0, 0], "to": [16, 16, 16], "faces": {"north": {"texture": "#all"}}}]
         }),
     );
+    let mut tank_variants = serde_json::Map::new();
+    for bottom in [false, true] {
+        for top in [false, true] {
+            for shape in [
+                "plain",
+                "window",
+                "window_ne",
+                "window_nw",
+                "window_se",
+                "window_sw",
+            ] {
+                let model = format!("block/fluid_tank/fixture_{bottom}_{top}_{shape}");
+                tank_variants.insert(
+                    format!("bottom={bottom},shape={shape},top={top}"),
+                    json!({"model": format!("create:{model}")}),
+                );
+                json_file(
+                    format!("assets/create/models/{model}.json"),
+                    json!({
+                        "textures": {
+                            "side": "create:block/fluid_tank",
+                            "top": "create:block/fluid_tank_top",
+                            "inner": "create:block/fluid_tank_inner"
+                        },
+                        "elements": [{"from":[0,0,0], "to":[16,16,16], "faces":{
+                            "up": {"uv":[0,0,16,16], "texture":"#top", "cullface":"up"},
+                            "down": {"uv":[0,0,16,16], "texture":"#inner", "cullface":"down"},
+                            "north": {"uv":[0,0,16,16], "texture":"#side", "cullface":"north"},
+                            "east": {"uv":[0,0,16,16], "texture":"#side", "cullface":"east"}
+                        }}]
+                    }),
+                );
+            }
+        }
+    }
+    json_file(
+        "assets/create/blockstates/fluid_tank.json".into(),
+        json!({"variants": tank_variants}),
+    );
     json_file(
         "assets/create/lang/en_us.json".into(),
         json!({"block.create.shaft":"Fixture Shaft"}),
@@ -78,10 +117,22 @@ fn fixture(change: impl FnOnce(&mut BTreeMap<String, Vec<u8>>)) -> Vec<u8> {
         "block/brass_casing",
         "block/blaze_burner_flame_scroll",
         "block/blaze_burner_flame_superheated_scroll",
+        "block/fluid_tank",
+        "block/fluid_tank_top",
+        "block/fluid_tank_inner",
+        "fluid/honey_still",
+        "fluid/chocolate_still",
     ] {
         files.insert(
             format!("assets/create/textures/{texture}.png"),
             b"\x89PNG\r\n\x1a\nsynthetic fixture".to_vec(),
+        );
+    }
+    for texture in ["fluid_tank", "fluid_tank_top", "fluid_tank_inner"] {
+        files.insert(
+            format!("assets/create/textures/block/{texture}_connected.png"),
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x40\x00\x00\x00\x40synthetic"
+                .to_vec(),
         );
     }
     for dye in BELT_DYES {
@@ -127,6 +178,25 @@ fn fixture(change: impl FnOnce(&mut BTreeMap<String, Vec<u8>>)) -> Vec<u8> {
         zip.write_all(&bytes).unwrap();
     }
     zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn fluid_atlas_adds_only_the_two_original_still_sprites() {
+    let files = collect(fixture(|_| {})).unwrap();
+    let atlas: Value =
+        serde_json::from_slice(&files["assets/minecraft/atlases/blocks.json"]).unwrap();
+    let expected: Vec<_> = FLUID_SPRITES
+        .iter()
+        .map(|sprite| json!({"type": "single", "resource": sprite}))
+        .collect();
+    assert_eq!(atlas, json!({"sources": expected}));
+    let model: Value = serde_json::from_slice(&files[FLUID_SPRITE_MODEL_PATH]).unwrap();
+    assert_eq!(model["textures"]["honey"], FLUID_SPRITES[0]);
+    assert_eq!(model["textures"]["chocolate"], FLUID_SPRITES[1]);
+    for &sprite in FLUID_SPRITES {
+        let path = resource_path(sprite, "textures", "png").unwrap().unwrap();
+        assert_eq!(files[&path], b"\x89PNG\r\n\x1a\nsynthetic fixture");
+    }
 }
 
 fn import_fixture(home: &Path, bytes: &[u8]) -> io::Result<Imported> {
@@ -723,19 +793,22 @@ fn basin_mixer_bundle_keeps_source_defaults_and_supported_recipes() {
         .iter()
         .filter(|(name, _)| name.starts_with("data/create/recipe/mixing/"))
         .collect();
-    assert_eq!(recipes.len(), 5);
+    assert_eq!(recipes.len(), 7);
     for (name, raw) in recipes {
         let recipe: Value = serde_json::from_str(raw).unwrap();
         assert_eq!(recipe["type"], "create:mixing");
-        let brass = name.ends_with("/brass_ingot.json");
-        if brass {
+        let id = name.rsplit('/').next().unwrap();
+        if matches!(
+            id,
+            "brass_ingot.json" | "honey.json" | "chocolate_melting.json"
+        ) {
             assert_eq!(recipe["heat_requirement"], "heated");
         } else {
             assert!(recipe.get("heat_requirement").is_none());
         }
-        assert_eq!(recipe["ingredients"].as_array().unwrap().len(), 2);
-        match name.rsplit('/').next().unwrap() {
+        match id {
             "andesite_alloy.json" | "andesite_alloy_from_zinc.json" => {
+                assert_eq!(recipe["ingredients"].as_array().unwrap().len(), 2);
                 assert_eq!(recipe["results"], json!([{"id":"create:andesite_alloy"}]));
             }
             "dough_by_mixing.json" => {
@@ -762,9 +835,60 @@ fn basin_mixer_bundle_keeps_source_defaults_and_supported_recipes() {
                     json!([{"id":"create:brass_ingot", "count":2}])
                 );
             }
+            "honey.json" => {
+                assert_eq!(recipe["ingredients"], json!(["minecraft:honey_block"]));
+                assert_eq!(
+                    recipe["results"],
+                    json!([{"id":"create:honey","amount":1000}])
+                );
+            }
+            "chocolate_melting.json" => {
+                assert_eq!(recipe["ingredients"], json!(["create:bar_of_chocolate"]));
+                assert_eq!(
+                    recipe["results"],
+                    json!([{"id":"create:chocolate","amount":250}])
+                );
+            }
             name => panic!("unsupported source mixing recipe {name}"),
         }
     }
+    for (name, ingredient, item) in [
+        (
+            "honey",
+            json!({"type":"neoforge:tag","amount":1000,"tag":"c:honey"}),
+            "minecraft:honey_block",
+        ),
+        (
+            "chocolate",
+            json!({"type":"neoforge:single","amount":250,"fluid":"create:chocolate"}),
+            "create:bar_of_chocolate",
+        ),
+    ] {
+        let recipe = read(&format!("data/create/recipe/compacting/{name}.json"));
+        assert_eq!(recipe["type"], "create:compacting");
+        assert_eq!(recipe["ingredients"], json!([ingredient]));
+        assert_eq!(recipe["results"], json!([{"id":item}]));
+        assert_eq!(
+            read(&format!("data/c/tags/fluid/{name}.json"))["values"],
+            json!([format!("create:{name}")])
+        );
+    }
+    let bar = read("data/create/horizon/item/bar_of_chocolate.json");
+    assert_eq!(bar["max_stack_size"], 64);
+    assert_eq!(
+        bar["components"]["minecraft:food"],
+        json!({"nutrition":6,"saturation":3.6000001430511475})
+    );
+    let honey_bottle = read("data/create/recipe/emptying/honey_bottle.json");
+    assert_eq!(honey_bottle["type"], "create:emptying");
+    assert_eq!(
+        honey_bottle["ingredients"],
+        json!(["minecraft:honey_bottle"])
+    );
+    assert_eq!(
+        honey_bottle["results"],
+        json!([{"id":"minecraft:glass_bottle"}, {"id":"create:honey", "amount":250}])
+    );
     assert_eq!(
         read("data/minecraft/tags/block/convertable_to_mud.json")["values"],
         json!([
@@ -863,6 +987,7 @@ fn generated_distribution_passes_the_native_content_allowlist() {
         "assets/create/models/block/large_water_wheel/block.obj",
         "assets/create/models/block/large_water_wheel/wheel.mtl",
         "assets/create/textures/item/fallback/wrench.png",
+        "assets/create/textures/item/fallback/bar_of_chocolate.png",
         "data/create/horizon/block/gantry_shaft.json",
         "data/create/horizon/block/rope_pulley.json",
         "data/create/horizon/block/rope.json",
@@ -944,6 +1069,51 @@ fn cache_is_reused_and_missing_or_changed_resources_are_repaired() {
     assert!(
         serde_json::from_slice::<Value>(&fs::read(first.pack.join("pack.mcmeta")).unwrap()).is_ok()
     );
+}
+
+#[test]
+fn tank_overlay_keeps_source_provenance_and_is_verified_in_cache() {
+    let home = Stage::new(&std::env::temp_dir()).unwrap();
+    let bytes = fixture(|_| {});
+    let imported = import_fixture(&home.0, &bytes).unwrap();
+    let original = "assets/create/blockstates/fluid_tank.json";
+    let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let mut original_bytes = Vec::new();
+    archive
+        .by_name(original)
+        .unwrap()
+        .read_to_end(&mut original_bytes)
+        .unwrap();
+    assert_eq!(
+        fs::read(imported.pack.join(original)).unwrap(),
+        original_bytes
+    );
+
+    let overlay = imported.pack.join(tank_ct::DIRECTORY);
+    let blockstate: Value =
+        serde_json::from_slice(&fs::read(overlay.join(original)).unwrap()).unwrap();
+    assert_eq!(blockstate["variants"].as_object().unwrap().len(), 240);
+    let model = blockstate["variants"]["bottom=true,create_connections=10,shape=window_nw,top=true"]["model"]
+        .as_str().unwrap().strip_prefix("create:").unwrap();
+    let alias = overlay.join(format!("assets/create/models/{model}.json"));
+    let connected: Value = serde_json::from_slice(&fs::read(&alias).unwrap()).unwrap();
+    let faces = &connected["elements"][0]["faces"];
+    assert!(faces.get("east").is_none());
+    assert_eq!(
+        faces["up"],
+        json!({"texture":"#create_ct_fluid_tank_top","uv":[4.0,0.0,8.0,4.0]})
+    );
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(imported.pack.join("pack.mcmeta")).unwrap()).unwrap();
+    assert_eq!(
+        metadata["overlays"]["entries"][0]["directory"],
+        tank_ct::DIRECTORY
+    );
+
+    assert!(import_fixture(&home.0, &bytes).unwrap().cached);
+    fs::remove_file(&alias).unwrap();
+    assert!(!import_fixture(&home.0, &bytes).unwrap().cached);
+    assert!(alias.is_file());
 }
 
 #[test]

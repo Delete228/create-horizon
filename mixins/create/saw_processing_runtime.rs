@@ -4,10 +4,11 @@
 
 use super::{
     Game, create_port as create, create_port_belt as belt,
+    create_port_block_entity_revision::EntityRevision as _,
     native_block_entity_draw::BlockEntityDraw,
 };
 use crate::{
-    containers::{BlockEntity, ModBlockEntity, ModContainer},
+    containers::{BlockEntity, ModBlockEntity, ModContainer, ModRevision},
     items::ItemStack,
 };
 use create_engine::{
@@ -15,11 +16,15 @@ use create_engine::{
     milling::roll_count,
     placement::Direction,
     saw_processing::{self, Action, CuttingCycle},
-    transport::Transported,
+    transport::{SessionCache, Transported},
 };
 use horizon_core::random::RandomSource;
 use horizon_items::item_nbt::item_from_nbt;
 use horizon_world::nbt::{Compound, Tag};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+};
 
 const SLOTS: usize = 32;
 const INVENTORY: &str = "Inventory";
@@ -27,11 +32,15 @@ const INVENTORY: &str = "Inventory";
 /// MechanicalCrafterBlockEntity and RecipeGridHandler. The kinetic and
 /// transport adapters in this source share the host's ordinary ticker.
 pub(super) mod crafter {
+    use super::super::create_port_chute as chute;
     use super::{
         BlockEntity, BlockEntityDraw, Compound, Game, ItemStack, ModBlockEntity, Pos, Tag,
         Transported, belt, create,
     };
-    use crate::particles::{ParticleOptions, ParticleType};
+    use crate::{
+        mod_api::{NativeModelMaterial, NativeModelRenderOptions, NativeModelUvShift},
+        particles::{ParticleOptions, ParticleType},
+    };
     use create_engine::{
         crafter::{self, Cycle, GroupedItems, Layout, Phase, Pointing, Tick},
         kinetics::Axis,
@@ -55,6 +64,8 @@ pub(super) mod crafter {
     const ANIMATION_TIME: &str = "CreateHorizonCrafterTime";
     const CLIENT_INPUTS: &str = "CreateHorizonCrafterInputs";
     const TIME_SLOT: usize = 2;
+    const BELT_MODEL: &str = "create:block/mechanical_crafter/belt_animated";
+    const BELT_SPRITE: &str = "create:block/crafter_thingies";
 
     fn authoritative(game: &Game<'_>) -> bool {
         game.serving.is_some() || game.options.dedicated.is_some()
@@ -190,35 +201,45 @@ pub(super) mod crafter {
         Depot,
         Belt,
         Container,
+        Crafter,
+        Chute,
     }
 
     fn outlet(game: &Game<'_>, pos: Pos, layout: Layout) -> Option<Outlet> {
         let target @ [x, y, z] = layout.target_position(pos);
+        if !game.world.loaded(x, z) {
+            return None;
+        }
         let block = game.native_block(target);
         if block == "create:depot" {
             return Some(Outlet::Depot);
         }
-        if layout.target_direction() == Direction::Down
-            && block == "create:belt"
-            && game.native_block_property(target, "slope").as_deref() == Some("horizontal")
-        {
-            return Some(Outlet::Belt);
+        if block == BLOCK {
+            return Some(Outlet::Crafter);
         }
-        if layout.target_direction() == Direction::Down
-            && matches!(
-                block.as_str(),
-                "minecraft:chest"
-                    | "minecraft:trapped_chest"
-                    | "minecraft:barrel"
-                    | "minecraft:hopper"
-            )
-            && game.chute_source_available((x, y, z))
-        {
-            return Some(Outlet::Container);
+        if chute::is_chute(&block) {
+            return Some(Outlet::Chute);
         }
-        game.res
-            .behaviours()
-            .is_air(game.world.block(x, y, z))
+        if block == "create:belt" {
+            return match game.native_block_property(target, "slope").as_deref() {
+                Some("horizontal" | "upward" | "downward") => Some(Outlet::Belt),
+                Some("sideways" | "vertical") => Some(Outlet::Open),
+                _ => None,
+            };
+        }
+        if matches!(
+            block.as_str(),
+            "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel" | "minecraft:hopper"
+        ) {
+            return game
+                .chute_source_available((x, y, z))
+                .then_some(Outlet::Container);
+        }
+        // An unsupported container might still accept the product in Java.
+        // A loaded target without inventory uses Java's front ejection.
+        let side = belt::world_direction(layout.target_direction().opposite());
+        game.native_container_slots(game.dim.id(), target, side)
+            .is_none()
             .then_some(Outlet::Open)
     }
 
@@ -647,57 +668,106 @@ pub(super) mod crafter {
         })
     }
 
-    fn hand_feed(game: &mut Game<'_>, pos: Pos, stack: &ItemStack) {
-        if !authoritative(game) {
-            return;
-        }
-        let Some(group) = input_group(game, pos) else {
-            return;
-        };
-        let Some(layout) = layout(game, group.root) else {
-            return;
-        };
+    fn ordered_inputs(game: &Game<'_>, pos: Pos) -> Option<InputGroup> {
+        let mut group = input_group(game, pos)?;
+        let layout = layout(game, group.root)?;
         let right = layout.facing.clockwise(Axis::Y).opposite();
         let horizontal = right.axis().index();
         let sign = i64::from(right.vector()[horizontal]);
-        let mut members = group.members;
-        members.sort_by_key(|pos| (-i64::from(pos[1]), i64::from(pos[horizontal]) * sign));
-        for pos in members {
-            if game.held().is_none() {
+        group
+            .members
+            .sort_by_key(|pos| (-i64::from(pos[1]), i64::from(pos[horizontal]) * sign));
+        Some(group)
+    }
+
+    fn can_feed(member: &ModBlockEntity, pos: Pos, root: Pos) -> bool {
+        (pos == root || attached_to(member, pos, root))
+            && cycle(&member.nbt).phase == Phase::Idle
+            && create::integer(&member.nbt, "Cover") == 0
+            && member.items.len() <= 1
+            && member.items.first().is_none_or(Option::is_none)
+    }
+
+    pub(in crate::game) fn hopper_input(game: &Game<'_>, pos: Pos) -> Option<Pos> {
+        let group = ordered_inputs(game, pos)?;
+        group
+            .members
+            .into_iter()
+            .find(|&pos| entity(game, pos).is_some_and(|member| can_feed(member, pos, group.root)))
+    }
+
+    fn finish_feed(game: &mut Game<'_>, pos: Pos) {
+        game.native_block_entity_sync(pos);
+        crate::game::create_port_sounds::crafter_feed(game, pos);
+        start(game, pos, None, false);
+    }
+
+    pub(in crate::game) fn fed_by_hopper(game: &mut Game<'_>, pos: Pos) {
+        if game
+            .native_with_mod_block_entity(pos, save_inventory)
+            .is_some()
+        {
+            finish_feed(game, pos);
+        }
+    }
+
+    /// ConnectedInput.getItemHandler: all members expose the same ordered
+    /// one-item slots. Simulate never consumes items, starts a recipe or sends
+    /// data. Execute rechecks each slot after the previous insertion can start
+    /// a recipe.
+    pub(in crate::game) fn insert_linked(
+        game: &mut Game<'_>,
+        pos: Pos,
+        stack: &ItemStack,
+        simulate: bool,
+    ) -> u32 {
+        if !authoritative(game) || stack.count == 0 {
+            return 0;
+        }
+        let Some(group) = ordered_inputs(game, pos) else {
+            return 0;
+        };
+        let mut inserted = 0;
+        for at in group.members {
+            if inserted == stack.count {
                 break;
             }
-            let Some(member) = entity(game, pos) else {
-                continue;
-            };
-            if (pos != group.root && !attached_to(member, pos, group.root))
-                || cycle(&member.nbt).phase != Phase::Idle
-                || create::integer(&member.nbt, "Cover") != 0
-                || member.items.first().is_some_and(Option::is_some)
-            {
+            if !entity(game, at).is_some_and(|member| can_feed(member, at, group.root)) {
                 continue;
             }
-            let mut one = stack.clone();
-            one.count = 1;
-            if game
-                .native_with_mod_block_entity(pos, |entity| {
-                    entity.items.resize(1, None);
-                    entity.items[0] = Some(one);
-                    save_inventory(entity);
-                })
-                .is_none()
-            {
-                continue;
-            }
-            let hand = game.held_mut();
-            if let Some(held) = hand {
-                held.count -= 1;
-                if held.count == 0 {
-                    *hand = None;
+            if !simulate {
+                let one = ItemStack {
+                    count: 1,
+                    ..stack.clone()
+                };
+                if game
+                    .native_with_mod_block_entity(at, |entity| {
+                        entity.items.resize(1, None);
+                        entity.items[0] = Some(one);
+                        save_inventory(entity);
+                    })
+                    .is_none()
+                {
+                    continue;
                 }
+                finish_feed(game, at);
             }
-            game.native_block_entity_sync(pos);
-            crate::game::create_port_sounds::crafter_feed(game, pos);
-            start(game, pos, None, false);
+            inserted += 1;
+        }
+        inserted
+    }
+
+    fn hand_feed(game: &mut Game<'_>, pos: Pos, stack: &ItemStack) {
+        let inserted = insert_linked(game, pos, stack, false);
+        if inserted == 0 {
+            return;
+        }
+        let hand = game.held_mut();
+        if let Some(held) = hand {
+            held.count -= inserted;
+            if held.count == 0 {
+                *hand = None;
+            }
         }
     }
 
@@ -998,11 +1068,15 @@ pub(super) mod crafter {
         layout: Layout,
         outlet: Option<Outlet>,
     ) -> bool {
-        let Some(outlet @ (Outlet::Depot | Outlet::Belt | Outlet::Container)) = outlet else {
+        let Some(outlet) = outlet else {
+            return false;
+        };
+        if matches!(outlet, Outlet::Open) {
             eject_chain(game, pos, Some(entity));
             return true;
-        };
+        }
         let destination @ [x, y, z] = layout.target_position(pos);
+        let direction = layout.target_direction();
         let mut grouped = grid(&entity.nbt);
         let mut changed = false;
         grouped.grid.retain(|_, stack| {
@@ -1013,7 +1087,6 @@ pub(super) mod crafter {
                         belt::core_stack(game, stack.clone()),
                         belt::angle(game, stack),
                     );
-                    let direction = layout.target_direction();
                     if matches!(outlet, Outlet::Belt) {
                         if belt::insert_belt_from_side(game, destination, &item, direction, false) {
                             stack.count
@@ -1024,7 +1097,16 @@ pub(super) mod crafter {
                         belt::insert_depot_from_side(game, destination, &item, direction)
                     }
                 }
-                Outlet::Container => game.chute_insert((x, y, z), stack, false).unwrap_or(0),
+                Outlet::Container => game
+                    .insert_stacked_from_side(
+                        (x, y, z),
+                        belt::world_direction(direction.opposite()),
+                        stack,
+                        false,
+                    )
+                    .unwrap_or(0),
+                Outlet::Crafter => insert_linked(game, destination, stack, false),
+                Outlet::Chute => chute::insert_from_inventory(game, destination, stack),
                 Outlet::Open => unreachable!("only accepting outlets reach insertion"),
             };
             changed |= moved != 0;
@@ -1080,8 +1162,19 @@ pub(super) mod crafter {
         }
         if state.phase == Phase::Inserting {
             let target = outlet(game, pos, layout_here);
-            return (lazy || matches!(target, Some(Outlet::Depot | Outlet::Belt)))
-                && try_output(game, pos, entity, layout_here, target);
+            let direct = match target {
+                Some(Outlet::Depot) => true,
+                Some(Outlet::Belt) => belt::accepts_belt_input(
+                    game,
+                    layout_here.target_position(pos),
+                    layout_here.target_direction(),
+                ),
+                Some(Outlet::Chute) => {
+                    chute::accepts_direct_input(game, layout_here.target_position(pos))
+                }
+                _ => false,
+            };
+            return (lazy || direct) && try_output(game, pos, entity, layout_here, target);
         }
         let action = state.tick(rpm);
         if state != before {
@@ -1171,6 +1264,8 @@ pub(super) mod crafter {
         let Some(state) = layout(game, pos) else {
             return;
         };
+        let running = cycle(&entity.nbt);
+        let rpm = create::running_speed(game, &entity.nbt);
         let axis = state.facing.axis();
         draw.push();
         create::orient(draw, axis);
@@ -1194,31 +1289,43 @@ pub(super) mod crafter {
             Pointing::Right => 90.0,
         };
         draw.rotate_about([1.0, 0.0, 0.0], angle, [0.5; 3]);
-        let connected = crafter::target(pos, state, &mut |p| layout(game, p)).is_some();
-        let base = "create:block/mechanical_crafter/";
-        if connected {
-            game.native_draw_model(draw, &format!("{base}belt"), 0xFFFFFF);
-            game.native_draw_model(draw, &format!("{base}belt_animated"), 0xFFFFFF);
-        } else {
-            game.native_draw_model(draw, &format!("{base}arrow"), 0xFFFFFF);
-        }
-        draw.pop();
-
-        let running = cycle(&entity.nbt);
         if !matches!(running.phase, Phase::Crafting | Phase::Inserting)
             && (running.phase != Phase::Idle || create::integer(&entity.nbt, "Cover") != 0)
         {
-            draw.push();
-            create::face_south(draw, state.facing);
-            draw.rotate_about([0.0, 1.0, 0.0], 90.0, [0.5; 3]);
-            game.native_draw_model(draw, &format!("{base}lid"), 0xFFFFFF);
-            draw.pop();
+            game.native_draw_model(draw, "create:block/mechanical_crafter/lid", 0xFFFFFF);
         }
+        if layout(game, state.target_position(pos))
+            .is_some_and(|target| state.shows_belt_to(target))
+        {
+            let drew_original_belt = create::original_assets()
+                && game.native_draw_terrain_model(
+                    draw,
+                    BELT_MODEL,
+                    NativeModelRenderOptions {
+                        material: NativeModelMaterial::Solid,
+                        uv_shrink_ratio: 4.0 / 2048.0,
+                        uv_shift: crafter::belt_u_offset(running.phase, rpm, game.visual_ticks())
+                            .map(|offset| NativeModelUvShift {
+                                source_sprite: BELT_SPRITE,
+                                target_sprite: BELT_SPRITE,
+                                scale: [1.0; 2],
+                                offset: [offset, 0.0],
+                            }),
+                        ..Default::default()
+                    },
+                );
+            if !drew_original_belt {
+                game.native_draw_model(draw, BELT_MODEL, 0xFFFFFF);
+            }
+            game.native_draw_model(draw, "create:block/mechanical_crafter/belt", 0xFFFFFF);
+        } else {
+            game.native_draw_model(draw, "create:block/mechanical_crafter/arrow", 0xFFFFFF);
+        }
+        draw.pop();
 
         let elapsed = elapsed_ticks(entity, draw.game_time);
         let remaining = running.countdown as f32
-            - crafter::countdown_speed(create::running_speed(game, &entity.nbt)) as f32
-                * (elapsed as f32 + draw.partial);
+            - crafter::countdown_speed(rpm) as f32 * (elapsed as f32 + draw.partial);
         let advance = if running.phase == Phase::Exporting {
             0.75 * ((1000.0 - remaining) / 1000.0).clamp(0.0, 1.0)
         } else {
@@ -1497,41 +1604,92 @@ pub(super) mod crushing {
         game.native_block_property(pos, "facing").as_deref() == Some("down")
     }
 
-    fn recipe(game: &Game<'_>, stack: &ItemStack) -> Option<(i32, Vec<(ItemStack, f32)>)> {
+    type Recipe = (i32, Vec<(ItemStack, f32)>);
+
+    fn recipe(game: &Game<'_>, stack: &ItemStack) -> Result<Option<Recipe>, ()> {
         let crushing = game.native_recipes_of_type("create:crushing");
         let milling = game.native_recipes_of_type("create:milling");
+        let mut unresolved = false;
         for recipe in crushing.iter().chain(milling) {
             let json = &recipe.json;
-            let Some(input) = json["ingredients"]
+            let Some(ingredient) = json["ingredients"]
                 .as_array()
                 .filter(|list| list.len() == 1)
                 .and_then(|list| create::ingredient(&list[0]))
-                .and_then(|value| game.native_recipe_ingredient(&value))
             else {
+                unresolved = true;
+                continue;
+            };
+            let Some(input) = game.native_recipe_ingredient(&ingredient) else {
                 continue;
             };
             if !input.test(stack) {
                 continue;
             }
-            let duration = i32::try_from(json["processing_time"].as_i64()?).ok()?;
-            let results = json["results"]
-                .as_array()?
-                .iter()
-                .map(|row| {
-                    let id = row["id"].as_str()?;
-                    let count = row["count"].as_u64().unwrap_or(1);
-                    let chance = row["chance"].as_f64().unwrap_or(1.0);
-                    (count > 0
-                        && count <= 64
-                        && (0.0..=1.0).contains(&chance)
-                        && game.native_max_stack_size(id).is_some())
-                    .then(|| (ItemStack::new(id, count as u32), chance as f32))
-                })
-                .collect::<Option<Vec<_>>>()?;
-            return (duration > 0 && !results.is_empty() && results.len() < SLOTS)
-                .then_some((duration, results));
+            let decoded = (|| {
+                let duration = i32::try_from(json["processing_time"].as_i64()?).ok()?;
+                let results = json["results"]
+                    .as_array()?
+                    .iter()
+                    .map(|row| {
+                        let chance = match row.get("chance") {
+                            Some(chance) => chance.as_f64()?,
+                            None => 1.0,
+                        };
+                        if !(0.0..=1.0).contains(&chance)
+                            || row
+                                .get("components")
+                                .is_some_and(|value| !value.is_object())
+                        {
+                            return None;
+                        }
+                        // ProcessingOutput constructs its stack with the recipe's
+                        // component patch before rolling count or merging slots.
+                        let stack = game.native_recipe_result(row)?;
+                        Some((stack, chance as f32))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                (duration > 0 && !results.is_empty() && results.len() < SLOTS)
+                    .then_some((duration, results))
+            })();
+            return decoded.map(Some).ok_or(());
         }
-        None
+        if unresolved { Err(()) } else { Ok(None) }
+    }
+
+    fn known_without_recipe(game: &Game<'_>, stack: &ItemStack) -> bool {
+        let id = stack.item.as_ref();
+        // These inputs still have a Crushing recipe in standalone Java
+        // Create 6.0.10. Keep them intact until their results are available.
+        (id.starts_with("minecraft:") || id.starts_with("create:"))
+            && !matches!(
+                id,
+                "minecraft:netherrack"
+                    | "create:asurine"
+                    | "create:crimsite"
+                    | "create:ochrum"
+                    | "create:veridium"
+            )
+            && ![
+                "create:stone_types/asurine",
+                "create:stone_types/crimsite",
+                "create:stone_types/ochrum",
+                "create:stone_types/veridium",
+            ]
+            .into_iter()
+            .any(|tag| {
+                game.items()
+                    .item_tags
+                    .get(tag)
+                    .is_some_and(|set| set.contains(id))
+            })
+    }
+
+    fn processing_duration(game: &Game<'_>, stack: &ItemStack) -> Option<i32> {
+        match recipe(game, stack).ok()? {
+            Some((duration, _)) => Some(duration),
+            None => known_without_recipe(game, stack).then_some(100),
+        }
     }
 
     fn bypasses(game: &Game<'_>, id: u32, pos: Pos) -> bool {
@@ -1556,7 +1714,9 @@ pub(super) mod crushing {
         );
         let Some(item) = candidates.into_iter().find(|item| match tracked {
             Some(uuid) => game.persist.uuid_of(item.id) == Some(uuid),
-            None => !bypasses(game, item.id, pos) && recipe(game, &item.stack).is_some(),
+            None => {
+                !bypasses(game, item.id, pos) && processing_duration(game, &item.stack).is_some()
+            }
         }) else {
             if entity.nbt.remove(&PROCESSING_ENTITY.into()).is_some() {
                 game.native_block_entity_sync(pos);
@@ -1565,7 +1725,7 @@ pub(super) mod crushing {
         };
 
         if item.position[1] < origin[1] + 0.25 {
-            let Some((duration, _)) = recipe(game, &item.stack) else {
+            let Some(duration) = processing_duration(game, &item.stack) else {
                 entity.nbt.remove(&PROCESSING_ENTITY.into());
                 game.native_block_entity_sync(pos);
                 return;
@@ -1629,7 +1789,7 @@ pub(super) mod crushing {
         {
             return 0;
         }
-        let Some((duration, _)) = recipe(game, stack) else {
+        let Some(duration) = processing_duration(game, stack) else {
             return 0;
         };
         let moved = stack.count.min(create::stack_maximum(game, stack));
@@ -1751,12 +1911,13 @@ pub(super) mod crushing {
                 }
             }
             Action::Apply => {
-                let Some((_, results)) = entity.items[0]
-                    .as_ref()
-                    .and_then(|stack| recipe(game, stack))
-                else {
-                    // A data reload can remove a recipe while it is in progress.
+                let Some(input) = entity.items[0].as_ref() else {
                     return;
+                };
+                let results = match recipe(game, input) {
+                    Ok(Some((_, results))) => results,
+                    Ok(None) if known_without_recipe(game, input) => Vec::new(),
+                    _ => return,
                 };
                 let outputs = results
                     .into_iter()
@@ -1938,7 +2099,63 @@ struct CuttingRecipe {
     outputs: Vec<(ItemStack, f32)>,
 }
 
-pub(super) fn read_filter(game: &Game<'_>, entity: &ModBlockEntity) -> Option<Option<ItemStack>> {
+#[derive(Default)]
+struct SawLimits {
+    instances: BTreeMap<Pos, (ModRevision, bool)>,
+    sweep_tick: Option<i64>,
+}
+
+thread_local! {
+    static BULK_LIMITS: RefCell<SessionCache<SawLimits>> = RefCell::new(SessionCache::default());
+    static STONECUTTING_SEARCH: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+pub(super) fn recipes_reloaded() {
+    STONECUTTING_SEARCH.set(None);
+}
+
+fn allow_stonecutting() -> bool {
+    // RecipeFinder caches the included types until the recipe data reloads.
+    STONECUTTING_SEARCH.with(|setting| {
+        if let Some(enabled) = setting.get() {
+            return enabled;
+        }
+        let enabled = super::create_port_server_config::saw_stonecutting();
+        setting.set(Some(enabled));
+        enabled
+    })
+}
+
+fn bulk_cutting(game: &Game<'_>, pos: Pos, entity: &ModBlockEntity) -> bool {
+    // SawBlockEntity binds this flag to its ProcessingInventory instance.
+    // The option is not in its save data, so a new loaded entity re-reads it.
+    BULK_LIMITS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let state = cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+        let tick = game.world.game_time;
+        if state.sweep_tick.is_none_or(|previous| tick < previous || tick - previous >= 64) {
+            state.sweep_tick = Some(tick);
+            state.instances.retain(|&[x, y, z], (revision, _)| {
+                [x, y, z] == pos
+                    || matches!(game.world.block_entities.get(&(x, y, z)),
+                        Some(BlockEntity::Mod(entity)) if entity.revision().is_same_create_entity(*revision))
+            });
+        }
+        let revision = entity.revision();
+        let entry = state.instances.entry(pos).or_insert_with(|| {
+            (revision, super::create_port_server_config::bulk_cutting())
+        });
+        if !entry.0.is_same_create_entity(revision) {
+            *entry = (revision, super::create_port_server_config::bulk_cutting());
+        }
+        entry.1
+    })
+}
+
+pub(super) fn read_filter(
+    items: &crate::items::Items,
+    entity: &ModBlockEntity,
+) -> Option<Option<ItemStack>> {
     let Some(saved) = entity.nbt.get(&"Filter".into()) else {
         return Some(None);
     };
@@ -1946,16 +2163,16 @@ pub(super) fn read_filter(game: &Game<'_>, entity: &ModBlockEntity) -> Option<Op
         return Some(None);
     }
     let item = item_from_nbt(saved)?;
-    ordinary_filter_item(game, &item).then_some(Some(item))
+    ordinary_filter_item(items, &item).then_some(Some(item))
 }
 
-pub(super) fn ordinary_filter_item(game: &Game<'_>, item: &ItemStack) -> bool {
+pub(super) fn ordinary_filter_item(items: &crate::items::Items, item: &ItemStack) -> bool {
     item.count != 0
         && !matches!(
             item.item.as_ref(),
             "create:filter" | "create:attribute_filter" | "create:package_filter"
         )
-        && game.items().get(&item.item).is_some()
+        && items.get(&item.item).is_some()
 }
 
 fn cutting_recipes(
@@ -2020,28 +2237,30 @@ fn cutting_recipes(
         .collect();
     // The same authoritative provider as the native Stonecutter, including
     // merged world recipes and item tags. The original default enables these.
-    recipes.extend(
-        game.stations()
-            .recipes
-            .stonecutting
-            .iter()
-            .filter_map(|recipe| {
-                let id = saw_processing::stonecutting_source_id(&recipe.id)?;
-                (saw_processing::automated_recipe(id)
-                    && recipe.input.test(input)
-                    && accepts(&recipe.result)
-                    && game.items().get(&recipe.result.item).is_some())
-                .then(|| {
-                    (
-                        id,
-                        CuttingRecipe {
-                            duration: 50,
-                            outputs: vec![(recipe.result.clone(), 1.0)],
-                        },
-                    )
-                })
-            }),
-    );
+    if allow_stonecutting() {
+        recipes.extend(
+            game.stations()
+                .recipes
+                .stonecutting
+                .iter()
+                .filter_map(|recipe| {
+                    let id = saw_processing::stonecutting_source_id(&recipe.id)?;
+                    (saw_processing::automated_recipe(id)
+                        && recipe.input.test(input)
+                        && accepts(&recipe.result)
+                        && game.items().get(&recipe.result.item).is_some())
+                    .then(|| {
+                        (
+                            id,
+                            CuttingRecipe {
+                                duration: 50,
+                                outputs: vec![(recipe.result.clone(), 1.0)],
+                            },
+                        )
+                    })
+                }),
+        );
+    }
     recipes.sort_by_key(|(id, _)| saw_processing::source_recipe_order(id));
     recipes.into_iter().map(|(_, recipe)| recipe).collect()
 }
@@ -2105,14 +2324,20 @@ pub(super) fn insert_from_transport(
     {
         return 0;
     }
-    let (Some(filter), Some(mut cycle)) = (read_filter(game, entity), cycle(entity)) else {
+    let (Some(filter), Some(mut cycle)) = (read_filter(game.items(), entity), cycle(entity)) else {
         return 0;
     };
+    let limit = if bulk_cutting(game, pos, entity) {
+        create::stack_maximum(game, stack).min(99)
+    } else {
+        1
+    };
+    let accepted = stack.count.min(limit);
     if simulate {
-        return 1;
+        return accepted;
     }
     let mut inserted = stack.clone();
-    inserted.count = 1;
+    inserted.count = accepted;
     start(game, &mut cycle, &inserted, filter.as_ref());
     if game
         .native_with_mod_block_entity(pos, |entity| {
@@ -2124,7 +2349,7 @@ pub(super) fn insert_from_transport(
         return 0;
     }
     game.native_block_entity_sync(pos);
-    1
+    accepted
 }
 
 pub(super) fn landed(game: &mut Game<'_>, pos: Pos, stack: &mut ItemStack) -> bool {
@@ -2135,10 +2360,11 @@ pub(super) fn landed(game: &mut Game<'_>, pos: Pos, stack: &mut ItemStack) -> bo
     if game.clock.frozen() || create::number(&entity.nbt, "Speed") == 0.0 {
         return false;
     }
-    if insert_from_transport(game, pos, stack, false) == 0 {
+    let accepted = insert_from_transport(game, pos, stack, false);
+    if accepted == 0 {
         return false;
     }
-    stack.count -= 1;
+    stack.count -= accepted;
     true
 }
 
@@ -2146,7 +2372,11 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity, r
     if entity.items.len() != SLOTS {
         return false;
     }
-    let (Some(filter), Some(mut cycle)) = (read_filter(game, entity), cycle(entity)) else {
+    bulk_cutting(game, pos, entity);
+    if game.native_block_property(pos, "facing").as_deref() != Some("up") {
+        return false;
+    }
+    let (Some(filter), Some(mut cycle)) = (read_filter(game.items(), entity), cycle(entity)) else {
         return false;
     };
     let first = game

@@ -4,7 +4,9 @@
 use super::create_port_chassis as chassis;
 use super::create_port_contraption_actors as actors;
 use super::create_port_contraption_storage as storage;
+use super::create_port_contraption_tank as tanks;
 use super::create_port_deployer as deployer;
+use super::create_port_fluid_tank as fluid_tank;
 use super::create_port_portable_storage as psi;
 use super::create_port_sticker as sticker;
 use super::{
@@ -18,7 +20,7 @@ use create_engine::{
     contraption::windmill::{Config as WindmillConfig, RotationDirection, Windmill},
     contraption::{
         Adhesion, Assembly, BlockRules, CaptureView, Cell, QuarterTurn, RenderMotion, RenderPose,
-        Rotation, plan_landing,
+        Rotation, cargo_bounds, cargo_light, plan_landing,
     },
     kinetics::{Axis, Pos},
     placement::Direction,
@@ -26,9 +28,9 @@ use create_engine::{
 use glam::{DVec3, Mat4, Vec3};
 use horizon_client::collisions::LookupCollisions;
 use horizon_client_render::create_contraption_scene::{
-    ACTIVE, ACTOR_VISUAL_KEY, ClockHand, KEY, MAX_BLOCKS, MAX_PLAIN_ROTARY_BLOCKS, MAX_RECORDS,
-    POSE_KEY, POSES as POSE_ATTACHMENT, RECORDS, Record, StrokeKind, apply_scene_sync, dry_slab_type,
-    dry_straight_stair, plain_rotary_state, plan_scene_update, read, solid_create_payload,
+    ACTIVE, ACTOR_VISUAL_KEY, ClockHand, KEY, MAX_BLOCKS, MAX_PACKED_BLOCKS, MAX_RECORDS,
+    POSE_KEY, POSES as POSE_ATTACHMENT, RECORDS, Record, StrokeKind, TANK_STORAGE_KEY, apply_scene_sync, dry_slab_type,
+    dry_straight_stair, plain_packed_state, plan_scene_update, read, solid_create_payload,
     vanilla_stair,
 };
 use horizon_core::position::BlockPos;
@@ -139,7 +141,7 @@ pub(super) fn facing(game: &Game<'_>, p: Pos) -> Option<Direction> {
         .find(|direction| direction.name() == facing)
 }
 
-fn controller_present(game: &Game<'_>, record: &Record) -> bool {
+pub(super) fn controller_present(game: &Game<'_>, record: &Record) -> bool {
     let [x, y, z] = record.controller;
     let name = game.native_block(record.controller);
     let rope_pulley = record.stroke_kind() == Some(StrokeKind::RopePulley);
@@ -309,6 +311,16 @@ pub(super) fn commit(
     if set_records(game, key, records).is_err() {
         return false;
     }
+    // Contraption.removeBlocksFromWorld detaches a tank block entity before
+    // replacing its terrain. The ordinary removal observer must not split or
+    // journal cargo that is already owned by the moving structure.
+    for &(pos, before, after) in edits {
+        if game.res.facts().is_air(after)
+            && registry.state(before).is_some_and(|state| state.name == fluid_tank::BLOCK)
+        {
+            game.world.block_entities.remove(&(pos[0], pos[1], pos[2]));
+        }
+    }
     let flags = flags::UPDATE_CLIENTS | flags::UPDATE_SKIP_ALL_SIDEEFFECTS;
     let applied = game.with_level(|behaviour, level, ticks| {
         for (index, &(p, _, after)) in edits.iter().enumerate() {
@@ -364,7 +376,7 @@ fn supported(state: &BlockState) -> bool {
         || dry_slab_type(state).is_some()
         || dry_straight_stair(state)
         || solid_create_payload(state)
-        || plain_rotary_state(state)
+        || plain_packed_state(state)
     {
         return true;
     }
@@ -554,9 +566,11 @@ pub(super) struct MountedCapture<'g, 'a> {
     base: Capture<'g, 'a>,
     allow_chest: bool,
     allow_barrel: bool,
-    allow_actor_data: bool,
+    allow_deployer: bool,
+    allow_psi: bool,
     allow_chassis: bool,
     allow_sticker: bool,
+    allow_tank: bool,
     glue: &'g [create_engine::contraption::glue::Volume],
 }
 
@@ -564,15 +578,28 @@ impl<'g, 'a> MountedCapture<'g, 'a> {
     pub(super) fn for_linear(
         game: &'g Game<'a>,
         glue: &'g [create_engine::contraption::glue::Volume],
+        allow_psi: bool,
     ) -> Self {
         Self {
             base: Capture(game),
             allow_chest: true,
             allow_barrel: true,
-            allow_actor_data: false,
+            allow_deployer: false,
+            allow_psi,
             allow_chassis: true,
             allow_sticker: false,
+            allow_tank: false,
             glue,
+        }
+    }
+
+    pub(super) fn for_rope_pulley(
+        game: &'g Game<'a>,
+        glue: &'g [create_engine::contraption::glue::Volume],
+    ) -> Self {
+        Self {
+            allow_tank: true,
+            ..Self::for_linear(game, glue, true)
         }
     }
 }
@@ -591,7 +618,8 @@ pub(super) fn commit_linear_capture(
     let Ok(ranges) = chassis::capture(game, origin, &record.blocks) else {
         return false;
     };
-    let Ok(chest) = storage::capture(game, origin, &record.blocks, false) else {
+    let Ok(chest) = storage::capture(game, origin, &record.blocks, storage::supports_pair(&record))
+    else {
         return false;
     };
     let Ok(update) = glue::capture(game, key, &record, origin) else {
@@ -642,10 +670,13 @@ impl CaptureView for MountedCapture<'_, '_> {
             self.allow_chest
         };
         if (allow_storage && storage::can_capture(game, p, block))
-            || (self.allow_actor_data
-                && (deployer::can_capture(game, p, block) || psi::can_capture(game, p, block)))
+            || (self.allow_deployer && deployer::can_capture(game, p, block))
+            || (self.allow_psi && psi::can_capture(game, p, block))
             || (self.allow_chassis && chassis::can_capture(game, p, block))
             || (self.allow_sticker && sticker::can_capture(game, p, block))
+            || (self.allow_tank
+                && block.name == fluid_tank::BLOCK
+                && fluid_tank::endpoint(game, p).is_some())
         {
             return Some(block.clone());
         }
@@ -661,6 +692,11 @@ impl CaptureView for MountedCapture<'_, '_> {
         p: Pos,
         forced: Option<Direction>,
     ) -> Result<Vec<Pos>, create_engine::contraption::CaptureError> {
+        if self.allow_tank && self.base.0.native_block(p) == fluid_tank::BLOCK {
+            let record = fluid_tank::endpoint(self.base.0, p)
+                .ok_or(create_engine::contraption::CaptureError::Unsupported(p))?;
+            return Ok(record.tank.parts().filter(|&part| part != p).collect());
+        }
         if self.allow_sticker {
             let game = self.base.0;
             let registry = game.pack.assets.registry;
@@ -719,22 +755,19 @@ fn assemble(
             base: Capture(game),
             allow_chest: allow_mounted_data,
             allow_barrel: !windmill,
-            allow_actor_data: allow_mounted_data,
+            allow_deployer: allow_mounted_data,
+            allow_psi: allow_mounted_data,
             allow_chassis: allow_mounted_data,
             allow_sticker: !windmill,
+            allow_tank: allow_mounted_data,
             glue: &glue,
         };
-        Assembly::capture(&capture, anchor, Some(controller), None, MAX_PLAIN_ROTARY_BLOCKS).ok()?
+        Assembly::capture(&capture, anchor, Some(controller), None, MAX_PACKED_BLOCKS).ok()?
     };
     if shape.blocks().is_empty()
         || (shape.blocks().len() > MAX_BLOCKS
-            && shape.blocks().iter().any(|(_, state)| !plain_rotary_state(state)))
-        || shape
-            .blocks()
-            .iter()
-            .filter(|(_, block)| block.name == psi::BLOCK)
-            .count()
-            > 1
+            && shape.blocks().iter().any(|(_, state)| !plain_packed_state(state)))
+        || psi::has_multiple(shape.blocks())
     {
         return None;
     }
@@ -784,6 +817,7 @@ fn assemble(
     let chest = storage::capture(game, anchor, shape.blocks(), allow_mounted_data).ok()?;
     let deployer = deployer::capture(game, anchor, shape.blocks()).ok()?;
     let chassis = chassis::capture(game, anchor, shape.blocks()).ok()?;
+    let tanks = tanks::capture(game, anchor, shape.blocks()).ok()?;
     let record = Record {
         controller,
         anchor,
@@ -801,7 +835,9 @@ fn assemble(
     records.push(record);
     if !super::create_port_glue_transfer::commit(game, key, glue, |game| {
         chassis::commit_capture(game, key, controller, chassis, |game| {
-            deployer::commit_capture(game, key, records, &edits, controller, chest, deployer)
+            tanks::commit_capture(game, key, controller, tanks, |game| {
+                deployer::commit_capture(game, key, records, &edits, controller, chest, deployer)
+            })
         })
     }) {
         return None;
@@ -811,6 +847,11 @@ fn assemble(
 }
 
 fn rotate_state(state: &BlockState, turn: QuarterTurn) -> Option<BlockState> {
+    if state.name == fluid_tank::BLOCK {
+        // Landing validates the captured footprint and generates its complete
+        // destination states together, including the relocated controller.
+        return (turn.facing(Direction::Up) == Direction::Up).then(|| state.clone());
+    }
     if chassis::is_chassis(&state.name) {
         return chassis::rotate_state(state, turn);
     }
@@ -928,17 +969,40 @@ fn replaceable_leaf(
         .properties
         .get("waterlogged")
         .is_none_or(|value| value != "false")
-        || game.res.behaviours().fluid(before).amount() != 0
     {
         return false;
     }
+    can_replace_on_landing(game, position, &leaf.name, before, after)
+}
+
+pub(super) fn replaceable_stone(
+    game: &Game<'_>,
+    position: Pos,
+    before: BlockStateId,
+    after: BlockStateId,
+) -> bool {
+    game.pack.assets.registry.state(before).is_some_and(|block| {
+        block.name == "minecraft:stone"
+            && block.properties.is_empty()
+            && can_replace_on_landing(game, position, &block.name, before, after)
+    })
+}
+
+fn can_replace_on_landing(
+    game: &Game<'_>,
+    position: Pos,
+    block: &str,
+    before: BlockStateId,
+    after: BlockStateId,
+) -> bool {
     let [x, y, z] = position;
     let key = (x, y, z);
     let [cx, cz] = column(position);
-    if !game.border.contains(f64::from(x), f64::from(z))
+    if game.res.behaviours().fluid(before).amount() != 0
+        || !game.border.contains(f64::from(x), f64::from(z))
         || game.world.block_names.contains_key(&key)
         || game.world.block_lock(key).is_some()
-        || game.loot_block_entity(position, &leaf.name).is_some()
+        || game.loot_block_entity(position, block).is_some()
         || game
             .world
             .block_entities
@@ -971,7 +1035,7 @@ fn replaceable_leaf(
         .is_ok_and(|shape| !shape.is_empty())
 }
 
-fn drop_replaced_leaf(game: &mut Game<'_>, position: Pos, old: BlockStateId) {
+pub(super) fn drop_replaced_block(game: &mut Game<'_>, position: Pos, old: BlockStateId) {
     game.level_event_at(2001, position, old.0 as i32);
     if !game.ui.rules.bool("block_drops") {
         return;
@@ -1023,6 +1087,10 @@ fn land(game: &mut Game<'_>, controller: Pos, angle: f32) -> bool {
     ) else {
         return false;
     };
+    let turn = rotation.snapped();
+    let Ok(tank_landing) = tanks::prepare_landing(game, key, &record, record.anchor, turn) else {
+        return false;
+    };
     let registry = game.pack.assets.registry;
     let accepts_leaves = record.axis == Axis::Y.index()
         && record.stroke.is_none()
@@ -1032,7 +1100,10 @@ fn land(game: &mut Game<'_>, controller: Pos, angle: f32) -> bool {
         .iter()
         .map(|(p, block)| {
             let before = state(game, *p);
-            let after = registry.id(block)?;
+            let after = tank_landing
+                .as_ref()
+                .and_then(|landing| landing.state(*p))
+                .or_else(|| registry.id(block))?;
             (game.res.facts().is_air(before)
                 || accepts_leaves && replaceable_leaf(game, *p, before, after))
             .then_some((*p, before, after))
@@ -1050,7 +1121,6 @@ fn land(game: &mut Game<'_>, controller: Pos, angle: f32) -> bool {
     ) {
         return false;
     }
-    let turn = rotation.snapped();
     let Ok(glue) =
         super::create_port_glue_transfer::landing(game, key, &record, record.anchor, turn)
     else {
@@ -1058,7 +1128,9 @@ fn land(game: &mut Game<'_>, controller: Pos, angle: f32) -> bool {
     };
     if !super::create_port_glue_transfer::commit(game, key, glue, |game| {
         chassis::commit_landing(game, key, &record, record.anchor, turn, &edits, |game| {
-            deployer::commit_landing(game, key, records, &edits, &record, turn)
+            tanks::commit_landing(game, key, tank_landing, |game| {
+                deployer::commit_landing(game, key, records, &edits, &record, turn)
+            })
         })
     }) {
         return false;
@@ -1069,7 +1141,7 @@ fn land(game: &mut Game<'_>, controller: Pos, angle: f32) -> bool {
     // landed. A parked or restarted failed landing can retry without drops.
     for (position, before, _) in edits {
         if !game.res.facts().is_air(before) {
-            drop_replaced_leaf(game, position, before);
+            drop_replaced_block(game, position, before);
         }
     }
     movement_sound(game, controller, false);
@@ -1137,7 +1209,7 @@ pub(super) fn tick(
     let stalled = current.is_some_and(|record| {
         actors::tick_bearing_tools(game, record);
         let cutting = actors::stalled(game, pos);
-        let docked = psi::advance(game, record);
+        let docked = psi::advance(game, record, None).is_some();
         cutting || docked
     });
     let action = controller.tick(raw_rpm, rpm, mode, stalled, || {
@@ -1377,7 +1449,8 @@ pub(super) fn mirror_sync(game: &mut Game<'_>, data: &[u8]) {
         .into_iter()
         .filter(|change| {
             change.namespace == "create".into()
-                && (change.name == KEY.into() || change.name == POSE_KEY.into())
+                && (change.name == KEY.into() || change.name == POSE_KEY.into()
+                    || change.name == TANK_STORAGE_KEY.into())
         })
         .collect();
     let Some(chunk) = game.world.chunks.get_mut(&(x, z)) else { return };
@@ -1386,6 +1459,7 @@ pub(super) fn mirror_sync(game: &mut Game<'_>, data: &[u8]) {
         && !(replace
             && chunk.saved.as_ref().is_some_and(|saved| {
                 saved.attachments.has(&RECORDS) || saved.attachments.has(&POSE_ATTACHMENT)
+                    || tanks::has_storage(&saved.attachments)
             }))
     {
         return;
@@ -1393,7 +1467,11 @@ pub(super) fn mirror_sync(game: &mut Game<'_>, data: &[u8]) {
     let chunk = Arc::make_mut(chunk);
     let extras = Arc::make_mut(chunk.saved.get_or_insert_with(Default::default));
     let map = &mut extras.attachments;
+    let tanks_changed = changes.iter().any(|change| change.name == TANK_STORAGE_KEY.into());
     if let Ok(records) = apply_scene_sync(map, changes, replace) {
+        if tanks_changed {
+            tanks::cache_mirror(map);
+        }
         POSES.with(|poses| {
             poses.borrow_mut().retain(|&(controller, hand), _| {
                 column(controller) != [x, z]
@@ -1500,6 +1578,31 @@ fn draw_actor(
     }
 }
 
+fn cargo_visible(game: &Game<'_>, record: &Record, camera: DVec3, view_scale: f64) -> bool {
+    let motion = match record.stroke {
+        None => cargo_bounds::Motion::Rotary(axis(record.axis)),
+        Some(stroke) if stroke.kind == StrokeKind::Piston => cargo_bounds::Motion::Piston {
+            poles: stroke.limit as usize + 1,
+        },
+        Some(_) => cargo_bounds::Motion::Translating,
+    };
+    let Some([min, max]) = cargo_bounds::local_bounds(record.blocks.iter().map(|(pos, _)| *pos), motion)
+    else {
+        return false;
+    };
+    let min = DVec3::from_array(min);
+    let max = DVec3::from_array(max);
+    // Vanilla tests the current entity position, independently of its render pose.
+    let offset = record.stroke.map_or(0.0, |stroke| stroke.offset);
+    let origin = DVec3::from_array(record.origin_for_offset(offset)) - camera;
+    let range = super::entity_culling::default_range(max - min, view_scale);
+    origin.length_squared() < range * range
+        && game.view_frustum.as_ref().is_none_or(|frustum| {
+            let margin = DVec3::splat(0.5);
+            frustum.intersects((origin + min - margin).as_vec3(), (origin + max + margin).as_vec3())
+        })
+}
+
 pub(super) fn draw_structures(game: &Game<'_>, draw: &mut NativeWorldDraw) {
     use horizon_client::block_entity_render::vertex_light;
     if game.ticks.is_multiple_of(20) {
@@ -1508,24 +1611,27 @@ pub(super) fn draw_structures(game: &Game<'_>, draw: &mut NativeWorldDraw) {
         });
     }
     let camera = DVec3::from_array(draw.camera);
+    let registry = game.pack.assets.registry;
+    let grass = game.pack.item_renderer.grass_color(0.5, 1.0) as u32;
+    let tables = &game.pack.context.tables;
+    let view_scale = game.view_scale();
     for chunk in game.world.chunks.values() {
-        if (f64::from(chunk.x) * 16.0 + 8.0 - camera.x).abs() > 80.0
-            || (f64::from(chunk.z) * 16.0 + 8.0 - camera.z).abs() > 80.0
-        {
-            continue;
-        }
-        let Ok(records) = read(chunk) else { continue };
-        let visuals = chunk
+        let Some(saved) = chunk
             .saved
             .as_ref()
-            .and_then(|saved| decoded(&saved.attachments, &ACTOR_VISUALS));
+            .filter(|saved| saved.attachments.has(&RECORDS))
+        else {
+            continue;
+        };
+        let Ok(records) = read(chunk) else { continue };
+        let visuals = decoded(&saved.attachments, &ACTOR_VISUALS);
         for record in records.iter() {
             let pose = rendered_pose(game, draw.partial, record);
             pulley::draw_line(game, draw, record, pose.offset);
-            let anchor = record.origin_for_offset(pose.offset);
-            if DVec3::from_array(anchor).distance_squared(camera) > 64.0 * 64.0 {
+            if !cargo_visible(game, record, camera, view_scale) {
                 continue;
             }
+            let anchor = record.origin_for_offset(pose.offset);
             draw.push();
             draw.translate_world(anchor);
             let mut axis = [0.0; 3];
@@ -1537,11 +1643,20 @@ pub(super) fn draw_structures(game: &Game<'_>, draw: &mut NativeWorldDraw) {
             let previous_light = draw.light;
             draw.light = vertex_light(game.world.light(x, y, z));
             let structure_pose = draw.pose();
+            let centre = structure_pose.transform_point3(Vec3::splat(0.5)).to_array();
             let light = draw.light;
             for (local, block) in record.blocks.iter() {
                 let translation = local.map(|value| value as f32);
                 let block_pose = structure_pose * Mat4::from_translation(Vec3::from_array(translation));
-                if let Some(id) = game.pack.assets.registry.id(block) {
+                let state = registry.id(block).or_else(|| {
+                    // Older snapshots may have only part of the state.
+                    let mut state = registry.state(registry.default_state(&block.name)?)?.clone();
+                    for (key, value) in &block.properties {
+                        state.properties.get_mut(key)?.clone_from(value);
+                    }
+                    registry.id(&state)
+                });
+                if let Some(id) = state {
                     let chest = block.name == "minecraft:chest" &&
                         horizon_client_render::block_entity_render::create_contraption_chest::closed(
                             game.res.block_entity_render(),
@@ -1553,18 +1668,27 @@ pub(super) fn draw_structures(game: &Game<'_>, draw: &mut NativeWorldDraw) {
                             draw.vertices_mut(),
                         );
                     if !chest {
-                        // Same seeded model path as native_draw_block, using
-                        // the complete state already stored in the geometry.
-                        game.block_model_vertices(id, 42, block_pose, light, true, draw.vertices_mut());
+                        let vertices = draw.vertices_mut();
+                        let first = vertices.len();
+                        // Keep the same baked model, seed and tint as native_draw_block.
+                        // Start with its baked light rather than the controller's light.
+                        game.tinted_block_model_vertices(
+                            id,
+                            42,
+                            block_pose,
+                            |quad| vertex_light((quad.light[1] << 4) | quad.light[0]),
+                            true,
+                            |index| tables.default_tint(id, index, grass),
+                            vertices,
+                        );
+                        for vertex in &mut vertices[first..] {
+                            let [x, y, z] = cargo_light::sample_cell(camera.to_array(), centre, vertex.pos);
+                            vertex.light = cargo_light::max_light(
+                                vertex.light,
+                                vertex_light(game.world.light(x, y, z)),
+                            );
+                        }
                     }
-                } else {
-                    // Older snapshots may have only part of the state.
-                    let properties: Vec<_> = block.properties.iter()
-                        .map(|(key, value)| (key.as_str(), value.as_str())).collect();
-                    draw.push();
-                    draw.translate(translation);
-                    game.native_draw_block(draw, &block.name, &properties);
-                    draw.pop();
                 }
                 if record.blocks.len() <= MAX_BLOCKS {
                     draw.push();
@@ -1573,6 +1697,7 @@ pub(super) fn draw_structures(game: &Game<'_>, draw: &mut NativeWorldDraw) {
                     draw.pop();
                 }
             }
+            tanks::draw_mounted(game, &saved.attachments, record.controller, draw);
             draw.light = previous_light;
             draw.pop();
         }

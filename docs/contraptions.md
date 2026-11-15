@@ -13,6 +13,18 @@ rules while using Horizon's block, item and player APIs.
 | Presentation | The client receives geometry at capture and tracks it with small pose updates during motion. The rendered pose interpolates across packet arrival and local frame boundaries. Collision uses the authoritative pose. Original resources remain an optional local import. |
 | Contact and actors | Horizon's normal collision paths handle moving geometry. Riders follow horizontal and translating platforms, and a rising blade can lift a rider on a bearing rotating around X or Z. Moving harvesters, saws and drills use the original crop or block rules and Horizon loot. |
 
+Moving block models sample the light at each transformed vertex. The sample
+point moves one sixteenth toward the assembly's pivot, as in Catnip's CPU
+renderer. The world and baked model contributions combine separately for
+sky and block light. This covers external lighting on ordinary cargo.
+Virtual-world light propagation, translucent materials, mounted block entities
+and the Flywheel lighting path remain separate work.
+
+Loaded contraptions use Create's cargo bounds, including the swept radius of
+a rotary assembly. The client uses Horizon's vanilla entity view scale and
+camera frustum. The rope keeps the pulley renderer's separate offscreen
+range. Chunk streaming still determines which scene records are available.
+
 The current native adapter keeps each structure's source blocks, landing cells
 and persistent record in one loaded chunk column so they share a chunk save.
 Older saves with geometry and pose in one record are read and converted on
@@ -27,16 +39,25 @@ stone slabs keep their registered half-block or double-block collision. A
 half-turn about X or Z flips their top or bottom state at landing. A vertical
 Mechanical Bearing can carry a Deployer.
 
-A Mechanical or Windmill Bearing can carry up to 2,048 blocks of eligible
-plain stone, slime, glass, terracotta, wool or concrete. The source and snapped
-positions must still fit in one loaded column. Other cargo and other drivers
-retain the 64-block limit.
+A Mechanical Bearing, Windmill Bearing or Rope Pulley can carry up to 2,048
+blocks of eligible plain stone, slime, glass, terracotta, wool or concrete.
+The source and landing positions must fit in one loaded column. Bearings also
+check their snapped rotations. A dry vertical Mechanical Piston can also
+carry 2,048 total blocks, including its full moving head and pole train.
+A Gantry accepts 2,047 eligible plain blocks and the carriage when the cargo
+fits in its column across the rail. Other cargo and drivers retain the
+64-block limit. Large linear assemblies use the same packed block palette as
+large Bearings and mark their geometry as version 3. Earlier scene versions
+remain readable.
 A vertical Mechanical Bearing, Gantry, Rope Pulley or Mechanical Piston can
 carry an ordinary chest or closed barrel. All four can use the three chassis
 variants to expand capture. The supported Gantry path has a fixed loaded rail
-span.
-The Rope Pulley supports dry rope and cargo. The clockwork hands are captured
-and restored together and currently accept vanilla payloads only.
+span. Vertical rails carry cargo upward or downward inside one column.
+The Rope Pulley supports dry rope and cargo. Complete ordinary Fluid Tanks
+can travel with a vertical Mechanical Bearing or Rope Pulley inside one
+column. The moving scene retains their fluid and restores the controller and
+members at landing. The clockwork hands are captured and restored together
+and currently accept vanilla payloads only.
 
 The Mechanical, Windmill and Clockwork Bearings expose the pinned Java
 settings boards. Hold Use on the active value box and release on a choice.
@@ -49,10 +70,9 @@ a new selection or speed change wakes it.
 Right-click a mounted ordinary single Chest or closed Barrel where its driver
 supports that storage. The generic inventory has 27 slots and uses the current
 bank shared with automation. The block that the player actually hits selects
-the bank on a rotor with two separate containers. The screen closes when the
+the bank on a structure with two separate containers. The screen closes when the
 structure lands or leaves range. The menu uses Horizon's inventory actions
-with each click applied before the next packet. Named, locked and double
-chests are outside the supported capture rules.
+with each click applied before the next packet.
 
 Collision uses exact boxes at quarter turns, narrow strips for oblique rotation
 and the registered shapes of piston parts and tools. Grounded transfer uses the
@@ -60,21 +80,27 @@ surfaces of full blocks, supported dry slabs and dry straight stair treads.
 Translating platforms and bearing side contact resolve overlap before clipping
 against ordinary terrain.
 An X- or Z-axis bearing uses the vertical pass of Java's
-`ContinuousOBBCollider`. It clips separation and horizontal contact-point
-motion independently. The local client applies these corrections at the player
-tick and includes them in the camera and body interpolation.
+`ContinuousOBBCollider`. For an active bearing with full-cube cargo, the
+local client moves the player normally before applying rotor contact. It clips
+separation and contact-point motion independently, keeping the height from
+separation and the in-tick impact response. The camera and body interpolate
+through both the ordinary movement and the correction. A tick without a pose
+update uses the last loaded hull for support. Contiguous updates that arrive
+together supply one contact-point transfer for the client tick. An unloaded or
+replaced hull starts from its next known pose.
 
-The solver matches the pinned JAR for separation, surface contact and time of
-impact on all three axes. Live player trajectories still differ at some bearing
-angles. Compound rotation, exact sub-tick timing, moving block bounce and
-sliding, and full mob contact remain open. Sable integration remains a separate
-milestone.
+The solver matches the pinned JAR for separation, surface contact, time of
+impact, normal and hit location on all three axes. Live player trajectories still
+differ at some bearing angles. Compound rotation, exact sub-tick timing, player
+bounce and sliding, and full mob contact remain open. Sable integration remains
+a separate milestone.
 
 For supported Y-axis rotors made of full collision cubes, dropped items use the
 ordinary item tick followed by Create's contact pass at the end of the level
 tick. A stone tip carrying an item through a loaded neighboring column matches
-the Java trajectory. Bounce on moving slime, overlapping rotors, and contact
-for other moving structures still need separate parity checks.
+the Java trajectory. An item can rebound off a moving Slime Block when its
+relative impact speed exceeds the source threshold. Overlapping rotors and
+contact for other moving structures still need separate parity checks.
 
 The Harvester handles wheat, carrots, potatoes, beetroot, Nether Wart, cocoa,
 sweet berries, sugar cane and supported leaves or growing plants. Its moving
@@ -170,14 +196,15 @@ and restores it at its rotated or translated landing position, including
 after a restart or controller removal.
 
 A plain closed barrel uses the same 27-slot save path. A Mechanical Bearing
-rotates its lid direction with the structure. Gantry, Rope Pulley and regular
-or sticky Mechanical Piston translate one chest or barrel. Open barrels and
-barrels with names, locks or pending loot tables are refused.
+rotates its lid direction with the structure. Linear drivers preserve the
+barrel's facing during translation. Open barrels and barrels with names,
+locks or pending loot tables are refused.
 
-A vertical Mechanical Bearing can carry two closed ordinary chests, two
-closed barrels or one of each within its loaded chunk column. The order
-matches the original Java local-position hash buckets and preserves capture
-order when two banks share a bucket. The saved one-bank format is unchanged.
+A vertical Mechanical Bearing, Gantry, dry Rope Pulley or Mechanical Piston
+can carry two ordinary single chests, two closed barrels or one of each
+within its loaded chunk column. The order matches the original Java
+local-position hash buckets and preserves capture order within a bucket.
+The saved one-bank format is unchanged.
 The two-bank format stores each 27-slot inventory under the same controller
 and restores both together after landing, including an obstructed restart.
 
@@ -186,15 +213,20 @@ when the incoming block has collision. The leaves use the usual block-break
 effect and bare-hand drops after the assembly lands. Logs, waterlogged
 leaves and other obstructions keep the structure parked.
 
-A Portable Storage Interface on a vertical Mechanical Bearing can dock that
-chest with a stationary interface and a vanilla hopper or dry vertical Chute
-below. A dry Chute above the dock can supply the moving chest and holds
-anything the chest could not accept. Both directions preserve the components.
+A dry Rope Pulley or Mechanical Piston can land solid cargo through ordinary
+Stone. The block break and its loot occur after the whole cargo lands. The
+piston head and pole train require a clear path. Bedrock keeps both banks
+and the cargo in their saved moving record until the landing cells are clear.
+
+A Portable Storage Interface on a vertical Mechanical Bearing, dry Rope
+Pulley, vertical Mechanical Piston or Gantry can dock that chest with a
+stationary interface and a vanilla Hopper or dry vertical Chute below. A
+dry Chute above the dock can supply the moving chest and holds anything the
+chest could not accept. Both directions preserve the components.
 [Portable Storage Interface](portable-storage.md)
 
-Access the inventory after landing. Moving menus, more than two banks,
-double chests, named, locked and loot-table containers are outside the
-current adapter.
+More than two banks, double Chests, Item Vaults, and containers with names,
+locks or pending loot tables remain outside this adapter.
 
 ## Controller settings
 
@@ -364,6 +396,28 @@ controller motion. The current implementation is exercised by Rust unit tests.
   placement over a native process restart. A Gantry Harvester fixture checks
   replanting and delivery of the crop to its moving chest. `--barrel` runs the
   movement and storage checks with closed barrels, including sticky retraction.
+- `tools/gantry_mounted_storage_checks.py` checks a Chest and a Barrel on one
+  Gantry, including bank order, tagged slots, unchanged facing and landing
+  after a full process restart.
+- `tools/gantry_vertical_checks.py` compares both vertical rail directions
+  with Java, including the in-flight coordinate and both tagged banks
+  after a native restart and landing.
+- `tools/pulley_mounted_pair_checks.py` checks the same pair on a dry Rope
+  Pulley, including one Cobblestone drop on replacement and retained custody
+  across a restart with a blocked landing.
+- `tools/piston_mounted_pair_checks.py` compares the same pair on a dry
+  upward Mechanical Piston. It checks an 80-tick extension trace, both saved
+  banks in flight and their inventory contents after a full restart.
+- `tools/piston_mounted_obstruction_checks.py` compares Stone replacement
+  with Java and checks that both banks remain saved when Bedrock blocks the
+  landing. After restart and clearing Bedrock, the blocked pair lands with
+  one Cobblestone drop from its remaining Stone obstruction.
+- `tools/contraption_cargo_light_checks.py` swaps a nearby lamp between
+  the ends of an assembled rotor and compares screenshot brightness changes
+  with the original JAR. The check uses `ffmpeg` to sample the captured PNGs.
+- `tools/contraption_culling_checks.py` checks the visible tip of a loaded
+  rotor from above and across the old render distance cutoffs. It also
+  checks that the Horizon renderer skips the assembly when the camera faces away.
 - `tools/sail_reference_checks.py` and `tools/sail_native_checks.py` verify
   placement, dye, shear, axial exclusion and 1 RPM generation with eight
   sails or frames. The native runs cover restart, landing and both art packs.

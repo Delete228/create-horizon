@@ -147,6 +147,7 @@ pub const ITEMS: &[&str] = &[
     "copper_nugget",
     "powdered_obsidian",
     "experience_nugget",
+    "bar_of_chocolate",
 ];
 pub const PARTS: &[&str] = &[
     "shaft",

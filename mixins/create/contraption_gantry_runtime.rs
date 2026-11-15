@@ -9,6 +9,7 @@ use super::{
     },
     create_port_contraption_actors as actors,
     create_port_piston::collides_at,
+    create_port_portable_storage as psi,
     create_port_super_glue as glue,
 };
 use crate::containers::{BlockEntity, ModBlockEntity};
@@ -21,12 +22,12 @@ use create_engine::{
     placement::Direction,
 };
 use horizon_client_render::create_contraption_scene::{
-    MAX_BLOCKS, MAX_RECORDS, Record, Stroke, StrokeKind, read,
+    MAX_BLOCKS, MAX_PACKED_BLOCKS, MAX_RECORDS, Record, Stroke, StrokeKind, plain_packed_state, read,
 };
 use horizon_world::{
-    attachments::AttachmentType,
+    attachments::{AttachmentCodec, AttachmentError, AttachmentType, Holder},
     level::{PlacementContext, flags},
-    nbt::Tag,
+    nbt::{Compound, Tag},
     registry::BlockStateId,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +46,87 @@ const AGES: AttachmentType<BTreeMap<Pos, u32>> = AttachmentType {
     copy_on_death: false,
     sync: false,
 };
+
+type ItemDocks = BTreeMap<Pos, Pos>;
+
+// A moving carriage has no terrain block entity in which to store its
+// WorkingPos. Its scene owner and station share the same chunk column.
+const ITEM_DOCKS: AttachmentType<ItemDocks> = AttachmentType {
+    namespace: "create",
+    name: "gantry_item_docks",
+    default: ItemDocks::new,
+    codec: Some(AttachmentCodec {
+        encode: encode_item_docks,
+        decode: decode_item_docks,
+    }),
+    copy_on_death: false,
+    sync: false,
+};
+
+fn encode_item_docks(docks: &ItemDocks) -> Result<Compound, AttachmentError> {
+    if docks.len() > MAX_RECORDS
+        || docks.iter().any(|(&owner, &target)| column(owner) != column(target))
+    {
+        return Err(AttachmentError::Encode);
+    }
+    let entries = docks
+        .iter()
+        .map(|(&owner, &target)| Tag::IntArray(owner.into_iter().chain(target).collect()))
+        .collect();
+    Ok(Compound::from([("Entries".into(), Tag::List(entries))]))
+}
+
+fn decode_item_docks(data: &Compound) -> Result<ItemDocks, AttachmentError> {
+    let Some(Tag::List(entries)) = data.get(&"Entries".into()) else {
+        return Err(AttachmentError::Decode);
+    };
+    if data.len() != 1 || entries.len() > MAX_RECORDS {
+        return Err(AttachmentError::Decode);
+    }
+    let mut docks = ItemDocks::new();
+    for entry in entries {
+        let Tag::IntArray(fields) = entry else {
+            return Err(AttachmentError::Decode);
+        };
+        let [x, y, z, target_x, target_y, target_z] = fields.as_slice() else {
+            return Err(AttachmentError::Decode);
+        };
+        let owner = [*x, *y, *z];
+        let target = [*target_x, *target_y, *target_z];
+        if column(owner) != column(target) || docks.insert(owner, target).is_some() {
+            return Err(AttachmentError::Decode);
+        }
+    }
+    Ok(docks)
+}
+
+fn read_item_docks(game: &mut Game<'_>, key: [i32; 2]) -> Option<ItemDocks> {
+    let attachments = game.attachment_map_quiet(Holder::Chunk(key)).ok()?;
+    Some(attachments.get_existing(&ITEM_DOCKS).ok()?.unwrap_or_default())
+}
+
+fn save_item_dock(game: &mut Game<'_>, owner: Pos, dock: Option<Pos>, mut docks: ItemDocks) {
+    let key = column(owner);
+    if docks.get(&owner).copied() == dock {
+        return;
+    }
+    if let Some(target) = dock {
+        docks.insert(owner, target);
+    } else {
+        docks.remove(&owner);
+    }
+    let Ok(attachments) = game.native_attachments(Holder::Chunk(key)) else {
+        return;
+    };
+    let result = if docks.is_empty() {
+        attachments.remove(&ITEM_DOCKS).map(|_| ())
+    } else {
+        attachments.set(&ITEM_DOCKS, docks)
+    };
+    if let Err(error) = result {
+        log::warn!("Create could not save Gantry item dock at {owner:?}: {error:?}");
+    }
+}
 
 pub(super) fn entity_id(block: &str) -> &str {
     if block == CARRIAGE { PINION } else { block }
@@ -230,12 +312,12 @@ fn capture(
     // GantryContraption.assemble leaves the force direction unset even when
     // the rail provides a direction for the terrain collision check below.
     let Ok(payload) = Assembly::capture_from(
-        &MountedCapture::for_linear(game, &stationary_glue),
+        &MountedCapture::for_linear(game, &stationary_glue, true),
         pos,
         [step(pos, carriage)],
         |p| p == pos || rail.contains(&p),
         None,
-        MAX_BLOCKS - 1,
+        MAX_PACKED_BLOCKS - 1,
     ) else {
         return false;
     };
@@ -244,6 +326,11 @@ fn capture(
         return false;
     };
     let mut blocks = payload.blocks().to_vec();
+    if (blocks.len() >= MAX_BLOCKS && blocks.iter().any(|(_, state)| !plain_packed_state(state)))
+        || psi::has_multiple(&blocks)
+    {
+        return false;
+    }
     blocks.push(([0; 3], carriage_state.clone()));
     let cell = |origin: Pos, local: Pos| -> Pos { std::array::from_fn(|i| origin[i] + local[i]) };
     if blocks.iter().any(|&(local, _)| {
@@ -281,9 +368,8 @@ fn capture(
         }),
         blocks: blocks.into(),
     };
-    if collides_at(game, &record, step(pos, movement), movement.vector(), |p| {
-        edits.iter().any(|&(from, _, _)| p == from)
-    }) {
+    let owned: BTreeSet<_> = edits.iter().map(|&(from, _, _)| from).collect();
+    if collides_at(game, &record, step(pos, movement), movement.vector(), |p| owned.contains(&p)) {
         return false;
     }
     if !commit_linear_capture(game, key, records, record, pos, &edits) {
@@ -346,6 +432,12 @@ fn land(game: &mut Game<'_>, key: [i32; 2], mut records: Vec<Record>, index: usi
         && commit_linear_landing(game, key, records.clone(), &record, origin, &edits)
     {
         actors::remove(game, record.controller);
+        if psi::mover(&record).is_some() {
+            psi::remove(game, record.controller);
+            if let Some(docks) = read_item_docks(game, key) {
+                save_item_dock(game, record.controller, None, docks);
+            }
+        }
         movement_sound(game, origin, false);
     } else if let Some(stroke) = record.stroke
         && !stroke.waiting
@@ -362,7 +454,7 @@ fn land(game: &mut Game<'_>, key: [i32; 2], mut records: Vec<Record>, index: usi
     }
 }
 
-fn tick_record(game: &mut Game<'_>, owner: Pos, age: u32) {
+fn tick_record(game: &mut Game<'_>, owner: Pos, age: u32, has_psi: bool) {
     let key = column(owner);
     let Ok(mut records) = entries(game, key) else {
         return;
@@ -398,7 +490,14 @@ fn tick_record(game: &mut Game<'_>, owner: Pos, age: u32) {
         return;
     };
     let axis = record.axis;
-    let stalled = actors::stalled(game, owner);
+    let docks = has_psi.then(|| read_item_docks(game, key)).flatten();
+    let saved_dock = docks.as_ref().and_then(|docks| docks.get(&owner).copied());
+    let dock = if has_psi {
+        psi::advance(game, record, saved_dock)
+    } else {
+        None
+    };
+    let stalled = actors::stalled(game, owner) || dock.is_some();
     let action = motion.tick(
         age,
         stalled,
@@ -437,8 +536,14 @@ fn tick_record(game: &mut Game<'_>, owner: Pos, age: u32) {
             });
             let current = record.clone();
             if set_records(game, key, records).is_ok() {
+                if let Some(docks) = docks {
+                    save_item_dock(game, owner, dock, docks);
+                }
                 if stop_actors {
                     actors::remove(game, owner);
+                    if has_psi {
+                        psi::stop_motion(game, owner);
+                    }
                 }
                 actors::tick(game, &previous, &current);
             }
@@ -451,7 +556,7 @@ pub(super) fn maintenance(game: &mut Game<'_>) {
         return;
     }
     rail_state(game);
-    let owners: BTreeSet<_> = game
+    let owners: BTreeMap<_, _> = game
         .world
         .chunks
         .values()
@@ -459,9 +564,8 @@ pub(super) fn maintenance(game: &mut Game<'_>) {
         .flat_map(|records| {
             records
                 .iter()
-                .filter_map(|record| {
-                    (record.stroke_kind() == Some(StrokeKind::Gantry)).then_some(record.controller)
-                })
+                .filter(|record| record.stroke_kind() == Some(StrokeKind::Gantry))
+                .map(|record| (record.controller, psi::mover(record).is_some()))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -472,11 +576,14 @@ pub(super) fn maintenance(game: &mut Game<'_>) {
     let Ok(mut ages) = game.world.attachments.get(&AGES) else {
         return;
     };
-    ages.retain(|owner, _| owners.contains(owner));
-    for owner in owners {
+    ages.retain(|owner, _| owners.contains_key(owner));
+    for (owner, has_psi) in owners {
+        if has_psi && game.level_pass.running != Some(true) {
+            continue;
+        }
         let age = ages.entry(owner).or_default();
         *age = age.saturating_add(1);
-        tick_record(game, owner, *age);
+        tick_record(game, owner, *age, has_psi);
     }
     let _ = game.world.attachments.set(&AGES, ages);
 }

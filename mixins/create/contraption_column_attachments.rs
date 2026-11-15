@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 pub(super) fn copy_scene(world: &crate::world::World, chunk: &mut crate::chunk::Chunk) {
-    use crate::create_contraption_scene::{ACTOR_VISUAL_KEY, KEY, POSE_KEY, RECORDS};
+    use crate::create_contraption_scene::{
+        ACTOR_VISUAL_KEY, KEY, POSE_KEY, RECORDS, TANK_STORAGE_KEY,
+    };
     use horizon_world::attachments::create_contraption_attachment::copy_entry;
 
     let Some(saved) = world
@@ -30,5 +32,11 @@ pub(super) fn copy_scene(world: &crate::world::World, chunk: &mut crate::chunk::
         &mut incoming.attachments,
         "create",
         ACTOR_VISUAL_KEY,
+    );
+    copy_entry(
+        &saved.attachments,
+        &mut incoming.attachments,
+        "create",
+        TANK_STORAGE_KEY,
     );
 }

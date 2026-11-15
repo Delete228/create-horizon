@@ -7,6 +7,7 @@ fn motor_level(game: &mut crate::game::Game<'_>) {
     crate::game::create_port_contraption_menu::tick(game);
     crate::game::create_port_gantry::maintenance(game);
     crate::game::create_port_belt::maintenance(game);
+    crate::game::create_port_fluid_tank::maintenance(game);
     crate::game::create_port_basin::maintenance(game);
     crate::game::create_port_mixer::maintenance(game);
     crate::game::create_port_press_basin::maintenance(game);

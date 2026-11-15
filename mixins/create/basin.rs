@@ -2,18 +2,19 @@
 // Copyright (c) 2026 create-horizon contributors
 // SPDX-License-Identifier: MIT
 // Create 6.0.10 BasinBlockEntity/BasinInventory/BasinRenderer adapter.
-// Heat-aware downward basin; two canonical water/lava tank halves.
-// Unknown tank data, complex filters and side spouts remain opaque.
+// Heat-aware Basin with canonical fluid tanks and side output queues.
 use super::create_port_block_entity_revision::EntityRevision as _;
 use super::{
-    Game, GameLevel, create_port_basin_recipes::item_drain, create_port_fluid_codec as fluids,
+    Game, GameLevel,
+    create_port_basin_recipes::{emptying, item_drain},
+    create_port_fluid_codec as fluids, create_port_fluid_tank as tank,
     native_block_entity_draw::BlockEntityDraw,
 };
 use crate::{
     containers::{BlockEntity, ModBlockEntity, ModContainer, ModRevision},
     items::ItemStack,
 };
-use create_engine::{basin as rules, transport::SessionCache};
+use create_engine::{basin as rules, fluid_transport::Fluid, transport::SessionCache};
 use horizon_client::mod_api::{
     NativeFluidAction, NativeFluidDrain, NativeFluidRenderOptions, NativeFluidStack,
     NativeFluidTankView,
@@ -34,6 +35,7 @@ impl PartialEq for Key {
 }
 impl Eq for Key {}
 pub(super) type Basin = rules::Basin<Key, fluids::Key>;
+type FluidBasin = rules::Basin<(), fluids::Key>;
 
 #[derive(Default)]
 struct Motion {
@@ -72,7 +74,10 @@ impl Default for Server {
 }
 impl Server {
     fn bind(&mut self, owner: ModRevision) {
-        if self.owner.is_some_and(|old| !old.is_same_create_entity(owner)) {
+        if self
+            .owner
+            .is_some_and(|old| !old.is_same_create_entity(owner))
+        {
             *self = Self::default();
         }
         self.owner = Some(owner);
@@ -218,14 +223,6 @@ pub(super) fn initialize(entity: &mut ModBlockEntity) {
     data(entity);
 }
 
-fn nonempty(tag: Option<&Tag>) -> bool {
-    match tag {
-        None => false,
-        Some(Tag::Compound(c)) => !c.is_empty(),
-        Some(Tag::List(l)) => !l.is_empty(),
-        _ => true,
-    }
-}
 pub(super) fn unsupported(
     game: &Game<'_>,
     pos: Pos,
@@ -234,8 +231,8 @@ pub(super) fn unsupported(
     if !crate::game::create_port::inventory_supported(entity) {
         return Some("basin inventory sizes are not supported");
     }
-    if game.native_block_property(pos, "facing").as_deref() != Some("down") {
-        return Some("basin side spouts are not implemented");
+    if spout::facing(game, pos).is_none() {
+        return Some("basin spout direction is not supported");
     }
     if super::create_port_basin_filter::read(game, entity).is_none() {
         return Some("basin recipe filter data is not supported");
@@ -245,16 +242,11 @@ pub(super) fn unsupported(
             return Some(reason);
         }
     }
-    if [
-        "Overflow",
-        "FluidOverflow",
-        "PreferredSpoutput",
-        "DisabledSpoutput",
-    ]
-    .into_iter()
-    .any(|key| nonempty(entity.nbt.get(&key.into())))
-    {
-        return Some("basin spout buffers are not implemented");
+    if let Err(fluids::Unsupported(reason)) = spout::fluid_buffer(entity) {
+        return Some(reason);
+    }
+    if spout::Settings::read(entity).is_none() || spout::buffer(entity).is_none() {
+        return Some("basin item spout data is not supported");
     }
     None
 }
@@ -269,7 +261,10 @@ pub(super) fn has_analog(
     state: horizon_world::registry::BlockStateId,
     output: &mut bool,
 ) {
-    if matches!(game.facts.get(state).name.as_ref(), ID | item_drain::BLOCK | tank::BLOCK) {
+    if matches!(
+        game.facts.get(state).name.as_ref(),
+        ID | item_drain::BLOCK | tank::BLOCK
+    ) {
         *output = true;
     }
 }
@@ -292,7 +287,7 @@ pub(super) fn analog(
         return;
     }
     if block == tank::BLOCK {
-        *output = tank::comparator(e);
+        *output = tank::comparator(game, [pos.x, pos.y, pos.z]);
         return;
     }
     // Unsupported native-created inventories may not have canonical slots yet.
@@ -372,6 +367,12 @@ pub(super) fn read(game: &Game<'_>, pos: Pos) -> Option<Basin> {
         }),
         input_fluids: read_tanks(entity, "InputTanks").ok()?,
         output_fluids: read_tanks(entity, "OutputTanks").ok()?,
+        mode: spout::output_mode(game, pos),
+        overflow: spout::buffer(entity)?
+            .iter()
+            .map(|stack| core_stack(game, stack))
+            .collect(),
+        fluid_overflow: spout::fluid_buffer(entity).ok()?,
         ..Basin::default()
     })
 }
@@ -432,14 +433,19 @@ pub(super) fn write(game: &mut Game<'_>, pos: Pos, basin: &Basin) -> bool {
         let Ok((input, output)) = replacement_tanks(entity, basin) else {
             return false;
         };
+        let Ok(pending_fluids) = spout::encode_fluid_buffer(&basin.fluid_overflow) else {
+            return false;
+        };
         let fluid_changed = set_tanks(entity, input, output);
+        let spout_changed = spout::set_buffer(entity, basin.overflow.iter().map(native_stack))
+            | spout::set_fluid_buffer(entity, pending_fluids);
         entity.items = basin
             .input
             .iter()
             .chain(&basin.output)
             .map(|s| s.as_ref().map(native_stack))
             .collect();
-        data(entity) || fluid_changed
+        data(entity) || fluid_changed || spout_changed
     }) else {
         return false;
     };
@@ -456,9 +462,9 @@ fn read_tanks(entity: &ModBlockEntity, key: &str) -> Result<fluids::Tanks, fluid
     let empty = empty_tanks();
     fluids::read_half(Some(entity.nbt.get(&key.into()).unwrap_or(&empty)))
 }
-fn replacement_tanks(
+fn replacement_tanks<I>(
     entity: &ModBlockEntity,
-    basin: &Basin,
+    basin: &rules::Basin<I, fluids::Key>,
 ) -> Result<(Tag, Tag), fluids::Unsupported> {
     let empty = empty_tanks();
     Ok((
@@ -481,7 +487,7 @@ fn set_tanks(entity: &mut ModBlockEntity, input: Tag, output: Tag) -> bool {
     }
     changed
 }
-fn fluid_state(game: &Game<'_>, pos: Pos) -> Option<Basin> {
+fn fluid_state(game: &Game<'_>, pos: Pos) -> Option<FluidBasin> {
     if game.options.execution_role.is_client() {
         return None;
     }
@@ -491,13 +497,13 @@ fn fluid_state(game: &Game<'_>, pos: Pos) -> Option<Basin> {
     if entity.id != ID || !crate::game::create_port::inventory_supported(entity) {
         return None;
     }
-    Some(Basin {
+    Some(FluidBasin {
         input_fluids: read_tanks(entity, "InputTanks").ok()?,
         output_fluids: read_tanks(entity, "OutputTanks").ok()?,
-        ..Basin::default()
+        ..FluidBasin::default()
     })
 }
-fn commit_fluids(game: &mut Game<'_>, pos: Pos, state: &Basin) {
+fn commit_fluids(game: &mut Game<'_>, pos: Pos, state: &FluidBasin) {
     let changed = game
         .native_with_mod_block_entity(pos, |entity| {
             if entity.id != ID || !crate::game::create_port::inventory_supported(entity) {
@@ -514,18 +520,17 @@ fn commit_fluids(game: &mut Game<'_>, pos: Pos, state: &Basin) {
         notify_contents(game, pos);
     }
 }
-fn core_fluid(stack: &NativeFluidStack) -> Option<rules::Fluid<fluids::Key>> {
-    (stack.amount > 0 && matches!(stack.fluid.as_str(), "minecraft:water" | "minecraft:lava")).then(
-        || rules::Fluid {
+pub(super) fn core_fluid(stack: &NativeFluidStack) -> Option<rules::Fluid<fluids::Key>> {
+    (stack.amount > 0 && create_engine::fluid_transport::Fluid::from_id(&stack.fluid).is_some())
+        .then(|| rules::Fluid {
             key: fluids::Key {
                 id: stack.fluid.clone(),
                 components: stack.components.clone(),
             },
             amount: stack.amount as u32,
-        },
-    )
+        })
 }
-fn native_fluid(stack: &rules::Fluid<fluids::Key>) -> NativeFluidStack {
+pub(super) fn native_fluid(stack: &rules::Fluid<fluids::Key>) -> NativeFluidStack {
     NativeFluidStack {
         fluid: stack.key.id.clone(),
         amount: stack.amount as i32,
@@ -534,19 +539,28 @@ fn native_fluid(stack: &rules::Fluid<fluids::Key>) -> NativeFluidStack {
 }
 /// Use the shared Horizon fluid helpers for sided automation.
 pub(super) fn custom_fluids(block: &str, custom: &mut bool) {
-    if matches!(block, ID | tank::BLOCK) {
+    if matches!(block, ID | tank::BLOCK | item_drain::BLOCK) {
         *custom = true;
     }
 }
 pub(super) fn fluid_tanks(
     game: &Game<'_>,
     pos: Pos,
-    _side: Option<horizon_core::geometry::Direction>,
+    side: Option<horizon_core::geometry::Direction>,
     out: &mut Option<Vec<NativeFluidTankView>>,
 ) {
-    if game.native_block(pos) == tank::BLOCK {
-        *out = tank::view(game, pos);
-        return;
+    match game.native_block(pos).as_str() {
+        tank::BLOCK => {
+            *out = tank::view(game, pos);
+            return;
+        }
+        item_drain::BLOCK => {
+            if side != Some(horizon_core::geometry::Direction::Up) {
+                *out = item_drain::fluid_view(game, pos);
+            }
+            return;
+        }
+        _ => {}
     }
     let Some(state) = fluid_state(game, pos) else {
         return;
@@ -594,7 +608,7 @@ pub(super) fn fluid_fill(
 fn fill_input(
     game: &mut Game<'_>,
     pos: Pos,
-    state: &mut Basin,
+    state: &mut FluidBasin,
     resource: &rules::Fluid<fluids::Key>,
     simulate: bool,
 ) -> u32 {
@@ -607,14 +621,23 @@ fn fill_input(
 pub(super) fn fluid_drain(
     game: &mut Game<'_>,
     pos: Pos,
-    _side: Option<horizon_core::geometry::Direction>,
+    side: Option<horizon_core::geometry::Direction>,
     request: &NativeFluidDrain,
     action: NativeFluidAction,
     out: &mut Option<NativeFluidStack>,
 ) {
-    if game.native_block(pos) == tank::BLOCK {
-        *out = tank::drain(game, pos, request, action);
-        return;
+    match game.native_block(pos).as_str() {
+        tank::BLOCK => {
+            *out = tank::drain(game, pos, request, action);
+            return;
+        }
+        item_drain::BLOCK => {
+            if side != Some(horizon_core::geometry::Direction::Up) {
+                *out = item_drain::fluid_drain(game, pos, request, action);
+            }
+            return;
+        }
+        _ => {}
     }
     let Some(mut state) = fluid_state(game, pos) else {
         return;
@@ -645,7 +668,7 @@ pub(super) fn fluid_drain(
 fn drain(
     game: &mut Game<'_>,
     pos: Pos,
-    state: &mut Basin,
+    state: &mut FluidBasin,
     request: rules::FluidRequest<'_, fluids::Key>,
     simulate: bool,
 ) -> Option<rules::Fluid<fluids::Key>> {
@@ -720,14 +743,14 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) -
             let _ = fluids::tick_half(tanks);
         }
     }
-    let scheduled = SERVER.with(|cache| {
+    let (scheduled, refresh_spout) = SERVER.with(|cache| {
         let mut cache = cache.borrow_mut();
         let s = cache
             .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
             .entry(pos)
             .or_default();
         if s.tick == Some(game.world.game_time) {
-            return false;
+            return (false, false);
         }
         if s.tick.is_some_and(|t| t > game.world.game_time) {
             *s = Server {
@@ -737,6 +760,7 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) -
         }
         // The duplicate-tick return above deliberately leaves this flag set.
         let mut scheduled = std::mem::take(&mut s.contents_changed) || !s.initialized;
+        let refresh_spout = !s.initialized || s.lazy <= 0;
         if !s.initialized {
             s.initialized = true;
             s.backup -= 1;
@@ -757,12 +781,14 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) -
             s.lazy -= 1;
         }
         s.tick = Some(game.world.game_time);
-        scheduled
+        (scheduled, refresh_spout)
     });
+    let reason = unsupported(game, pos, entity);
+    let spout_changed = reason.is_none() && spout::tick(game, pos, entity, refresh_spout);
     // Canonical serialization may normalize a supported loaded inventory's
     // order/numeric tags. Basin.read does not notify contents: only genuine
     // inventory/fluid events, initialization and the lazy backup wake it.
-    if scheduled {
+    if scheduled || spout_changed {
         crate::game::create_port_mixer::schedule(game, [pos[0], pos[1] + 2, pos[2]]);
         crate::game::create_port_press_basin::schedule(game, [pos[0], pos[1] + 2, pos[2]]);
     }
@@ -770,7 +796,6 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) -
         let dim = game.dim.id().to_owned();
         game.native_update_output_neighbors(&dim, pos);
     }
-    let reason = unsupported(game, pos, entity);
     match reason {
         Some(reason) => {
             entity.nbt.insert(
@@ -784,7 +809,15 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) -
     }
     // Falling-item intake deliberately waits for the entity-sensitive basin
     // collision API; no guessed contact height or direct teleport is used.
-    changed
+    changed || spout_changed
+}
+
+pub(super) fn predicts_wrench(game: &Game<'_>, pos: Pos) -> bool {
+    spout::wrench_held(game, pos)
+}
+
+pub(super) fn wrench(game: &mut Game<'_>, pos: Pos, face: Pos) -> bool {
+    spout::wrench(game, pos, face)
 }
 pub(super) fn reacts(game: &Game<'_>, pos: Pos) -> bool {
     game.native_on("create")
@@ -794,11 +827,11 @@ pub(super) fn reacts(game: &Game<'_>, pos: Pos) -> bool {
                 || matches!(
                     s.item.as_ref(),
                     "minecraft:air"
-                        | "minecraft:water_bucket"
-                        | "minecraft:lava_bucket"
                         | "minecraft:bucket"
                         | "minecraft:sponge"
+                        | emptying::GLASS_BOTTLE
                 )
+                || emptying::can_empty(game, s)
         })
 }
 pub(super) fn give_container(game: &mut Game<'_>, pos: Pos, stack: ItemStack) {
@@ -811,17 +844,20 @@ pub(super) fn give_container(game: &mut Game<'_>, pos: Pos, stack: ItemStack) {
         }
     }
 }
-fn bucket_click(game: &mut Game<'_>, pos: Pos, held: &ItemStack) -> bool {
+fn fluid_container_click(game: &mut Game<'_>, pos: Pos, held: &ItemStack) -> bool {
     match held.item.as_ref() {
-        "minecraft:water_bucket" | "minecraft:lava_bucket" => {
-            let Some((fluid, amount, remainder)) = game.native_item_fluid_drain(held, 1000) else {
+        _ if emptying::can_empty(game, held) => {
+            let Some((fluid, amount, remainder)) = emptying::empty(game, held) else {
                 return true;
             };
             let Some(mut state) = fluid_state(game, pos) else {
                 return true;
             };
             let fluid = rules::Fluid {
-                key: fluids::Key { id: fluid, components: Compound::new() },
+                key: fluids::Key {
+                    id: fluid.to_owned(),
+                    components: Compound::new(),
+                },
                 amount: amount as u32,
             };
             if fill_input(game, pos, &mut state, &fluid, true) != fluid.amount {
@@ -840,7 +876,13 @@ fn bucket_click(game: &mut Game<'_>, pos: Pos, held: &ItemStack) -> bool {
             }
             true
         }
-        "minecraft:bucket" => {
+        "minecraft:bucket" | emptying::GLASS_BOTTLE => {
+            let bottle = held.item.as_ref() == emptying::GLASS_BOTTLE;
+            let required = if bottle {
+                emptying::BOTTLE_AMOUNT
+            } else {
+                1000
+            };
             let Some(mut state) = fluid_state(game, pos) else {
                 return true;
             };
@@ -850,28 +892,48 @@ fn bucket_click(game: &mut Game<'_>, pos: Pos, held: &ItemStack) -> bool {
                 };
                 // API item containers cannot carry an opaque fluid component
                 // patch. Refuse it explicitly rather than flattening it.
-                if !fluid.key.components.is_empty() || fluid.amount < 1000 {
+                if !fluid.key.components.is_empty() || fluid.amount < required as u32 {
                     continue;
                 }
-                let Some((amount, filled)) = game.native_item_fluid_fill(held, &fluid.key.id, 1000)
-                else {
-                    continue;
+                let filled = if bottle {
+                    if fluid.key.id != Fluid::Water.id() {
+                        continue;
+                    }
+                    ItemStack::new("minecraft:potion", 1).with_potion(Fluid::Water.id())
+                } else {
+                    let Some((_, filled)) = game
+                        .native_item_fluid_fill(held, &fluid.key.id, required)
+                        .filter(|(amount, _)| *amount == required)
+                    else {
+                        continue;
+                    };
+                    filled
                 };
-                if amount != 1000 {
-                    continue;
-                }
-                fluid.amount = amount as u32;
-                drain(game, pos, &mut state, rules::FluidRequest::Exact(&fluid), false);
+                fluid.amount = required as u32;
+                drain(
+                    game,
+                    pos,
+                    &mut state,
+                    rules::FluidRequest::Exact(&fluid),
+                    false,
+                );
                 if !game.creative {
                     game.consume_held();
                     give_container(game, pos, filled);
                 }
                 return true;
             }
-            true // GenericItemFilling claims even a refused/insufficient bucket.
+            true // GenericItemFilling claims even a refused/insufficient container.
         }
         "minecraft:sponge" => fluid_state(game, pos).is_some_and(|mut state| {
-            drain(game, pos, &mut state, rules::FluidRequest::Any(i32::MAX as u32), false).is_some()
+            drain(
+                game,
+                pos,
+                &mut state,
+                rules::FluidRequest::Any(i32::MAX as u32),
+                false,
+            )
+            .is_some()
         }),
         _ => false,
     }
@@ -888,7 +950,7 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
         .filter(|s| s.count > 0 && s.item.as_ref() != "minecraft:air")
         .cloned()
     {
-        return bucket_click(game, pos, &held);
+        return fluid_container_click(game, pos, &held);
     }
     let stacks = game
         .native_with_mod_block_entity(pos, |entity| {
@@ -931,587 +993,8 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
     true
 }
 
-/// Ordinary singleton FluidTankBlockEntity. A controller or non-singleton save
-/// never falls back to empty storage. Towers, boiler and moving tanks need their
-/// own topology adapter.
-pub(super) mod tank {
-    use super::*;
-    use horizon_world::level::PlacementContext;
-
-    pub(in crate::game) const BLOCK: &str = "create:fluid_tank";
-    const CAPACITY: u32 = 8000;
-    const BUCKET: i32 = 1000;
-    const TOTAL_HEIGHT: f32 = 7.0 / 16.0;
-    type Fluid = rules::Fluid<fluids::Key>;
-
-    #[derive(Default)]
-    struct RenderLevel {
-        owner: Option<ModRevision>,
-        tick: Option<i64>,
-        chase: rules::FluidLevel,
-    }
-
-    thread_local! {
-        static RENDER: RefCell<SessionCache<BTreeMap<Pos, RenderLevel>>> = RefCell::new(SessionCache::default());
-    }
-
-    pub(super) fn reset() {
-        RENDER.with(|cache| cache.borrow_mut().clear());
-    }
-
-    pub(in crate::game) fn default_nbt() -> Compound {
-        Compound::from([
-            (
-                "Boiler".into(),
-                Tag::Compound(Compound::from([
-                    ("ActiveHeat".into(), Tag::Int(0)),
-                    ("Engines".into(), Tag::Int(0)),
-                    ("PassiveHeat".into(), Tag::Byte(0)),
-                    ("Supply".into(), Tag::Float(0)),
-                    ("Update".into(), Tag::Byte(0)),
-                    ("Whistles".into(), Tag::Int(0)),
-                ])),
-            ),
-            ("Height".into(), Tag::Int(1)),
-            ("Size".into(), Tag::Int(1)),
-            ("Luminosity".into(), Tag::Int(0)),
-            ("Window".into(), Tag::Byte(1)),
-            ("TankContent".into(), Tag::Compound(Compound::new())),
-        ])
-    }
-
-    fn read(entity: &ModBlockEntity) -> Option<(bool, Option<Fluid>)> {
-        let nbt = &entity.nbt;
-        if entity.id != BLOCK
-            || nbt.contains_key(&"Controller".into())
-            || !matches!(nbt.get(&"Size".into()), Some(Tag::Int(1)))
-            || !matches!(nbt.get(&"Height".into()), Some(Tag::Int(1)))
-        {
-            return None;
-        }
-        let Tag::Compound(boiler) = nbt.get(&"Boiler".into())? else {
-            return None;
-        };
-        if ["Engines", "Whistles"]
-            .iter()
-            .any(|key| !matches!(boiler.get(&(*key).into()), Some(Tag::Int(0))))
-        {
-            return None;
-        }
-        let window = match nbt.get(&"Window".into())? {
-            Tag::Byte(value @ (0 | 1)) => *value != 0,
-            _ => return None,
-        };
-        Some((
-            window,
-            fluids::read_content(nbt.get(&"TankContent".into()), CAPACITY).ok()?,
-        ))
-    }
-
-    fn entity_at<'a>(game: &'a Game<'_>, [x, y, z]: Pos) -> Option<&'a ModBlockEntity> {
-        match game.world.block_entities.get(&(x, y, z))? {
-            BlockEntity::Mod(entity) => Some(entity),
-            _ => None,
-        }
-    }
-
-    fn current(game: &Game<'_>, pos: Pos) -> Option<(bool, Option<Fluid>)> {
-        if game.options.execution_role.is_client() || !game.native_on("create") {
-            return None;
-        }
-        let state = game
-            .pack
-            .assets
-            .registry
-            .state(game.world.block(pos[0], pos[1], pos[2]))?;
-        if state.name != BLOCK
-            || state.properties.get("top").is_none_or(|v| v != "true")
-            || state.properties.get("bottom").is_none_or(|v| v != "true")
-            || !matches!(
-                state.properties.get("shape").map(String::as_str),
-                Some("window" | "plain")
-            )
-        {
-            return None;
-        }
-        read(entity_at(game, pos)?)
-    }
-
-    pub(in crate::game) fn placement(game: &GameLevel<'_>, ctx: &PlacementContext) -> bool {
-        let [x, y, z] = [ctx.pos.x, ctx.pos.y, ctx.pos.z];
-        let is_tank = |x, y, z| game.native_state_block(game.world.block(x, y, z)) == Some(BLOCK);
-        if is_tank(x, y - 1, z) || is_tank(x, y + 1, z) {
-            return false;
-        }
-        // Vertical groups always occupy the same column. For wider groups,
-        // completing a horizontal 2×2 is the first point Java could merge.
-        for dx in [-1, 1] {
-            for dz in [-1, 1] {
-                if !game.world.loaded(x + dx, z + dz)
-                    || (is_tank(x + dx, y, z)
-                        && is_tank(x, y, z + dz)
-                        && is_tank(x + dx, y, z + dz))
-                {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    pub(in crate::game) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
-        if entity.nbt.contains_key(&"LastKnownPos".into()) || read(entity).is_none() {
-            return;
-        }
-        entity
-            .nbt
-            .insert("LastKnownPos".into(), Tag::IntArray(pos.to_vec()));
-        game.world.modified.insert((pos[0] >> 4, pos[2] >> 4));
-    }
-
-    fn fraction(fluid: Option<&Fluid>) -> f32 {
-        fluid.map_or(0.0, |fluid| fluid.amount as f32 / CAPACITY as f32)
-    }
-
-    pub(super) fn comparator(entity: &ModBlockEntity) -> i32 {
-        read(entity).map_or(0, |(_, fluid)| {
-            let fraction = f64::from(fraction(fluid.as_ref()));
-            (fraction * 14.0 + f64::from(u8::from(fraction > 0.0))).floor() as i32
-        })
-    }
-
-    pub(super) fn view(game: &Game<'_>, pos: Pos) -> Option<Vec<NativeFluidTankView>> {
-        let (_, fluid) = current(game, pos)?;
-        Some(vec![NativeFluidTankView {
-            tank: 0,
-            content: fluid.as_ref().map(native_fluid),
-            capacity: CAPACITY as i32,
-            can_fill: true,
-            can_drain: true,
-        }])
-    }
-
-    fn tank_fields(fluid: Option<&Fluid>) -> Option<(Tag, Tag)> {
-        let content = fluids::write_content(fluid, CAPACITY).ok()?;
-        let luminosity = fluid.map_or(0, |fluid| {
-            if fluid.key.id == "minecraft:lava" {
-                12
-            } else {
-                0
-            }
-        });
-        Some((content, Tag::Int(luminosity)))
-    }
-
-    fn set_fields(game: &mut Game<'_>, pos: Pos, (content, luminosity): (Tag, Tag)) -> bool {
-        game.native_with_mod_block_entity(pos, |entity| {
-            entity.nbt.insert("TankContent".into(), content);
-            entity.nbt.insert("Luminosity".into(), luminosity);
-        })
-        .is_some()
-    }
-
-    fn notify(game: &mut Game<'_>, pos: Pos) {
-        game.native_block_entity_sync(pos);
-        game.native_update_output_neighbors(game.dim.id(), pos);
-    }
-
-    fn commit(game: &mut Game<'_>, pos: Pos, fluid: Option<&Fluid>) -> bool {
-        let Some(fields) = tank_fields(fluid) else {
-            return false;
-        };
-        if !set_fields(game, pos, fields) {
-            return false;
-        }
-        notify(game, pos);
-        true
-    }
-
-    pub(super) fn endpoint(game: &Game<'_>, pos: Pos) -> bool {
-        current(game, pos)
-            .is_some_and(|(_, fluid)| fluid.is_none_or(|fluid| fluid.key.components.is_empty()))
-    }
-
-    pub(super) fn sample(
-        game: &Game<'_>,
-        pos: Pos,
-    ) -> Option<create_engine::fluid_transport::Fluid> {
-        let (_, fluid) = current(game, pos)?;
-        let fluid = fluid?;
-        if !fluid.key.components.is_empty() {
-            return None;
-        }
-        create_engine::fluid_transport::Fluid::from_id(&fluid.key.id)
-    }
-
-    pub(super) fn amount(game: &Game<'_>, pos: Pos) -> Option<u32> {
-        let (_, fluid) = current(game, pos)?;
-        Some(fluid.map_or(0, |fluid| fluid.amount))
-    }
-
-    pub(super) fn transfer_pair(
-        game: &mut Game<'_>,
-        source: Pos,
-        target: Pos,
-        kind: create_engine::fluid_transport::Fluid,
-        rate: i32,
-    ) {
-        if source == target || rate <= 0 {
-            return;
-        }
-        let Some((_, Some(mut from))) = current(game, source) else {
-            return;
-        };
-        let Some((_, to)) = current(game, target) else {
-            return;
-        };
-        if from.key.id != kind.id()
-            || !from.key.components.is_empty()
-            || to.as_ref().is_some_and(|fluid| fluid.key != from.key)
-        {
-            return;
-        }
-        let received = to.as_ref().map_or(0, |fluid| fluid.amount);
-        let moved = (rate as u32).min(from.amount).min(CAPACITY - received);
-        if moved == 0 {
-            return;
-        }
-        let Some(original) = entity_at(game, source) else {
-            return;
-        };
-        let Some(original_content) = original.nbt.get(&"TankContent".into()).cloned() else {
-            return;
-        };
-        let original_luminosity = original.nbt.get(&"Luminosity".into()).cloned();
-        let into = Fluid {
-            key: from.key.clone(),
-            amount: received + moved,
-        };
-        from.amount -= moved;
-        let (Some(source_fields), Some(target_fields)) = (
-            tank_fields((from.amount > 0).then_some(&from)),
-            tank_fields(Some(&into)),
-        ) else {
-            return;
-        };
-        // Two canonical owned tank records were preflighted. No callbacks or
-        // neighbor notifications run between their writes.
-        if !set_fields(game, source, source_fields) {
-            return;
-        }
-        if !set_fields(game, target, target_fields) {
-            game.native_with_mod_block_entity(source, |entity| {
-                entity.nbt.insert("TankContent".into(), original_content);
-                match original_luminosity {
-                    Some(luminosity) => {
-                        entity.nbt.insert("Luminosity".into(), luminosity);
-                    }
-                    None => {
-                        entity.nbt.remove(&"Luminosity".into());
-                    }
-                }
-            });
-            return;
-        }
-        notify(game, source);
-        notify(game, target);
-    }
-
-    pub(super) fn fill(
-        game: &mut Game<'_>,
-        pos: Pos,
-        resource: &NativeFluidStack,
-        action: NativeFluidAction,
-    ) -> Option<i32> {
-        let (_, current) = current(game, pos)?;
-        let Some(mut fluid) = core_fluid(resource) else {
-            return Some(0);
-        };
-        let stored = match current {
-            Some(current) if current.key == fluid.key => current.amount,
-            Some(_) => return Some(0),
-            None => 0,
-        };
-        let accepted = fluid.amount.min(CAPACITY - stored);
-        #[allow(unreachable_patterns)]
-        match action {
-            NativeFluidAction::Simulate => {}
-            NativeFluidAction::Execute => {
-                fluid.amount = stored + accepted;
-                if accepted != 0 && !commit(game, pos, Some(&fluid)) {
-                    return Some(0);
-                }
-            }
-            _ => return Some(0),
-        }
-        Some(accepted as i32)
-    }
-
-    pub(super) fn drain(
-        game: &mut Game<'_>,
-        pos: Pos,
-        request: &NativeFluidDrain,
-        action: NativeFluidAction,
-    ) -> Option<NativeFluidStack> {
-        let (_, fluid) = current(game, pos)?;
-        let mut fluid = fluid?;
-        let maximum = match request {
-            NativeFluidDrain::Any(maximum) => *maximum,
-            NativeFluidDrain::Exact(wanted)
-                if wanted.fluid == fluid.key.id && wanted.components == fluid.key.components =>
-            {
-                wanted.amount
-            }
-            _ => return None,
-        };
-        if maximum <= 0 {
-            return None;
-        }
-        let drained = fluid.amount.min(maximum as u32);
-        #[allow(unreachable_patterns)]
-        match action {
-            NativeFluidAction::Simulate => {}
-            NativeFluidAction::Execute => {
-                fluid.amount -= drained;
-                if !commit(game, pos, (fluid.amount > 0).then_some(&fluid)) {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-        fluid.amount = drained;
-        Some(native_fluid(&fluid))
-    }
-
-    pub(in crate::game) fn predicts_use(game: &Game<'_>, pos: Pos) -> bool {
-        game.native_on("create")
-            && game.native_block(pos) == BLOCK
-            && !game.native_sneaking()
-            && game
-                .held()
-                .filter(|held| held.count > 0)
-                .is_some_and(|held| {
-                    game.may_build() && crate::game::create_port_chassis::wrench(game, held)
-                        || game.creative
-                            && matches!(
-                                held.item.as_ref(),
-                                "minecraft:bucket"
-                                    | "minecraft:water_bucket"
-                                    | "minecraft:lava_bucket"
-                            )
-                })
-    }
-
-    pub(in crate::game) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
-        if !predicts_use(game, pos) {
-            return false;
-        }
-        let Some((window, before)) = current(game, pos) else {
-            return true;
-        };
-        let Some(held) = game.held().cloned() else {
-            return false;
-        };
-        if crate::game::create_port_chassis::wrench(game, &held) {
-            let next = if window { "plain" } else { "window" };
-            if game.native_set_block_property_with(
-                pos,
-                "shape",
-                next,
-                horizon_world::level::flags::UPDATE_CLIENTS,
-            ) {
-                game.native_with_mod_block_entity(pos, |entity| {
-                    entity
-                        .nbt
-                        .insert("Window".into(), Tag::Byte(i8::from(!window)));
-                });
-                game.native_block_entity_sync(pos);
-            }
-            return true;
-        }
-        let (fluid, amount, emptying) = if held.item.as_ref() == "minecraft:bucket" {
-            let Some(mut resource) = before
-                .as_ref()
-                .map(native_fluid)
-                .filter(|f| f.components.is_empty())
-            else {
-                return true;
-            };
-            if resource.amount < BUCKET
-                || game
-                    .native_item_fluid_fill(&held, &resource.fluid, BUCKET)
-                    .is_none_or(|(amount, _)| amount != BUCKET)
-            {
-                return true;
-            }
-            let remaining = resource.amount - BUCKET;
-            resource.amount = BUCKET;
-            let request = NativeFluidDrain::Exact(resource);
-            let mut drained = None;
-            game.native_custom_fluid_drain(
-                pos,
-                None,
-                &request,
-                NativeFluidAction::Execute,
-                &mut drained,
-            );
-            let Some(drained) = drained else {
-                return true;
-            };
-            (drained.fluid, remaining, false)
-        } else {
-            let Some((fluid, amount, _)) = game.native_item_fluid_drain(&held, BUCKET) else {
-                return true;
-            };
-            let resource = NativeFluidStack {
-                fluid,
-                amount,
-                components: Compound::new(),
-            };
-            let mut accepted = None;
-            game.native_custom_fluid_fill(
-                pos,
-                None,
-                &resource,
-                NativeFluidAction::Simulate,
-                &mut accepted,
-            );
-            if accepted != Some(amount) {
-                return true;
-            }
-            accepted = None;
-            game.native_custom_fluid_fill(
-                pos,
-                None,
-                &resource,
-                NativeFluidAction::Execute,
-                &mut accepted,
-            );
-            if accepted != Some(amount) {
-                return true;
-            }
-            (
-                resource.fluid,
-                before.as_ref().map_or(0, |f| f.amount as i32) + amount,
-                true,
-            )
-        };
-        play_bucket(game, pos, &fluid, amount, emptying);
-        true
-    }
-
-    fn play_bucket(game: &mut Game<'_>, pos: Pos, fluid: &str, amount: i32, emptying: bool) {
-        let event = match (emptying, fluid) {
-            (true, "minecraft:lava") => "minecraft:item.bucket.empty_lava",
-            (false, "minecraft:lava") => "minecraft:item.bucket.fill_lava",
-            (true, _) => "minecraft:item.bucket.empty",
-            (false, _) => "minecraft:item.bucket.fill",
-        };
-        game.with_level(|_, level, _| {
-            let Some(random) = level.native_level_random() else {
-                return;
-            };
-            let pitch = (1.0 - amount as f32 / (CAPACITY as f32 * 16.0)).clamp(0.0, 1.0) / 1.5
-                + 0.5
-                + (random.next_float() - 0.5) / 4.0;
-            level.native_play_sound(
-                event,
-                pos.map(|coordinate| f64::from(coordinate) + 0.5),
-                4,
-                0.5,
-                pitch,
-            );
-        });
-    }
-
-    pub(super) fn client_tick(
-        session: usize,
-        dimension: &str,
-        time: i64,
-        entries: &[(Pos, &ModBlockEntity)],
-    ) {
-        RENDER.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let cache = cache.dimension(session, dimension);
-            let mut live = std::collections::BTreeSet::new();
-            for &(pos, entity) in entries.iter().filter(|(_, e)| e.id == BLOCK) {
-                let Some((_, fluid)) = read(entity) else {
-                    continue;
-                };
-                live.insert(pos);
-                let owner = entity.revision();
-                let target = fraction(fluid.as_ref());
-                let motion = cache.entry(pos).or_default();
-                if motion.tick.is_some_and(|old| old > time)
-                    || motion
-                        .owner
-                        .is_none_or(|old| !old.is_same_create_entity(owner))
-                {
-                    *motion = RenderLevel {
-                        owner: Some(owner),
-                        tick: None,
-                        chase: rules::FluidLevel {
-                            previous: target,
-                            value: target,
-                            target,
-                            speed: 0.5,
-                        },
-                    };
-                }
-                motion.chase.target = target;
-                if motion.tick != Some(time) {
-                    motion.chase.tick();
-                    motion.tick = Some(time);
-                }
-            }
-            cache.retain(|pos, _| live.contains(pos));
-        });
-    }
-
-    pub(in crate::game) fn draw(
-        game: &Game<'_>,
-        pos: Pos,
-        entity: &ModBlockEntity,
-        draw: &mut BlockEntityDraw,
-    ) {
-        let Some((true, Some(fluid))) = read(entity) else {
-            return;
-        };
-        let level = RENDER.with(|cache| {
-            cache
-                .borrow_mut()
-                .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
-                .get(&pos)
-                .filter(|motion| {
-                    motion
-                        .owner
-                        .is_some_and(|old| old.is_same_create_entity(entity.revision()))
-                })
-                .map_or_else(
-                    || fraction(Some(&fluid)),
-                    |motion| motion.chase.at(draw.partial),
-                )
-        });
-        if level < 1.0 / (512.0 * TOTAL_HEIGHT) {
-            return;
-        }
-        let hull = 1.0 / 16.0 + 1.0 / 128.0;
-        let floor = 5.0 / 16.0;
-        let height = (level * TOTAL_HEIGHT).clamp(0.0, TOTAL_HEIGHT);
-        game.native_draw_fluid_box(
-            draw,
-            &native_fluid(&fluid),
-            [hull, floor, hull, 1.0 - hull, floor + height, 1.0 - hull],
-            NativeFluidRenderOptions {
-                argb: None,
-                render_bottom: false,
-                uv_shrink_ratio: 4.0 / 2048.0,
-            },
-        );
-    }
-}
-
 pub(super) fn removed(game: &mut Game<'_>, pos: Pos) {
+    spout::drop_items(game, pos);
     SERVER.with(|cache| {
         cache
             .borrow_mut()
@@ -1529,49 +1012,1114 @@ pub(super) fn maintenance(game: &mut Game<'_>) {
             .retain(|p, _| game.world.loaded(p[0], p[2]) && game.native_block(*p) == ID);
     });
 }
-/// FluidTransportBehaviour adapter for one dry, closed, straight line.
+/// Item spouts between Basins.
+mod spout {
+    use super::{
+        BlockEntity, Game, ID, ItemStack, ModBlockEntity, Pos, Tag, core_stack, data, fluids,
+        notify_contents, read, read_tanks, restore, rules, unsupported, write,
+    };
+    use create_engine::placement::Direction;
+    use horizon_items::item_nbt::{item_from_nbt, item_to_nbt};
+
+    const PREFERRED: &str = "PreferredSpoutput";
+    const DISABLED: &str = "DisabledSpoutput";
+    const OVERFLOW: &str = "Overflow";
+    const FLUID_OVERFLOW: &str = "FluidOverflow";
+    const FLUID_STACK_CAPACITY: u32 = i32::MAX as u32;
+    type Fluid = rules::Fluid<fluids::Key>;
+    // Catnip Iterate.getHorizontals uses Direction.from2DDataValue. Java
+    // keeps the last eligible side, so search in reverse order.
+    const PRIORITY: [Direction; 4] = [
+        Direction::East,
+        Direction::North,
+        Direction::West,
+        Direction::South,
+    ];
+
+    pub(super) struct Settings {
+        preferred: Option<Direction>,
+        disabled: Vec<Direction>,
+    }
+
+    fn direction_tag(direction: Direction) -> Tag {
+        Tag::String(direction.name().to_ascii_uppercase().as_str().into())
+    }
+
+    fn read_direction(tag: &Tag) -> Option<Direction> {
+        let Tag::String(name) = tag else { return None };
+        let name = name.to_string().ok()?;
+        Direction::ALL
+            .into_iter()
+            .find(|direction| direction.name().eq_ignore_ascii_case(&name))
+    }
+
+    impl Settings {
+        pub(super) fn read(entity: &ModBlockEntity) -> Option<Self> {
+            let preferred = match entity.nbt.get(&PREFERRED.into()) {
+                Some(value) => Some(read_direction(value)?),
+                None => None,
+            };
+            let disabled = match entity.nbt.get(&DISABLED.into()) {
+                None => Vec::new(),
+                Some(Tag::List(rows)) if rows.len() <= Direction::ALL.len() => rows
+                    .iter()
+                    .map(read_direction)
+                    .collect::<Option<Vec<_>>>()?,
+                _ => return None,
+            };
+            Some(Self {
+                preferred,
+                disabled,
+            })
+        }
+
+        fn write(&self, entity: &mut ModBlockEntity) {
+            if let Some(direction) = self.preferred {
+                entity
+                    .nbt
+                    .insert(PREFERRED.into(), direction_tag(direction));
+            } else {
+                entity.nbt.remove(&PREFERRED.into());
+            }
+            entity.nbt.insert(
+                DISABLED.into(),
+                Tag::List(self.disabled.iter().copied().map(direction_tag).collect()),
+            );
+        }
+    }
+
+    pub(super) fn buffer(entity: &ModBlockEntity) -> Option<Vec<ItemStack>> {
+        match entity.nbt.get(&OVERFLOW.into()) {
+            None => Some(Vec::new()),
+            Some(Tag::List(stacks)) => stacks
+                .iter()
+                .map(|tag| item_from_nbt(tag).filter(|stack| stack.count > 0))
+                .collect(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set_buffer(
+        entity: &mut ModBlockEntity,
+        stacks: impl IntoIterator<Item = ItemStack>,
+    ) -> bool {
+        let value = Tag::List(
+            stacks
+                .into_iter()
+                .map(|stack| item_to_nbt(&stack))
+                .collect(),
+        );
+        let changed = entity.nbt.get(&OVERFLOW.into()) != Some(&value);
+        if changed {
+            entity.nbt.insert(OVERFLOW.into(), value);
+        }
+        changed
+    }
+
+    pub(super) fn fluid_buffer(entity: &ModBlockEntity) -> Result<Vec<Fluid>, fluids::Unsupported> {
+        match entity.nbt.get(&FLUID_OVERFLOW.into()) {
+            None => Ok(Vec::new()),
+            Some(Tag::List(stacks)) => stacks
+                .iter()
+                .map(|tag| fluids::read_stack(Some(tag), FLUID_STACK_CAPACITY))
+                .collect(),
+            _ => Err(fluids::Unsupported("noncanonical basin fluid spout buffer")),
+        }
+    }
+
+    pub(super) fn encode_fluid_buffer(stacks: &[Fluid]) -> Result<Tag, fluids::Unsupported> {
+        stacks
+            .iter()
+            .map(|fluid| fluids::write_stack(fluid, FLUID_STACK_CAPACITY))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Tag::List)
+    }
+
+    pub(super) fn set_fluid_buffer(entity: &mut ModBlockEntity, value: Tag) -> bool {
+        let changed = entity.nbt.get(&FLUID_OVERFLOW.into()) != Some(&value);
+        if changed {
+            entity.nbt.insert(FLUID_OVERFLOW.into(), value);
+        }
+        changed
+    }
+
+    pub(super) fn facing(game: &Game<'_>, pos: Pos) -> Option<Direction> {
+        let name = game.native_block_property(pos, "facing")?;
+        Direction::ALL
+            .into_iter()
+            .find(|direction| direction.name() == name)
+    }
+
+    fn neighbor(pos: Pos, direction: Direction) -> Pos {
+        let offset = direction.vector();
+        std::array::from_fn(|axis| pos[axis] + offset[axis])
+    }
+
+    fn target(pos: Pos, direction: Direction) -> Pos {
+        let [x, y, z] = neighbor(pos, direction);
+        [x, y - 1, z]
+    }
+
+    fn has_receiver(game: &Game<'_>, pos: Pos, direction: Direction) -> bool {
+        let [x, y, z] = target(pos, direction);
+        game.world.loaded(x, z)
+            && game.native_block([x, y, z]) == ID
+            && matches!(game.world.block_entities.get(&(x, y, z)), Some(BlockEntity::Mod(entity))
+                if entity.id == ID && unsupported(game, [x, y, z], entity).is_none())
+    }
+
+    fn can_output_to(game: &Game<'_>, pos: Pos, direction: Direction) -> bool {
+        has_receiver(game, pos, direction)
+            && game
+                .block_collision_shape(neighbor(pos, direction))
+                .is_empty()
+    }
+
+    pub(super) fn output_mode(game: &Game<'_>, pos: Pos) -> rules::OutputMode {
+        match facing(game, pos) {
+            Some(direction) if direction != Direction::Down => {
+                let has_receiver = has_receiver(game, pos, direction);
+                rules::OutputMode::Spout {
+                    item_destination: has_receiver,
+                    fluid_destination: has_receiver,
+                }
+            }
+            _ => rules::OutputMode::Internal,
+        }
+    }
+
+    fn next_facing(
+        game: &Game<'_>,
+        pos: Pos,
+        settings: &Settings,
+        current: Direction,
+    ) -> Direction {
+        if current != Direction::Down {
+            let [x, y, z] = target(pos, current);
+            if !game.world.loaded(x, z) {
+                return current;
+            }
+            let block = game.native_block([x, y, z]);
+            if block.starts_with("create:") && !has_receiver(game, pos, current) {
+                // Keep a saved route to a mod machine whose intake isn't wired yet.
+                return current;
+            }
+        }
+        settings
+            .preferred
+            .filter(|&direction| direction != Direction::Up && can_output_to(game, pos, direction))
+            .or_else(|| {
+                PRIORITY.into_iter().find(|direction| {
+                    !settings.disabled.contains(direction) && can_output_to(game, pos, *direction)
+                })
+            })
+            .unwrap_or(Direction::Down)
+    }
+
+    fn migrate(entity: &mut ModBlockEntity, next: Direction) {
+        if next == Direction::Down {
+            return;
+        }
+        let Some(mut pending) = buffer(entity) else {
+            return;
+        };
+        if let Ok(output) = read_tanks(entity, "OutputTanks")
+            && output.iter().any(Option::is_some)
+            && let Ok(mut fluids) = fluid_buffer(entity)
+        {
+            fluids.extend(output.into_iter().flatten());
+            if let (Ok(buffer), Ok(half)) = (
+                encode_fluid_buffer(&fluids),
+                fluids::write_half(entity.nbt.get(&"OutputTanks".into()), &[None, None]),
+            ) {
+                set_fluid_buffer(entity, buffer);
+                entity.nbt.insert("OutputTanks".into(), half);
+            }
+        }
+        restore(entity);
+        for slot in entity.items.iter_mut().skip(9).take(9) {
+            if let Some(stack) = slot.take() {
+                pending.push(stack);
+            }
+        }
+        set_buffer(entity, pending);
+        data(entity);
+    }
+
+    fn flush(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) -> bool {
+        let (Some(mut pending), Ok(mut pending_fluids)) = (buffer(entity), fluid_buffer(entity))
+        else {
+            return false;
+        };
+        if pending.is_empty() && pending_fluids.is_empty() {
+            return false;
+        }
+        let Some(direction) = facing(game, pos) else {
+            return false;
+        };
+        if direction == Direction::Down {
+            for stack in pending {
+                game.pop_resource(pos, stack);
+            }
+            return set_buffer(entity, []) | set_fluid_buffer(entity, Tag::List(Vec::new()));
+        }
+        if !has_receiver(game, pos, direction) {
+            return false;
+        }
+        let receiver = target(pos, direction);
+        let Some(mut state) = read(game, receiver) else {
+            return false;
+        };
+        let mut moved = false;
+        pending.retain_mut(|stack| {
+            let mut remainder = core_stack(game, stack);
+            for slot in 0..9 {
+                remainder = state.insert_input(slot, remainder, false);
+                if remainder.count == 0 {
+                    break;
+                }
+            }
+            moved |= stack.count != remainder.count;
+            stack.count = remainder.count;
+            stack.count > 0
+        });
+        pending_fluids.retain(|fluid| {
+            if state.fill_input_fluid(fluid, true) != fluid.amount {
+                return true;
+            }
+            state.fill_input_fluid(fluid, false);
+            moved = true;
+            false
+        });
+        if !moved {
+            return false;
+        }
+        let Ok(pending_fluids) = encode_fluid_buffer(&pending_fluids) else {
+            return false;
+        };
+        write(game, receiver, &state)
+            && (set_buffer(entity, pending) | set_fluid_buffer(entity, pending_fluids))
+    }
+
+    pub(super) fn tick(
+        game: &mut Game<'_>,
+        pos: Pos,
+        entity: &mut ModBlockEntity,
+        refresh: bool,
+    ) -> bool {
+        let mut changed = false;
+        if refresh
+            && let Some(current) = facing(game, pos)
+            && let Some(settings) = Settings::read(entity)
+        {
+            let next = next_facing(game, pos, &settings, current);
+            if next != current && game.native_set_block_property(pos, "facing", next.name()) {
+                migrate(entity, next);
+                changed = true;
+            }
+        }
+        flush(game, pos, entity) || changed
+    }
+
+    pub(super) fn wrench_held(game: &Game<'_>, pos: Pos) -> bool {
+        game.native_on("create")
+            && game.native_block(pos) == ID
+            && !game.native_sneaking()
+            && !game.spectator()
+            && game
+                .held()
+                .is_some_and(|stack| super::super::create_port_chassis::wrench(game, stack))
+    }
+
+    pub(super) fn wrench(game: &mut Game<'_>, pos: Pos, face: Pos) -> bool {
+        if !wrench_held(game, pos) {
+            return false;
+        }
+        let Some(clicked) = Direction::from_vector(face) else {
+            return false;
+        };
+        let Some(current) = facing(game, pos) else {
+            return true;
+        };
+        let Some(BlockEntity::Mod(entity)) =
+            game.world.block_entities.get(&(pos[0], pos[1], pos[2]))
+        else {
+            return true;
+        };
+        if unsupported(game, pos, entity).is_some() {
+            return true;
+        }
+        let Some(mut settings) = Settings::read(entity) else {
+            return true;
+        };
+        settings.disabled.retain(|&direction| direction != clicked);
+        if clicked == current {
+            if settings.preferred == Some(clicked) {
+                settings.preferred = None;
+            }
+            settings.disabled.push(clicked);
+        } else {
+            settings.preferred = Some(clicked);
+        }
+        let next = next_facing(game, pos, &settings, current);
+        let changed = next != current && game.native_set_block_property(pos, "facing", next.name());
+        game.native_with_mod_block_entity(pos, |entity| {
+            settings.write(entity);
+            if changed {
+                migrate(entity, next);
+            }
+        });
+        game.native_block_entity_sync(pos);
+        if changed {
+            notify_contents(game, pos);
+        }
+        true
+    }
+
+    pub(super) fn drop_items(game: &mut Game<'_>, pos: Pos) {
+        let Some(BlockEntity::Mod(entity)) =
+            game.world.block_entities.get(&(pos[0], pos[1], pos[2]))
+        else {
+            return;
+        };
+        let Some(stacks) = buffer(entity) else { return };
+        for stack in stacks {
+            game.pop_resource(pos, stack);
+        }
+    }
+}
+
+/// FluidTransportBehaviour adapter for directed pipe networks.
 pub(super) mod pump {
     use super::*;
+    use crate::game::create_port_fluid_open_effects as open_effects;
+    use crate::game::create_port_fluid_open_end as open;
     use create_engine::{fluid_transport as flow, placement::Direction};
-    use horizon_world::{chunk::BlockState, level::PlacementContext, registry::BlockStateId};
-    use std::rc::Rc;
+    use horizon_world::{
+        chunk::BlockState,
+        level::{BlockId, PlacementContext},
+        registry::BlockStateId,
+    };
+    use std::{
+        collections::{BTreeSet, VecDeque},
+        rc::Rc,
+    };
 
     pub(in crate::game) const PUMP: &str = "create:mechanical_pump";
     pub(in crate::game) const PIPE: &str = "create:fluid_pipe";
     pub(in crate::game) const VALVE: &str = "create:fluid_valve";
+    const PRESSURE_REBUILD_TICKS: u8 = 2;
 
     struct Line {
         pump: Pos,
         front: Direction,
-        source: Pos,
-        target: Pos,
-        devices: Vec<Pos>,
-        valve: Option<(Pos, bool)>,
+        sources: Rc<[End]>,
+        source_faces: BTreeMap<(Pos, u8), End>,
+        open_sources: Box<[End]>,
+        source_surfaces: RefCell<Option<Rc<[BlockId]>>>,
+        targets: Vec<Target>,
+        devices: Vec<Hop>,
+        by_pos: BTreeMap<Pos, usize>,
+        pump_count: usize,
+        opposing: Vec<Pos>,
+        overlap: bool,
+        valves: Rc<[(Pos, bool)]>,
+    }
+
+    impl Line {
+        fn source(&self, pos: Pos, side: Direction) -> Option<End> {
+            self.source_faces.get(&(pos, side as u8)).copied()
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct End {
+        pos: Pos,
+        face: Direction,
+        open: bool,
+    }
+
+    impl End {
+        fn anchor(self) -> Pos {
+            relative(self.pos, self.face, 1)
+        }
+
+        fn port(self) -> Direction {
+            self.face.opposite()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Target {
+        end: End,
+        device: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Hop {
+        pos: Pos,
+        ports: u8,
+        inlets: u8,
+        outlets: u8,
+        pump: Pos,
+        other: Option<PressureContribution>,
+        divisor: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct PressureContribution {
+        pump: Pos,
+        inlets: u8,
+        outlets: u8,
+        divisor: usize,
+    }
+
+    impl Hop {
+        fn new(pos: Pos, inlets: u8, outlets: u8, pump: Pos) -> Self {
+            Self {
+                pos,
+                ports: inlets | outlets,
+                inlets,
+                outlets,
+                pump,
+                other: None,
+                divisor: 1,
+            }
+        }
+
+        fn inlets(self) -> impl Iterator<Item = Direction> {
+            Direction::ALL
+                .into_iter()
+                .filter(move |&side| self.inlets & bit(side) != 0)
+        }
+
+        fn outlets(self) -> impl Iterator<Item = Direction> {
+            Direction::ALL
+                .into_iter()
+                .filter(move |&side| self.outlets & bit(side) != 0)
+        }
+
+        fn matches(self, state: &BlockState) -> bool {
+            port_mask(state) == self.ports
+        }
+    }
+
+    fn bit(side: Direction) -> u8 {
+        1 << side as usize
+    }
+
+    type Fluid = rules::Fluid<fluids::Key>;
+
+    enum Endpoint {
+        Tank(tank::Record),
+        Basin {
+            pos: Pos,
+            tanks: Box<FluidBasin>,
+        },
+        Drain(Pos, item_drain::Tank),
+        Open {
+            end: End,
+            space: open::Space,
+            buffer: open::Buffer,
+            world: Option<open::WorldWrite>,
+        },
+    }
+
+    enum FluidWrite {
+        Tank(tank::Record, Tag),
+        Basin(Pos, Tag, Tag),
+        Drain(Pos, item_drain::Tank),
+        Open(End, Tag, Option<open::WorldWrite>),
+    }
+
+    impl Endpoint {
+        fn storage(game: &Game<'_>, pos: Pos, side: Direction) -> Option<Self> {
+            match game.native_block(pos).as_str() {
+                tank::BLOCK => Some(Self::Tank(tank::endpoint(game, pos)?)),
+                ID => Some(Self::Basin {
+                    pos,
+                    tanks: Box::new(fluid_state(game, pos)?),
+                }),
+                item_drain::BLOCK if side != Direction::Up => {
+                    Some(Self::Drain(pos, item_drain::fluid_tank(game, pos)?))
+                }
+                _ => None,
+            }
+        }
+
+        fn at(game: &Game<'_>, end: End, current: (Pos, &ModBlockEntity)) -> Option<Self> {
+            if !end.open {
+                return Self::storage(game, end.pos, end.face);
+            }
+            let space = open::Space::read(game, end.pos, end.face)?;
+            let at = end.anchor();
+            let entity = if at == current.0 {
+                current.1
+            } else {
+                device_at(game, at)?
+            };
+            let buffer = open::Buffer::read(open_data(entity, end.port()), end.port())?;
+            Some(Self::Open {
+                end,
+                space,
+                buffer,
+                world: None,
+            })
+        }
+
+        fn owner(&self) -> Pos {
+            match self {
+                Self::Tank(record) => record.tank.root,
+                Self::Basin { pos, .. } | Self::Drain(pos, _) => *pos,
+                Self::Open { end, .. } => end.pos,
+            }
+        }
+
+        fn amount(&self) -> u32 {
+            match self {
+                Self::Tank(record) => record.fluid.as_ref().map_or(0, |fluid| fluid.amount),
+                Self::Basin { tanks, .. } => (0..4)
+                    .filter_map(|index| tanks.fluid(index))
+                    .map(|fluid| fluid.amount)
+                    .sum(),
+                Self::Drain(_, tank) => tank.amount as u32,
+                Self::Open { buffer, .. } => buffer.fluid.as_ref().map_or(0, |fluid| fluid.amount),
+            }
+        }
+
+        fn sample(&mut self) -> Option<flow::Fluid> {
+            let sampled;
+            let fluid = match self {
+                Self::Tank(record) => record.fluid.as_ref()?,
+                Self::Basin { tanks, .. } => {
+                    sampled = tanks
+                        .drain_fluid(rules::FluidRequest::Any(1), true)
+                        .returned?;
+                    &sampled
+                }
+                Self::Drain(_, tank) => {
+                    return (tank.amount > 0)
+                        .then(|| flow::Fluid::from_id(tank.fluid))
+                        .flatten();
+                }
+                Self::Open { buffer, space, .. } => {
+                    return buffer
+                        .fluid
+                        .as_ref()
+                        .and_then(|stack| flow::Fluid::from_id(&stack.key.id))
+                        .or_else(|| space.source().map(|(kind, _)| kind));
+                }
+            };
+            if !fluid.key.components.is_empty() {
+                return None;
+            }
+            flow::Fluid::from_id(&fluid.key.id)
+        }
+
+        fn drain(&mut self, game: &Game<'_>, request: &Fluid, simulate: bool) -> u32 {
+            match self {
+                Self::Tank(record) => {
+                    let Some(stored) = record.fluid.as_mut().filter(|f| f.key == request.key)
+                    else {
+                        return 0;
+                    };
+                    let drained = request.amount.min(stored.amount);
+                    if !simulate {
+                        stored.amount -= drained;
+                        if stored.amount == 0 {
+                            record.fluid = None;
+                        }
+                    }
+                    drained
+                }
+                Self::Basin { tanks, .. } => {
+                    let result = tanks.drain_fluid(rules::FluidRequest::Exact(request), simulate);
+                    if result.source_discarded > 0 {
+                        return 0;
+                    }
+                    result.returned.map_or(0, |fluid| fluid.amount)
+                }
+                Self::Drain(_, tank) => {
+                    if request.key.id != tank.fluid || !request.key.components.is_empty() {
+                        return 0;
+                    }
+                    let drained = request.amount.min(tank.amount as u32);
+                    if !simulate {
+                        tank.set_amount(tank.amount - drained as i32);
+                    }
+                    drained
+                }
+                Self::Open {
+                    buffer,
+                    space,
+                    world,
+                    ..
+                } => {
+                    let (amount, change) = buffer.drain(game, space, request, simulate);
+                    *world = change;
+                    amount
+                }
+            }
+        }
+
+        fn fill(&mut self, game: &Game<'_>, resource: &Fluid) -> u32 {
+            match self {
+                Self::Tank(record) => {
+                    let capacity = record.capacity();
+                    match &mut record.fluid {
+                        Some(stored) if stored.key == resource.key => {
+                            let accepted =
+                                resource.amount.min(capacity.saturating_sub(stored.amount));
+                            stored.amount += accepted;
+                            accepted
+                        }
+                        None => {
+                            let mut stored = resource.clone();
+                            stored.amount = stored.amount.min(capacity);
+                            let accepted = stored.amount;
+                            record.fluid = Some(stored);
+                            accepted
+                        }
+                        Some(_) => 0,
+                    }
+                }
+                Self::Basin { tanks, .. } => tanks.fill_input_fluid(resource, false),
+                Self::Drain(..) => 0,
+                Self::Open {
+                    buffer,
+                    space,
+                    world,
+                    ..
+                } => {
+                    if world.is_some() {
+                        return 0;
+                    }
+                    let (amount, change) = buffer.fill(game, space, resource);
+                    *world = change;
+                    amount
+                }
+            }
+        }
+
+        fn prepare(self, game: &Game<'_>) -> Option<FluidWrite> {
+            match self {
+                Self::Tank(record) => {
+                    let content = tank::prepare_content(game, &record)?;
+                    Some(FluidWrite::Tank(record, content))
+                }
+                Self::Basin {
+                    pos: [x, y, z],
+                    tanks,
+                } => {
+                    let BlockEntity::Mod(entity) = game.world.block_entities.get(&(x, y, z))?
+                    else {
+                        return None;
+                    };
+                    let (input, output) = replacement_tanks(entity, &tanks).ok()?;
+                    Some(FluidWrite::Basin([x, y, z], input, output))
+                }
+                Self::Drain(pos, tank) => Some(FluidWrite::Drain(pos, tank)),
+                Self::Open {
+                    end, buffer, world, ..
+                } => Some(FluidWrite::Open(
+                    end,
+                    buffer.write(end.anchor(), end.port())?,
+                    world,
+                )),
+            }
+        }
+    }
+
+    impl FluidWrite {
+        fn apply_world(&mut self, game: &mut Game<'_>) -> Option<bool> {
+            if let Self::Open(_, _, world) = self
+                && let Some(change) = world.take()
+            {
+                return change.apply(game);
+            }
+            Some(false)
+        }
+
+        fn set(self, game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) -> Notification {
+            match self {
+                Self::Tank(record, content) => {
+                    tank::set_content(game, record.tank.root, content);
+                    Notification::Tank(record)
+                }
+                Self::Basin(pos, input, output) => {
+                    game.native_with_mod_block_entity(pos, |entity| {
+                        set_tanks(entity, input, output)
+                    });
+                    Notification::Basin(pos)
+                }
+                Self::Drain(pos, tank) => {
+                    item_drain::set_fluid(game, pos, &tank);
+                    Notification::Drain(pos)
+                }
+                Self::Open(end, tag, _) => {
+                    let at = end.anchor();
+                    if at == pos {
+                        save_open(entity, end.port(), tag);
+                    } else {
+                        game.native_with_mod_block_entity(at, |entity| {
+                            save_open(entity, end.port(), tag)
+                        });
+                    }
+                    Notification::Open(at)
+                }
+            }
+        }
+    }
+
+    enum Notification {
+        Tank(tank::Record),
+        Basin(Pos),
+        Drain(Pos),
+        Open(Pos),
+    }
+
+    impl Notification {
+        fn send(self, game: &mut Game<'_>) {
+            match self {
+                Self::Tank(record) => tank::notify(game, &record),
+                Self::Basin(pos) => {
+                    game.native_block_entity_sync(pos);
+                    notify_contents(game, pos);
+                }
+                Self::Drain(pos) => item_drain::notify_fluid(game, pos),
+                Self::Open(pos) => game.native_block_entity_sync(pos),
+            }
+        }
+    }
+
+    fn transfer(
+        game: &mut Game<'_>,
+        pos: Pos,
+        entity: &mut ModBlockEntity,
+        source: End,
+        targets: &[End],
+        kind: flow::Fluid,
+        rate: i32,
+    ) -> (bool, bool) {
+        if targets.is_empty() || rate <= 0 {
+            return (false, false);
+        }
+        let source_end = source;
+        let Some(mut source) = Endpoint::at(game, source_end, (pos, entity)) else {
+            return (false, false);
+        };
+        let mut resource = Fluid {
+            key: fluids::Key {
+                id: kind.id().into(),
+                components: Compound::new(),
+            },
+            amount: rate as u32,
+        };
+        let available = source.drain(game, &resource, true);
+        if available == 0 {
+            return (false, false);
+        }
+        let mut by_owner = BTreeMap::new();
+        let mut stores = Vec::new();
+        let destinations: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                let target = Endpoint::at(game, *target, (pos, entity))?;
+                let owner = target.owner();
+                if owner == source.owner() {
+                    return None;
+                }
+                Some(*by_owner.entry(owner).or_insert_with(|| {
+                    let index = stores.len();
+                    stores.push((target, 0));
+                    index
+                }))
+            })
+            .collect();
+        flow::distribute(available, destinations.len(), |i, quota| {
+            let Some(index) = destinations[i] else {
+                return 0;
+            };
+            resource.amount = quota;
+            let (target, filled) = &mut stores[index];
+            let accepted = target.fill(game, &resource);
+            *filled += accepted;
+            accepted
+        });
+        let mut reactions = Vec::new();
+        let mut writes = Vec::new();
+        for (mut target, filled) in stores {
+            if let Endpoint::Open { world, .. } = &mut target
+                && world.as_ref().is_some_and(open::WorldWrite::is_reaction)
+            {
+                reactions.extend(world.take());
+            }
+            if filled != 0 {
+                let Some(write) = target.prepare(game) else {
+                    return (false, false);
+                };
+                writes.push((filled, write));
+            }
+        }
+        let mut refresh = false;
+        for reaction in reactions {
+            refresh |= reaction.apply(game).unwrap_or(false);
+        }
+        // An open source has to claim its world fluid first. Retain any
+        // unused part of that claim in the inlet's existing buffer.
+        let prepaid = if source_end.open {
+            resource.amount = writes.iter().map(|(filled, _)| filled).sum();
+            if resource.amount == 0 || source.drain(game, &resource, false) != resource.amount {
+                return (false, refresh);
+            }
+            let Endpoint::Open { world, .. } = &mut source else {
+                return (false, refresh);
+            };
+            if let Some(change) = world.take() {
+                let Some(rebuild) = change.apply(game) else {
+                    return (false, refresh);
+                };
+                refresh |= rebuild && open_source_rebuilds(game, source_end);
+            }
+            resource.amount
+        } else {
+            0
+        };
+        // A surface changed by an earlier outlet can invalidate a later
+        // one. Charge the source only for destinations that accepted fluid.
+        writes.retain_mut(|(_, write)| match write.apply_world(game) {
+            Some(rebuild) => {
+                refresh |= rebuild;
+                true
+            }
+            None => false,
+        });
+        resource.amount = writes.iter().map(|(filled, _)| filled).sum();
+        if let Endpoint::Open { buffer, .. } = &mut source {
+            if prepaid > resource.amount {
+                let mut returned = resource.clone();
+                returned.amount = prepaid - resource.amount;
+                buffer.refund(returned);
+            }
+        } else if resource.amount == 0 || source.drain(game, &resource, false) != resource.amount {
+            return (false, refresh);
+        }
+        let Some(source_write) = source.prepare(game) else {
+            return (false, refresh);
+        };
+        let exposed: Vec<_> = writes
+            .iter()
+            .filter_map(|(_, write)| match write {
+                FluidWrite::Open(end, ..) => Some(*end),
+                _ => None,
+            })
+            .collect();
+        // Contents are committed before any dependent notification.
+        let updates: Vec<_> = std::iter::once(source_write)
+            .chain(writes.into_iter().map(|(_, write)| write))
+            .map(|write| write.set(game, pos, entity))
+            .collect();
+        let mut current = false;
+        for update in updates {
+            if matches!(update, Notification::Open(at) if at == pos) {
+                current = true;
+            } else {
+                update.send(game);
+            }
+        }
+        for end in exposed {
+            open_effects::apply(game, end.pos, end.port(), kind);
+        }
+        (current, refresh)
+    }
+
+    fn is_endpoint(name: &str, face: Direction) -> bool {
+        matches!(name, tank::BLOCK | ID) || (name == item_drain::BLOCK && face != Direction::Up)
+    }
+
+    fn endpoint(game: &Game<'_>, pos: Pos, block: &BlockState, face: Direction) -> Option<End> {
+        if is_endpoint(&block.name, face) {
+            Endpoint::storage(game, pos, face)?;
+            return Some(End {
+                pos,
+                face,
+                open: false,
+            });
+        }
+        if matches!(block.name.as_str(), PIPE | PUMP | VALVE) {
+            return None;
+        }
+        open::Space::read(game, pos, face)?;
+        Some(End {
+            pos,
+            face,
+            open: true,
+        })
     }
 
     #[derive(Default)]
     struct TickState {
         owner: Option<ModRevision>,
-        line: Option<(Pos, Direction, Pos, Pos)>,
-        valve: Option<(Pos, bool)>,
-        pressure: f32,
+        line: Option<PressureRoute>,
+        source_surfaces: Option<Rc<[BlockId]>>,
+        refresh_surface: bool,
+        collision: Option<CollisionRecovery>,
+        valves: Option<Rc<[(Pos, bool)]>>,
+        pressure: [f32; 2],
         phase: u8,
-        source_ticks: u8,
+        source_ticks: [u8; 6],
+        overlap_targets: BTreeMap<u8, Vec<End>>,
+        last_turn: Option<i64>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum CollisionRecovery {
+        Junction {
+            resume_at: i64,
+        },
+        Split {
+            broken: Pos,
+            resume_at: i64,
+            role: SplitRole,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    enum SplitRole {
+        Pipe,
+        Pump,
+        Unchanged,
+    }
+
+    impl CollisionRecovery {
+        fn current(self, game: &Game<'_>) -> bool {
+            match self {
+                Self::Junction { .. } => true,
+                Self::Split {
+                    broken, resume_at, ..
+                } => {
+                    game.world.game_time <= resume_at
+                        && game.native_block(broken) == "minecraft:cobblestone"
+                }
+            }
+        }
+    }
+
+    #[derive(PartialEq, Eq)]
+    struct PressureRoute {
+        pump: Pos,
+        front: Direction,
+        sources: Rc<[End]>,
+        inlets: u8,
+        outlets: u8,
     }
 
     #[derive(Default)]
     struct Lines {
         tick: Option<i64>,
-        by_device: BTreeMap<Pos, Option<Rc<Line>>>,
+        by_device: BTreeMap<Pos, Option<(Rc<Line>, usize)>>,
         live: BTreeMap<Pos, TickState>,
+        stopped_pumps: BTreeMap<Pos, i64>,
+        reset_overlap_inlets: BTreeMap<Pos, i64>,
     }
 
     thread_local! {
         static NETWORKS: RefCell<SessionCache<Lines>> = RefCell::new(SessionCache::default());
+        static POINTERS: RefCell<SessionCache<BTreeMap<Pos, PointerFrame>>> = RefCell::new(SessionCache::default());
+        static RIMS: RefCell<SessionCache<RimHistory>> = RefCell::new(SessionCache::default());
     }
 
     pub(super) fn reset() {
         NETWORKS.with(|networks| networks.borrow_mut().clear());
+        POINTERS.with(|pointers| pointers.borrow_mut().clear());
+        RIMS.with(|rims| rims.borrow_mut().clear());
+    }
+
+    #[derive(Default)]
+    struct RimHistory {
+        time: Option<i64>,
+        active: BTreeMap<Pos, (ModRevision, u8)>,
+    }
+
+    type FluidParticle = (Pos, Direction, flow::Fluid, bool, Option<bool>);
+
+    pub(super) fn rim_events(
+        game: &Game<'_>,
+        session: usize,
+        dimension: &str,
+        time: i64,
+        entries: &[(Pos, &ModBlockEntity)],
+    ) -> Vec<FluidParticle> {
+        let view = game
+            .camera_mob()
+            .map(|m| [m.position.x, m.position.y, m.position.z])
+            .or_else(|| {
+                game.player
+                    .as_ref()
+                    .map(|p| [p.position.x, p.position.y, p.position.z])
+            });
+        RIMS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let history = cache.dimension(session, dimension);
+            if history.time == Some(time) {
+                return Vec::new();
+            }
+            if history.time.is_some_and(|previous| previous > time) {
+                history.active.clear();
+            }
+            history.time = Some(time);
+            history
+                .active
+                .retain(|pos, _| device_at(game, *pos).is_some());
+            let mut events = Vec::new();
+            for &(pos, entity) in entries
+                .iter()
+                .filter(|(_, e)| matches!(e.id.as_str(), PIPE | PUMP | VALVE))
+            {
+                let mask = state(game, pos).map_or(0, port_mask);
+                let owner = entity.revision();
+                let previous = history
+                    .active
+                    .get(&pos)
+                    .filter(|(old, _)| old.is_same_create_entity(owner))
+                    .map_or(0, |(_, mask)| *mask);
+                let visible = view.is_some_and(|view| {
+                    (0..3)
+                        .map(|i| {
+                            let distance = view[i] - (f64::from(pos[i]) + 0.5);
+                            distance * distance
+                        })
+                        .sum::<f64>()
+                        <= 20.0 * 20.0
+                });
+                let mut current = 0;
+                for side in Direction::ALL
+                    .into_iter()
+                    .filter(|&side| mask & bit(side) != 0)
+                {
+                    if let Some(Some((flow, inbound))) = stored(entity, side) {
+                        current |= bit(side);
+                        if visible {
+                            let adjacent = relative(pos, side, 1);
+                            let jet = (open_data(entity, side).is_some()
+                                && state(game, adjacent)
+                                    .and_then(|block| {
+                                        endpoint(game, adjacent, block, side.opposite())
+                                    })
+                                    .is_some_and(|end| end.open))
+                            .then_some(inbound);
+                            events.push((pos, side, flow.fluid, previous & bit(side) == 0, jet));
+                        }
+                    }
+                }
+                if current == 0 {
+                    history.active.remove(&pos);
+                } else {
+                    history.active.insert(pos, (owner, current));
+                }
+            }
+            events
+        })
     }
 
     fn relative(pos: Pos, direction: Direction, distance: i32) -> Pos {
@@ -1579,27 +2127,25 @@ pub(super) mod pump {
         std::array::from_fn(|i| pos[i] + offset[i] * distance)
     }
 
-    fn dry(state: &BlockState) -> bool {
-        state
-            .properties
-            .get("waterlogged")
-            .is_some_and(|value| value == "false")
-    }
-
     fn front(state: &BlockState) -> Option<Direction> {
         let name = state.properties.get("facing")?;
         Direction::ALL.into_iter().find(|side| side.name() == name)
     }
 
-    fn axis(state: &BlockState) -> Option<create_engine::kinetics::Axis> {
-        let mut sides = Direction::ALL.into_iter().filter(|side| {
-            state
-                .properties
-                .get(side.name())
-                .is_some_and(|v| v == "true")
-        });
-        let first = sides.next()?;
-        (sides.next()? == first.opposite() && sides.next().is_none()).then_some(first.axis())
+    fn pipe_open(state: &BlockState, side: Direction) -> bool {
+        state
+            .properties
+            .get(side.name())
+            .is_some_and(|v| v == "true")
+    }
+
+    fn connects(state: &BlockState, toward: Direction) -> bool {
+        matches!(
+            state.name.as_str(),
+            PIPE | "minecraft:cauldron" | "minecraft:lava_cauldron" | "minecraft:water_cauldron"
+        ) || state.properties.contains_key("honey_level")
+            || is_endpoint(&state.name, toward.opposite())
+            || device_ports(state).is_some_and(|ports| ports.contains(&toward.opposite()))
     }
 
     fn enabled(state: &BlockState) -> bool {
@@ -1625,90 +2171,436 @@ pub(super) mod pump {
         game.pack.assets.registry.state(game.world.block(x, y, z))
     }
 
-    fn device_axis(state: &BlockState) -> Option<create_engine::kinetics::Axis> {
-        if !dry(state) {
-            return None;
-        }
-        match state.name.as_str() {
-            PIPE => axis(state),
-            PUMP => front(state).map(Direction::axis),
-            VALVE => valve_axis(state, false),
+    fn port_mask(state: &BlockState) -> u8 {
+        let direction = match state.name.as_str() {
+            PIPE => {
+                return Direction::ALL
+                    .into_iter()
+                    .filter(|&side| pipe_open(state, side))
+                    .fold(0, |mask, side| mask | bit(side));
+            }
+            PUMP => front(state),
+            VALVE => valve_axis(state, false)
+                .map(|axis| [Direction::East, Direction::Up, Direction::South][axis.index()]),
             _ => None,
-        }
+        };
+        direction.map_or(0, |side| bit(side) | bit(side.opposite()))
     }
 
-    fn pump_at(game: &Game<'_>, pos: Pos, origin: &BlockState) -> Option<Pos> {
+    fn device_ports(state: &BlockState) -> Option<[Direction; 2]> {
+        let mask = port_mask(state);
+        let mut sides = Direction::ALL
+            .into_iter()
+            .filter(|&side| mask & bit(side) != 0);
+        let pair = [sides.next()?, sides.next()?];
+        sides.next().is_none().then_some(pair)
+    }
+
+    fn straight_axis(state: &BlockState) -> Option<create_engine::kinetics::Axis> {
+        let [first, second] = device_ports(state)?;
+        (first.opposite() == second).then_some(first.axis())
+    }
+
+    fn pump_at(game: &Game<'_>, pos: Pos, origin: &BlockState, limit: usize) -> Option<Pos> {
         if origin.name == PUMP {
             return Some(pos);
         }
-        let axis = device_axis(origin)?;
-        for side in Direction::ALL
-            .into_iter()
-            .filter(|side| side.axis() == axis)
-        {
-            for distance in 1..=flow::MAX_PIPES_PER_SIDE {
-                let neighbor = relative(pos, side, distance);
-                let Some(state) = state(game, neighbor) else {
-                    break;
+        let mut visited = BTreeSet::from([pos]);
+        let mut queue = VecDeque::from([(pos, port_mask(origin), 0)]);
+        while let Some((pos, mask, depth)) = queue.pop_front() {
+            for side in Direction::ALL
+                .into_iter()
+                .filter(|&side| mask & bit(side) != 0)
+            {
+                let at = relative(pos, side, 1);
+                let Some(block) = state(game, at) else {
+                    continue;
                 };
-                if device_axis(state) != Some(axis) {
-                    break;
+                let ports = port_mask(block);
+                if ports & bit(side.opposite()) == 0 || !visited.insert(at) {
+                    continue;
                 }
-                if state.name == PUMP {
-                    return Some(neighbor);
+                if block.name == PUMP {
+                    return Some(at);
+                }
+                if depth + 1 < limit {
+                    queue.push_back((at, ports, depth + 1));
                 }
             }
         }
         None
     }
 
-    fn find_line(game: &Game<'_>, pos: Pos, origin: &BlockState) -> Option<Line> {
-        let pump = pump_at(game, pos, origin)?;
-        let block = state(game, pump)?;
-        let direction = front(block)?;
-        if !dry(block) {
-            return None;
+    struct HalfHop {
+        hop: Hop,
+        toward_pump: Direction,
+        parent: usize,
+        depth: usize,
+        terminal_faces: u8,
+        valve: Option<bool>,
+    }
+
+    struct Half {
+        devices: Vec<HalfHop>,
+        ends: Vec<End>,
+        link: Option<Pos>,
+        opposing: Vec<Pos>,
+    }
+
+    impl Half {
+        fn valves(&self) -> impl Iterator<Item = (Pos, bool)> + '_ {
+            self.devices
+                .iter()
+                .filter(|device| device.hop.outlets != 0)
+                .filter_map(|device| Some((device.hop.pos, device.valve?)))
         }
-        let scan = |side| {
-            let mut devices = Vec::new();
-            let mut valve = None;
-            for distance in 1..=flow::MAX_PIPES_PER_SIDE + 1 {
-                let at = relative(pump, side, distance);
-                let state = state(game, at)?;
-                if state.name == tank::BLOCK && tank::endpoint(game, at) {
-                    return Some((at, devices, valve));
+    }
+
+    /// Pressure fans out from the pump on both sides, including the side
+    /// where actual liquid will travel back toward the pump.
+    fn scan_half(
+        game: &Game<'_>,
+        pump: Pos,
+        side: Direction,
+        pulling: bool,
+        limit: usize,
+        visited: &mut BTreeSet<Pos>,
+    ) -> Option<Half> {
+        let mut devices = vec![HalfHop {
+            hop: Hop::new(pump, bit(side.opposite()), bit(side), pump),
+            toward_pump: side.opposite(),
+            parent: 0,
+            depth: 0,
+            terminal_faces: 0,
+            valve: None,
+        }];
+        let mut targets = Vec::new();
+        let mut link = None;
+        let mut opposing = Vec::new();
+        let mut index = 0;
+        while index < devices.len() {
+            let HalfHop { hop, depth, .. } = devices[index];
+            for side in hop.outlets() {
+                let at = relative(hop.pos, side, 1);
+                let Some(block) = state(game, at) else {
+                    continue;
+                };
+                let face = side.opposite();
+                if let Some(end) = endpoint(game, at, block, face) {
+                    targets.push(end);
+                    devices[index].terminal_faces |= bit(side);
+                    continue;
                 }
-                if !matches!(state.name.as_str(), PIPE | VALVE)
-                    || device_axis(state) != Some(direction.axis())
+                let ports = port_mask(block);
+                let outlets = ports & !bit(face);
+                if block.name == PUMP && ports & bit(face) != 0 {
+                    let required = if pulling { face } else { side };
+                    if front(block) != Some(required) {
+                        // Pumps using the same side of their transfer
+                        // behavior do not form a pressure endpoint.
+                        opposing.push(at);
+                        continue;
+                    }
+                    if link.replace(at).is_some() {
+                        return None;
+                    }
+                    devices[index].terminal_faces |= bit(side);
+                    continue;
+                }
+                if !matches!(block.name.as_str(), PIPE | VALVE)
+                    || ports & bit(face) == 0
+                    || outlets == 0
                 {
+                    continue;
+                }
+                if visited.contains(&at) {
                     return None;
                 }
-                if state.name == VALVE && valve.replace((at, enabled(state))).is_some() {
-                    return None;
+                if depth == limit {
+                    // At the limit pressure reaches this face, but there is
+                    // no storage endpoint through which to transfer fluid.
+                    devices[index].terminal_faces |= bit(side);
+                    continue;
                 }
-                devices.push(at);
+                visited.insert(at);
+                devices.push(HalfHop {
+                    hop: Hop::new(at, bit(face), outlets, pump),
+                    toward_pump: face,
+                    parent: index,
+                    depth: depth + 1,
+                    terminal_faces: 0,
+                    valve: (block.name == VALVE).then(|| enabled(block)),
+                });
             }
-            None
-        };
-        let (source, mut behind, inlet_valve) = scan(direction.opposite())?;
-        let (target, ahead, outlet_valve) = scan(direction)?;
-        if inlet_valve.is_some() && outlet_valve.is_some() {
+            index += 1;
+        }
+        // An outlet or inlet between opposing pumps can see both pressure
+        // sources. Leave that layout to a combined pressure route.
+        if !opposing.is_empty() && !targets.is_empty() {
             return None;
         }
-        behind.reverse();
-        behind.push(pump);
-        behind.extend(ahead);
-        Some(Line {
-            pump,
-            front: direction,
-            source,
-            target,
-            devices: behind,
-            valve: inlet_valve.or(outlet_valve),
+        // A dead branch keeps its physical ports but contributes no pressure.
+        let mut face_counts = vec![0; devices.last()?.depth + 1];
+        for device in &mut devices {
+            device.hop.outlets = device.terminal_faces;
+        }
+        for i in (1..devices.len()).rev() {
+            let HalfHop {
+                hop,
+                depth,
+                toward_pump,
+                parent,
+                ..
+            } = devices[i];
+            if hop.outlets != 0 {
+                face_counts[depth] += 1 + hop.outlets.count_ones() as usize;
+                devices[parent].hop.outlets |= bit(toward_pump.opposite());
+            }
+        }
+        for device in devices.iter_mut().skip(1) {
+            device.hop.divisor = flow::pressure_divisor(face_counts[device.depth]);
+        }
+        Some(Half {
+            devices,
+            ends: targets,
+            link,
+            opposing,
         })
     }
 
-    fn line(game: &Game<'_>, pos: Pos, origin: &BlockState) -> Option<Rc<Line>> {
+    struct PumpSection {
+        pos: Pos,
+        front: Direction,
+        inlet: Half,
+        outlet: Half,
+    }
+
+    fn section(game: &Game<'_>, pump: Pos, limit: usize) -> Option<PumpSection> {
+        let front = front_of_pump(state(game, pump)?)?;
+        let mut visited = BTreeSet::from([pump]);
+        Some(PumpSection {
+            pos: pump,
+            front,
+            inlet: scan_half(game, pump, front.opposite(), true, limit, &mut visited)?,
+            outlet: scan_half(game, pump, front, false, limit, &mut visited)?,
+        })
+    }
+
+    fn find_line(game: &Game<'_>, pos: Pos, origin: &BlockState) -> Option<Line> {
+        // Java always inspects the first neighboring pipe, even at range 1.
+        let limit = (crate::game::create_port_server_config::pump_range() - 1).max(1) as usize;
+        let nearest = pump_at(game, pos, origin, limit)?;
+        let mut current = section(game, nearest, limit)?;
+        let mut later = BTreeMap::new();
+        while let Some(previous) = current.inlet.link {
+            if previous == current.pos || later.contains_key(&previous) {
+                return None;
+            }
+            let earlier = section(game, previous, limit)?;
+            if earlier.outlet.link != Some(current.pos) {
+                return None;
+            }
+            later.insert(current.pos, current);
+            current = earlier;
+        }
+        let pump = current.pos;
+        let direction = current.front;
+        let opposing = current
+            .inlet
+            .opposing
+            .iter()
+            .chain(&current.outlet.opposing)
+            .copied()
+            .collect();
+        let mut sources = std::mem::take(&mut current.inlet.ends);
+        let mut valves: Vec<_> = current.inlet.valves().collect();
+        let mut devices: Vec<_> = std::mem::take(&mut current.inlet.devices)
+            .into_iter()
+            .skip(1)
+            .rev()
+            .map(|mut device| {
+                std::mem::swap(&mut device.hop.inlets, &mut device.hop.outlets);
+                device.hop
+            })
+            .collect();
+        let mut pumps = BTreeSet::new();
+        let mut side_tanks = Vec::new();
+        let mut ends = loop {
+            if !pumps.insert(current.pos) {
+                return None;
+            }
+            devices.push(Hop::new(
+                current.pos,
+                bit(current.front.opposite()),
+                bit(current.front),
+                current.pos,
+            ));
+            valves.extend(current.outlet.valves());
+            let Some(next) = current.outlet.link else {
+                devices.extend(
+                    current
+                        .outlet
+                        .devices
+                        .into_iter()
+                        .skip(1)
+                        .map(|device| device.hop),
+                );
+                break current.outlet.ends;
+            };
+            let following = match later.remove(&next) {
+                Some(section) => section,
+                None => section(game, next, limit)?,
+            };
+            let side_ends = &current.outlet.ends;
+            if following.inlet.link != Some(current.pos)
+                || side_ends.len() != following.inlet.ends.len()
+                || side_ends
+                    .iter()
+                    .any(|end| !following.inlet.ends.contains(end))
+            {
+                return None;
+            }
+            if (1..=2).contains(&side_ends.len())
+                && side_tanks.is_empty()
+                && side_ends.iter().all(|end| {
+                    !end.open && state(game, end.pos).is_some_and(|block| block.name == tank::BLOCK)
+                })
+            {
+                side_tanks.extend(side_ends.iter().copied());
+                let mut reverse: BTreeMap<_, _> = following
+                    .inlet
+                    .devices
+                    .iter()
+                    .skip(1)
+                    .filter(|device| device.hop.outlets != 0)
+                    .map(|device| (device.hop.pos, device.hop))
+                    .collect();
+                for mut device in current.outlet.devices.into_iter().skip(1) {
+                    if device.hop.outlets != 0 {
+                        let other = reverse.remove(&device.hop.pos)?;
+                        device.hop.other = Some(PressureContribution {
+                            pump: next,
+                            inlets: other.outlets,
+                            outlets: other.inlets,
+                            divisor: other.divisor,
+                        });
+                    }
+                    devices.push(device.hop);
+                }
+                if !reverse.is_empty() {
+                    return None;
+                }
+                current = following;
+                continue;
+            }
+            if !current.outlet.ends.is_empty() {
+                return None;
+            }
+            // On the path between co-directed pumps, suction and output
+            // contribute pressure to the same face polarity. Compare only
+            // the pressure-carrying path. A capped arm can be visited in a
+            // different order from either pump and carries no pressure.
+            let mut reverse = following
+                .inlet
+                .devices
+                .iter()
+                .skip(1)
+                .filter(|device| device.hop.outlets != 0)
+                .rev();
+            for mut device in current.outlet.devices.into_iter().skip(1) {
+                if device.hop.outlets == 0 {
+                    devices.push(device.hop);
+                    continue;
+                }
+                let other = reverse.next()?.hop;
+                if device.hop.pos != other.pos
+                    || device.hop.inlets != other.outlets
+                    || device.hop.outlets != other.inlets
+                    || device.hop.outlets.count_ones() != 1
+                {
+                    return None;
+                }
+                device.hop.other = Some(PressureContribution {
+                    pump: next,
+                    inlets: other.outlets,
+                    outlets: other.inlets,
+                    divisor: other.divisor,
+                });
+                devices.push(device.hop);
+            }
+            if reverse.next().is_some() {
+                return None;
+            }
+            current = following;
+        };
+        let overlap = !side_tanks.is_empty();
+        if overlap {
+            // Both pumps can contribute pressure at the side tanks. These
+            // ends can act as inlets or outlets according to the flow.
+            if pumps.len() != 2
+                || sources.len() != 1
+                || ends.len() != 1
+                || sources[0].open
+                || ends[0].open
+                || !valves.is_empty()
+            {
+                return None;
+            }
+            sources.extend(side_tanks.iter().copied());
+            ends.extend(side_tanks);
+        }
+        let open_sources: Box<[End]> = sources.iter().filter(|end| end.open).copied().collect();
+        let mut outlet_surfaces = BTreeSet::new();
+        if ends
+            .iter()
+            .filter(|end| end.open)
+            .any(|end| !outlet_surfaces.insert(end.pos))
+            || open_sources
+                .iter()
+                .any(|end| outlet_surfaces.contains(&end.pos))
+        {
+            return None;
+        }
+        let by_pos: BTreeMap<_, _> = devices
+            .iter()
+            .enumerate()
+            .map(|(i, hop)| (hop.pos, i))
+            .collect();
+        if by_pos.len() != devices.len() {
+            return None;
+        }
+        let targets = ends
+            .into_iter()
+            .map(|end| {
+                Some(Target {
+                    device: *by_pos.get(&end.anchor())?,
+                    end,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let source_faces = sources
+            .iter()
+            .map(|end| ((end.anchor(), end.port() as u8), *end))
+            .collect();
+        let source_surfaces = RefCell::new(source_surfaces(game, &open_sources));
+        Some(Line {
+            pump,
+            front: direction,
+            open_sources,
+            source_surfaces,
+            sources: sources.into(),
+            source_faces,
+            targets,
+            devices,
+            by_pos,
+            pump_count: pumps.len(),
+            opposing,
+            overlap,
+            valves: valves.into(),
+        })
+    }
+
+    fn line(game: &Game<'_>, pos: Pos, origin: &BlockState) -> Option<(Rc<Line>, usize)> {
         NETWORKS.with(|cache| {
             let mut cache = cache.borrow_mut();
             let index = cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
@@ -1716,6 +2608,8 @@ pub(super) mod pump {
             if index.tick != Some(now) {
                 index.by_device.clear();
                 index.tick = Some(now);
+                index.stopped_pumps.retain(|_, tick| *tick >= now);
+                index.reset_overlap_inlets.retain(|_, tick| *tick >= now);
                 if now % 20 == 0 {
                     index.live.retain(|p, _| {
                         state(game, *p)
@@ -1728,14 +2622,68 @@ pub(super) mod pump {
             }
             let found = find_line(game, pos, origin).map(Rc::new);
             if let Some(line) = &found {
-                for &device in &line.devices {
-                    index.by_device.insert(device, Some(line.clone()));
+                for (i, device) in line.devices.iter().enumerate() {
+                    index.by_device.insert(
+                        device.pos,
+                        (device.inlets != 0 && device.outlets != 0).then(|| (line.clone(), i)),
+                    );
                 }
             } else {
                 index.by_device.insert(pos, None);
             }
-            found
+            index.by_device.get(&pos).cloned().flatten()
         })
+    }
+
+    fn open_data(entity: &ModBlockEntity, side: Direction) -> Option<&Tag> {
+        entity.nbt.get(&side.name().into())?.get("OpenEnd")
+    }
+
+    fn save_open(entity: &mut ModBlockEntity, side: Direction, tag: Tag) -> bool {
+        let connection = entity
+            .nbt
+            .entry(side.name().into())
+            .or_insert_with(|| Tag::Compound(Compound::new()));
+        let Tag::Compound(fields) = connection else {
+            return false;
+        };
+        let key = "OpenEnd".into();
+        if fields.get(&key) == Some(&tag) {
+            return false;
+        }
+        fields.insert(key, tag);
+        true
+    }
+
+    fn maintain_open(
+        pos: Pos,
+        entity: &mut ModBlockEntity,
+        line: &Line,
+        phase: u8,
+        active: bool,
+    ) -> bool {
+        if !active || phase == 2 {
+            return false;
+        }
+        let mut changed = false;
+        for (end, pulling) in line
+            .open_sources
+            .iter()
+            .copied()
+            .map(|end| (end, phase == 0))
+            .chain(line.targets.iter().map(|target| (target.end, false)))
+            .filter(|(end, _)| end.open && end.anchor() == pos)
+        {
+            let side = end.port();
+            let Some(mut buffer) = open::Buffer::read(open_data(entity, side), side) else {
+                continue;
+            };
+            buffer.pulling |= pulling;
+            if let Some(tag) = buffer.write(pos, side) {
+                changed |= save_open(entity, side, tag);
+            }
+        }
+        changed
     }
 
     fn stored(entity: &ModBlockEntity, side: Direction) -> Option<Option<(flow::Flow, bool)>> {
@@ -1745,10 +2693,12 @@ pub(super) mod pump {
         let Tag::Compound(connection) = tag else {
             return None;
         };
-        if connection
-            .keys()
-            .any(|key| !matches!(key.to_string_lossy().as_str(), "Pressure" | "Flow"))
-        {
+        if connection.keys().any(|key| {
+            !matches!(
+                key.to_string_lossy().as_str(),
+                "Pressure" | "Flow" | "OpenEnd"
+            )
+        }) {
             return None;
         }
         if let Some(pressure) = connection.get(&"Pressure".into()) {
@@ -1760,12 +2710,7 @@ pub(super) mod pump {
             };
             let inward = f32::from_bits(*inward);
             let outward = f32::from_bits(*outward);
-            if !inward.is_finite()
-                || !outward.is_finite()
-                || inward < 0.0
-                || outward < 0.0
-                || inward > 0.0 && outward > 0.0
-            {
+            if !inward.is_finite() || !outward.is_finite() || inward < 0.0 || outward < 0.0 {
                 return None;
             }
         }
@@ -1834,26 +2779,39 @@ pub(super) mod pump {
         )))
     }
 
-    fn faces(entity: &ModBlockEntity, front: Direction) -> Option<flow::Faces> {
-        let inlet = stored(entity, front.opposite())?;
-        let outlet = stored(entity, front)?;
-        if inlet.is_none_or(|(_, inward)| inward) && outlet.is_none_or(|(_, inward)| !inward) {
-            Some(flow::Faces {
-                inlet: inlet.map(|(f, _)| f),
-                outlet: outlet.map(|(f, _)| f),
-            })
-        } else if inlet.is_none_or(|(_, inward)| !inward) && outlet.is_none_or(|(_, inward)| inward)
+    type FaceFlows = [Option<flow::Flow>; 6];
+
+    fn internal_fluid(
+        hop: Hop,
+        before: FaceFlows,
+    ) -> Result<Option<flow::Fluid>, (flow::Fluid, flow::Fluid)> {
+        let mut complete = hop
+            .inlets()
+            .filter_map(|side| before[side as usize].and_then(flow::Flow::complete));
+        let first = complete.next();
+        if let Some(first) = first
+            && let Some(other) = complete.find(|&fluid| fluid != first)
         {
-            Some(
-                flow::Faces {
-                    inlet: outlet.map(|(f, _)| f),
-                    outlet: inlet.map(|(f, _)| f),
-                }
-                .reversed(),
-            )
-        } else {
-            None
+            return Err((first, other));
         }
+        Ok(first)
+    }
+
+    fn face(entity: &ModBlockEntity, side: Direction, inbound: bool) -> Option<Option<flow::Flow>> {
+        Some(stored(entity, side)?.and_then(|(flow, old_inbound)| {
+            (old_inbound == inbound || flow.complete().is_some()).then_some(flow)
+        }))
+    }
+
+    fn faces(entity: &ModBlockEntity, hop: Hop) -> Option<FaceFlows> {
+        let mut flows = [None; 6];
+        for side in hop.inlets() {
+            flows[side as usize] = face(entity, side, true)?;
+        }
+        for side in hop.outlets() {
+            flows[side as usize] = face(entity, side, false)?;
+        }
+        Some(flows)
     }
 
     fn tag_number(n: f32) -> Tag {
@@ -1865,6 +2823,71 @@ pub(super) mod pump {
         value: f32,
         target: f32,
         speed: f32,
+    }
+
+    struct PointerFrame {
+        owner: ModRevision,
+        time: i64,
+        previous: f32,
+        value: f32,
+    }
+
+    pub(super) fn client_tick(
+        session: usize,
+        dimension: &str,
+        time: i64,
+        entries: &[(Pos, &ModBlockEntity)],
+    ) {
+        POINTERS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let pointers = cache.dimension(session, dimension);
+            let mut live = std::collections::BTreeSet::new();
+            for &(pos, entity) in entries.iter().filter(|(_, e)| e.id == VALVE) {
+                let Some(pointer) = Pointer::read(&entity.nbt) else {
+                    continue;
+                };
+                live.insert(pos);
+                let owner = entity.revision();
+                let frame = pointers.entry(pos).or_insert(PointerFrame {
+                    owner,
+                    time,
+                    previous: pointer.value,
+                    value: pointer.value,
+                });
+                if frame.time != time || !frame.owner.is_same_create_entity(owner) {
+                    let continuous =
+                        frame.time + 1 == time && frame.owner.is_same_create_entity(owner);
+                    *frame = PointerFrame {
+                        owner,
+                        time,
+                        previous: if continuous {
+                            frame.value
+                        } else {
+                            pointer.value
+                        },
+                        value: pointer.value,
+                    };
+                } else {
+                    frame.value = pointer.value;
+                }
+            }
+            pointers.retain(|pos, _| live.contains(pos));
+        });
+    }
+
+    fn pointer_angle(game: &Game<'_>, pos: Pos, entity: &ModBlockEntity, partial: f32) -> f32 {
+        let value = Pointer::read(&entity.nbt).unwrap_or_default().value;
+        POINTERS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let pointers = cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+            let value = pointers
+                .get(&pos)
+                .filter(|frame| frame.owner.is_same_create_entity(entity.revision()))
+                .map_or(value, |frame| {
+                    frame.previous + (frame.value - frame.previous) * partial
+                });
+            value * -90.0
+        })
     }
 
     impl Pointer {
@@ -1892,9 +2915,12 @@ pub(super) mod pump {
             })
         }
 
-        fn tick(&mut self, rpm: f32) {
+        fn set_speed(&mut self, rpm: f32) {
             self.target = if rpm > 0.0 { 1.0 } else { 0.0 };
             self.speed = (rpm.abs() / 16.0 / 20.0).clamp(0.0, 1.0);
+        }
+
+        fn tick(&mut self) {
             if self.value < self.target {
                 self.value = (self.value + self.speed).min(self.target);
             } else if self.value > self.target {
@@ -1920,6 +2946,13 @@ pub(super) mod pump {
         nbt
     }
 
+    pub(in crate::game) fn valve_speed_changed(entity: &mut ModBlockEntity, rpm: f32) {
+        if let Some(mut pointer) = Pointer::read(&entity.nbt) {
+            pointer.set_speed(rpm);
+            pointer.save(&mut entity.nbt);
+        }
+    }
+
     pub(in crate::game) fn tick_valve(
         game: &mut Game<'_>,
         pos: Pos,
@@ -1931,7 +2964,7 @@ pub(super) mod pump {
             return changed;
         };
         let previous = pointer;
-        pointer.tick(rpm);
+        pointer.tick();
         if pointer != previous || entity.nbt.get(&"Pointer".into()).is_none() {
             pointer.save(&mut entity.nbt);
             changed = true;
@@ -1960,21 +2993,19 @@ pub(super) mod pump {
     fn save_face(
         entity: &mut ModBlockEntity,
         side: Direction,
-        pressure: f32,
-        inbound: bool,
-        fluid: Option<flow::Flow>,
+        pressure: flow::Pressure,
+        fluid: Option<flow::DirectedFlow>,
         force: bool,
     ) -> bool {
         let mut connection = Compound::new();
-        if pressure != 0.0 {
-            let values = if inbound {
-                [pressure, 0.0]
-            } else {
-                [0.0, pressure]
-            };
+        if let Some(open) = open_data(entity, side) {
+            connection.insert("OpenEnd".into(), open.clone());
+        }
+        if pressure != flow::Pressure::default() {
+            let values = [pressure.inbound, pressure.outward];
             connection.insert("Pressure".into(), Tag::List(values.map(tag_number).into()));
         }
-        if let Some(flow) = fluid {
+        if let Some(flow::DirectedFlow { flow, inbound }) = fluid {
             let mut data = Compound::from([
                 (
                     "Fluid".into(),
@@ -2009,50 +3040,273 @@ pub(super) mod pump {
 
     fn save(
         entity: &mut ModBlockEntity,
-        front: Direction,
+        hop: Hop,
         pressure: f32,
-        before: flow::Faces,
-        after: flow::Faces,
+        before: FaceFlows,
+        after: FaceFlows,
     ) -> bool {
-        let incoming = save_face(
-            entity,
-            front.opposite(),
-            pressure,
-            true,
-            after.inlet,
-            before.inlet.is_none(),
-        );
-        let outgoing = save_face(
-            entity,
-            front,
-            pressure,
-            false,
-            after.outlet,
-            before.outlet.is_none(),
-        );
-        incoming || outgoing
+        let mut changed = false;
+        for side in Direction::ALL {
+            let inbound = hop.inlets & bit(side) != 0;
+            if inbound || hop.outlets & bit(side) != 0 {
+                changed |= save_face(
+                    entity,
+                    side,
+                    if inbound {
+                        flow::Pressure {
+                            inbound: pressure,
+                            outward: 0.0,
+                        }
+                    } else {
+                        flow::Pressure {
+                            inbound: 0.0,
+                            outward: pressure,
+                        }
+                    },
+                    after[side as usize].map(|flow| flow::DirectedFlow { flow, inbound }),
+                    before[side as usize].is_none(),
+                );
+            } else if stored(entity, side).is_some() {
+                if open_data(entity, side).is_some() {
+                    changed |= save_face(entity, side, flow::Pressure::default(), None, false);
+                } else {
+                    changed |= entity.nbt.remove(&side.name().into()).is_some();
+                }
+            }
+        }
+        changed
     }
 
-    fn other_faces(game: &Game<'_>, pos: Pos, front: Direction) -> Option<flow::Faces> {
-        let BlockEntity::Mod(entity) = game.world.block_entities.get(&(pos[0], pos[1], pos[2]))?
-        else {
+    fn device_at<'a>(game: &'a Game<'_>, [x, y, z]: Pos) -> Option<&'a ModBlockEntity> {
+        let BlockEntity::Mod(entity) = game.world.block_entities.get(&(x, y, z))? else {
             return None;
         };
-        matches!(entity.id.as_str(), PIPE | PUMP | VALVE)
-            .then(|| faces(entity, front))
-            .flatten()
+        matches!(entity.id.as_str(), PIPE | PUMP | VALVE).then_some(entity.as_ref())
+    }
+
+    fn clear_connections(entity: &mut ModBlockEntity, clear_flow: bool) -> bool {
+        let mut changed = false;
+        for side in Direction::ALL {
+            if stored(entity, side).is_none() {
+                continue;
+            }
+            if let Some(Tag::Compound(connection)) = entity.nbt.get_mut(&side.name().into()) {
+                changed |= connection.remove(&"Pressure".into()).is_some();
+                if clear_flow {
+                    changed |= connection.remove(&"Flow".into()).is_some();
+                }
+            }
+        }
+        changed
+    }
+
+    fn wipe_pressure(game: &mut Game<'_>, pos: Pos) {
+        if game
+            .native_with_mod_block_entity(pos, |entity| clear_connections(entity, false))
+            .unwrap_or(false)
+        {
+            game.native_block_entity_sync(pos);
+        }
+    }
+
+    /// A kinetic publication wipes pressure through each adjacent pipe up to
+    /// the next pump. An immediately adjacent pump is also a starting node,
+    /// so its other side is part of this rebuild.
+    pub(in crate::game) fn drive_changed(game: &mut Game<'_>, pos: Pos, rpm: f32) {
+        let Some((line, index)) = state(game, pos).and_then(|block| line(game, pos, block)) else {
+            return;
+        };
+        if line.pump_count < 2 {
+            // Even a pressureless connection reaches the other pump on a
+            // speed change. That pump rebuilds its own faces, while its
+            // exterior pipes retain their pressure and flow.
+            for &peer in &line.opposing {
+                let Some(owner) = device_at(game, peer)
+                    .filter(|entity| entity.id == PUMP)
+                    .map(ModBlockEntity::revision)
+                else {
+                    continue;
+                };
+                NETWORKS.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    let state =
+                        cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+                    if let Some(entry) = state.live.get_mut(&peer)
+                        && entry
+                            .owner
+                            .is_some_and(|old| old.is_same_create_entity(owner))
+                    {
+                        entry.phase = PRESSURE_REBUILD_TICKS;
+                        entry.source_ticks = [0; 6];
+                    }
+                });
+                wipe_pressure(game, peer);
+            }
+            return;
+        }
+        let now = game.world.game_time;
+        let mut wiped = BTreeSet::from([pos]);
+        let mut redistribute = BTreeSet::new();
+        if line.overlap {
+            redistribute.insert(pos);
+        }
+        let mut pending: VecDeque<_> = Direction::ALL
+            .into_iter()
+            .filter(|&side| line.devices[index].ports & bit(side) != 0)
+            .map(|side| (relative(pos, side, 1), side.opposite(), true))
+            .collect();
+        while let Some((at, entered, start)) = pending.pop_front() {
+            let Some(&index) = line.by_pos.get(&at) else {
+                continue;
+            };
+            if !wiped.insert(at) {
+                continue;
+            }
+            let hop = line.devices[index];
+            if line.overlap && at == hop.pump && hop.outlets & bit(entered) != 0 {
+                redistribute.insert(at);
+            }
+            if start || hop.pos != hop.pump {
+                pending.extend(
+                    Direction::ALL
+                        .into_iter()
+                        .filter(|&side| hop.ports & bit(side) != 0)
+                        .map(|side| (relative(at, side, 1), side.opposite(), false)),
+                );
+            }
+        }
+        NETWORKS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let state = cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+            if rpm == 0.0 {
+                let turned = state
+                    .live
+                    .get(&pos)
+                    .is_some_and(|entry| entry.last_turn == Some(now));
+                state
+                    .stopped_pumps
+                    .insert(pos, if turned { now + 1 } else { now });
+            } else {
+                state.stopped_pumps.remove(&pos);
+            }
+            if line.overlap {
+                state
+                    .reset_overlap_inlets
+                    .extend(redistribute.into_iter().map(|pos| (pos, now + 1)));
+            }
+            for at in &wiped {
+                if let Some(entry) = state.live.get_mut(at) {
+                    entry.phase = PRESSURE_REBUILD_TICKS;
+                    entry.source_ticks = [0; 6];
+                    entry.overlap_targets.clear();
+                }
+            }
+        });
+        for at in wiped {
+            wipe_pressure(game, at);
+        }
+    }
+
+    fn ready_targets(
+        game: &Game<'_>,
+        line: &Line,
+        source_device: usize,
+        source_side: Direction,
+        start: FaceFlows,
+        kind: flow::Fluid,
+    ) -> Vec<End> {
+        let mut reachable = vec![0; line.devices.len()];
+        for (i, &hop) in line.devices.iter().enumerate().skip(source_device) {
+            let supplied = |side| {
+                if i == source_device {
+                    return side == source_side;
+                }
+                line.by_pos
+                    .get(&relative(hop.pos, side, 1))
+                    .is_some_and(|&parent| reachable[parent] & bit(side.opposite()) != 0)
+            };
+            if !hop.inlets().any(supplied) {
+                continue;
+            }
+            let valid = state(game, hop.pos).is_some_and(|block| {
+                if hop.pos == hop.pump {
+                    front_of_pump(block).is_some_and(|front| hop.outlets & bit(front) != 0)
+                        && (line.pump_count == 1
+                            || i == source_device
+                            || pump_supplies(game, hop.pos))
+                } else {
+                    (block.name == PIPE || (block.name == VALVE && enabled(block)))
+                        && hop.matches(block)
+                }
+            });
+            let flows = if i == source_device {
+                Some(start)
+            } else {
+                device_at(game, hop.pos).and_then(|entity| faces(entity, hop))
+            };
+            if valid
+                && let Some(flows) = flows
+                && internal_fluid(hop, flows) == Ok(Some(kind))
+                && hop.inlets().any(|side| {
+                    supplied(side)
+                        && flows[side as usize].and_then(flow::Flow::complete) == Some(kind)
+                })
+            {
+                reachable[i] = hop
+                    .outlets()
+                    .filter(|&side| {
+                        flows[side as usize].and_then(flow::Flow::complete) == Some(kind)
+                    })
+                    .fold(0, |mask, side| mask | bit(side));
+            }
+        }
+        line.targets
+            .iter()
+            .filter_map(|target| {
+                (reachable[target.device] & bit(target.end.face.opposite()) != 0)
+                    .then_some(target.end)
+            })
+            .collect()
+    }
+
+    fn open_source_rebuilds(game: &Game<'_>, end: End) -> bool {
+        // Create's neighbor-change validation only propagates pressure
+        // from a straight pipe. Bends and junctions skip this rebuild.
+        state(game, end.anchor()).and_then(straight_axis).is_some()
+    }
+
+    fn source_surfaces(game: &Game<'_>, sources: &[End]) -> Option<Rc<[BlockId]>> {
+        if sources.is_empty() {
+            return None;
+        }
+        let surfaces: Rc<[_]> = sources
+            .iter()
+            .filter(|&&end| open_source_rebuilds(game, end))
+            .map(|end| {
+                let [x, y, z] = end.pos;
+                game.res.behaviours().block(game.world.block(x, y, z))
+            })
+            .collect();
+        (!surfaces.is_empty()).then_some(surfaces)
     }
 
     fn controls(
         game: &Game<'_>,
         pos: Pos,
         owner: ModRevision,
-        line: Option<&Line>,
-        pressure: f32,
-        source_flow: bool,
-    ) -> (u8, bool) {
-        let valve = line.and_then(|line| line.valve);
-        let line = line.map(|line| (line.pump, line.front, line.source, line.target));
+        route: Option<(&Line, Hop)>,
+        pressure: [f32; 2],
+        source_flow: u8,
+    ) -> (u8, u8) {
+        let valves = route.map(|(line, _)| line.valves.clone());
+        let source_surfaces = route.and_then(|(line, _)| line.source_surfaces.borrow().clone());
+        let line = route.map(|(line, hop)| PressureRoute {
+            pump: line.pump,
+            front: line.front,
+            sources: line.sources.clone(),
+            inlets: hop.inlets,
+            outlets: hop.outlets,
+        });
         NETWORKS.with(|cache| {
             let mut cache = cache.borrow_mut();
             let state = cache
@@ -2060,34 +3314,571 @@ pub(super) mod pump {
                 .live
                 .entry(pos)
                 .or_default();
-            if state
+            let same_owner = state
                 .owner
-                .is_none_or(|old| !old.is_same_create_entity(owner))
+                .is_some_and(|old| old.is_same_create_entity(owner));
+            let rebuilt = state.collision.take().is_some_and(|recovery| {
+                if !same_owner || !recovery.current(game) {
+                    return false;
+                }
+                if matches!(
+                    recovery,
+                    CollisionRecovery::Split {
+                        role: SplitRole::Unchanged,
+                        ..
+                    }
+                ) {
+                    // Only the line ownership changed outside the split.
+                    // A new drive or connection still starts a rebuild.
+                    return state.pressure == pressure
+                        && state.valves == valves
+                        && state
+                            .line
+                            .as_ref()
+                            .zip(line.as_ref())
+                            .is_some_and(|(old, new)| {
+                                old.front == new.front
+                                    && old.inlets == new.inlets
+                                    && old.outlets == new.outlets
+                            });
+                }
+                true
+            });
+            if !same_owner
                 || state.line != line
-                || state.valve != valve
+                || state.valves != valves
                 || state.pressure != pressure
             {
                 *state = TickState {
                     owner: Some(owner),
                     line,
-                    valve,
+                    source_surfaces,
+                    refresh_surface: false,
+                    collision: None,
+                    valves,
                     pressure,
-                    phase: 2,
-                    source_ticks: 0,
+                    phase: if rebuilt { 0 } else { PRESSURE_REBUILD_TICKS },
+                    source_ticks: [0; 6],
+                    overlap_targets: BTreeMap::new(),
+                    last_turn: Some(game.world.game_time),
                 };
+            } else {
+                // Scheduled fluid changes complete their current transfer.
+                // The neighbor update rebuilds pressure on the next tick.
+                if state.refresh_surface {
+                    state.phase = PRESSURE_REBUILD_TICKS;
+                    state.source_ticks = [0; 6];
+                }
+                state.refresh_surface = state.source_surfaces != source_surfaces;
+                state.source_surfaces = source_surfaces;
+                state.last_turn = Some(game.world.game_time);
             }
             if state.phase != 0 {
                 let phase = state.phase;
                 state.phase -= 1;
-                return (phase, false);
+                return (phase, 0);
             }
-            state.source_ticks = if source_flow {
-                (state.source_ticks + 1).min(3)
-            } else {
-                0
-            };
-            (0, state.source_ticks == 3)
+            state
+                .overlap_targets
+                .retain(|&side, _| source_flow & (1 << side) != 0);
+            let mut ready = 0;
+            for side in Direction::ALL {
+                let ticks = &mut state.source_ticks[side as usize];
+                *ticks = if source_flow & bit(side) != 0 {
+                    (*ticks + 1).min(3)
+                } else {
+                    0
+                };
+                if *ticks == 3 {
+                    ready |= bit(side);
+                }
+            }
+            (0, ready)
         })
+    }
+
+    fn hold_after_collision(game: &mut Game<'_>, line: &Line, collision: Pos) {
+        let resume_at = game.world.game_time + 1 + i64::from(PRESSURE_REBUILD_TICKS);
+        // Pipe removal clears pressure on this side of the pump immediately.
+        // The two rebuild phases retain existing fluid animation progress.
+        for &hop in &line.devices {
+            if hop.pos != collision
+                && let Some(entity) = device_at(game, hop.pos)
+            {
+                let owner = entity.revision();
+                NETWORKS.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    let live = &mut cache
+                        .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
+                        .live;
+                    let state = live.entry(hop.pos).or_default();
+                    if state
+                        .owner
+                        .is_some_and(|old| old.is_same_create_entity(owner))
+                    {
+                        state.collision = Some(CollisionRecovery::Junction { resume_at });
+                    }
+                });
+                if hop.pos != line.pump
+                    && game
+                        .native_with_mod_block_entity(hop.pos, |entity| {
+                            clear_connections(entity, false)
+                        })
+                        .unwrap_or(false)
+                {
+                    game.native_block_entity_sync(hop.pos);
+                }
+            }
+            if hop.pos == line.pump {
+                break;
+            }
+        }
+    }
+
+    fn hold_after_overlap_collision(game: &mut Game<'_>, line: &Line, collision: Pos) {
+        // Removing the pipe propagates to both pumps without crossing them.
+        // The neighbor update repeats the pressure rebuild on the next tick.
+        let resume_at = game.world.game_time + 1 + i64::from(PRESSURE_REBUILD_TICKS);
+        NETWORKS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let state = cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+            state.live.remove(&collision);
+            for hop in &line.devices {
+                state.by_device.remove(&hop.pos);
+                if let Some(entry) = state.live.get_mut(&hop.pos) {
+                    let role = if hop.pos == hop.pump {
+                        SplitRole::Pump
+                    } else if hop.other.is_some() {
+                        SplitRole::Pipe
+                    } else {
+                        // The pump stopped the wipe. Rebind this outer
+                        // section to its new line without restarting flow.
+                        SplitRole::Unchanged
+                    };
+                    entry.collision = Some(CollisionRecovery::Split {
+                        broken: collision,
+                        resume_at,
+                        role,
+                    });
+                    entry.overlap_targets.clear();
+                }
+            }
+        });
+        for hop in line
+            .devices
+            .iter()
+            .filter(|hop| hop.pos != collision && (hop.pos == hop.pump || hop.other.is_some()))
+        {
+            wipe_pressure(game, hop.pos);
+        }
+    }
+
+    fn republish_split_pressure(game: &mut Game<'_>, pos: Pos, rpm: f32) {
+        let Some((line, _)) = state(game, pos).and_then(|origin| line(game, pos, origin)) else {
+            return;
+        };
+        for &hop in line
+            .devices
+            .iter()
+            .filter(|hop| hop.pos != pos && hop.pump == pos && hop.inlets != 0 && hop.outlets != 0)
+        {
+            let Some(entity) = device_at(game, hop.pos) else {
+                continue;
+            };
+            if !matches!(
+                collision_recovery(game, hop.pos, entity),
+                Some(CollisionRecovery::Split {
+                    role: SplitRole::Pipe,
+                    ..
+                })
+            ) {
+                continue;
+            }
+            let magnitude = rpm.abs() / hop.divisor as f32;
+            if game
+                .native_with_mod_block_entity(hop.pos, |entity| {
+                    let mut changed = false;
+                    for side in hop.inlets().chain(hop.outlets()) {
+                        let Some(saved) = stored(entity, side) else {
+                            continue;
+                        };
+                        let pressure = if hop.inlets & bit(side) != 0 {
+                            flow::Pressure {
+                                inbound: magnitude,
+                                outward: 0.0,
+                            }
+                        } else {
+                            flow::Pressure {
+                                inbound: 0.0,
+                                outward: magnitude,
+                            }
+                        };
+                        let saved =
+                            saved.map(|(flow, inbound)| flow::DirectedFlow { flow, inbound });
+                        changed |= save_face(entity, side, pressure, saved, false);
+                    }
+                    changed
+                })
+                .unwrap_or(false)
+            {
+                game.native_block_entity_sync(hop.pos);
+            }
+        }
+    }
+
+    fn collision_recovery(
+        game: &Game<'_>,
+        pos: Pos,
+        entity: &ModBlockEntity,
+    ) -> Option<CollisionRecovery> {
+        NETWORKS.with(|cache| {
+            cache
+                .borrow_mut()
+                .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
+                .live
+                .get(&pos)
+                .filter(|state| {
+                    state
+                        .owner
+                        .is_some_and(|owner| owner.is_same_create_entity(entity.revision()))
+                })
+                .and_then(|state| state.collision)
+                .filter(|recovery| recovery.current(game))
+        })
+    }
+
+    fn react_to_flow_collision(
+        game: &mut Game<'_>,
+        line: &Line,
+        pos: Pos,
+        entity: &ModBlockEntity,
+        first: flow::Fluid,
+        other: flow::Fluid,
+    ) {
+        if entity.id != PIPE || !first.has_world_state() || !other.has_world_state() {
+            return;
+        }
+        let Some(cobble) = game.native_default_state("minecraft:cobblestone") else {
+            return;
+        };
+        if game
+            .native_machine_destroy_block(pos, None, false)
+            .is_none()
+            || game.native_block(pos) == PIPE
+        {
+            return;
+        }
+        let _ = game.native_set_block(
+            game.dim.id(),
+            pos,
+            cobble,
+            horizon_world::level::flags::UPDATE_ALL,
+        );
+        if line.overlap {
+            hold_after_overlap_collision(game, line, pos);
+        } else {
+            hold_after_collision(game, line, pos);
+        }
+    }
+
+    fn pump_speed(game: &Game<'_>, pump: Pos, pos: Pos, rpm: f32) -> f32 {
+        if pump == pos {
+            return rpm.abs();
+        }
+        saved_pump_speed(game, pump)
+    }
+
+    fn saved_pump_speed(game: &Game<'_>, pump: Pos) -> f32 {
+        device_at(game, pump)
+            .filter(|entity| entity.id == PUMP)
+            .map_or(0.0, |entity| {
+                crate::game::create_port::running_speed(game, &entity.nbt).abs()
+            })
+    }
+
+    fn pump_supplies(game: &Game<'_>, pos: Pos) -> bool {
+        saved_pump_speed(game, pos) != 0.0
+            || NETWORKS.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let state =
+                    cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+                // A source outside the wiped region can still use its old
+                // destinations until that pressure rebuild reaches it.
+                state.stopped_pumps.get(&pos) == Some(&game.world.game_time)
+            })
+    }
+
+    type DirectedFaces = [Option<flow::DirectedFlow>; 6];
+
+    fn directed_faces(entity: &ModBlockEntity, hop: Hop) -> Option<DirectedFaces> {
+        let mut faces = [None; 6];
+        for side in Direction::ALL
+            .into_iter()
+            .filter(|&side| hop.ports & bit(side) != 0)
+        {
+            faces[side as usize] =
+                stored(entity, side)?.map(|(flow, inbound)| flow::DirectedFlow { flow, inbound });
+        }
+        Some(faces)
+    }
+
+    fn complete_face(face: Option<flow::DirectedFlow>, inbound: bool) -> Option<flow::Fluid> {
+        face.filter(|face| face.inbound == inbound)?.flow.complete()
+    }
+
+    fn overlap_targets(
+        game: &Game<'_>,
+        line: &Line,
+        source: usize,
+        port: Direction,
+        start: DirectedFaces,
+        kind: flow::Fluid,
+    ) -> Vec<End> {
+        let mut pending = VecDeque::from([(source, port, start)]);
+        let mut visited = BTreeSet::from([source]);
+        let mut targets = Vec::new();
+        while let Some((index, inlet, faces)) = pending.pop_front() {
+            if complete_face(faces[inlet as usize], true) != Some(kind) {
+                continue;
+            }
+            let hop = line.devices[index];
+            for side in Direction::ALL
+                .into_iter()
+                .filter(|&side| complete_face(faces[side as usize], false) == Some(kind))
+            {
+                if let Some(target) = line
+                    .targets
+                    .iter()
+                    .find(|target| target.device == index && target.end.port() == side)
+                {
+                    targets.push(target.end);
+                    continue;
+                }
+                let next = relative(hop.pos, side, 1);
+                let Some(&neighbor) = line.by_pos.get(&next) else {
+                    continue;
+                };
+                let device = line.devices[neighbor];
+                if (next != device.pump || pump_supplies(game, next))
+                    && visited.insert(neighbor)
+                    && let Some(faces) =
+                        device_at(game, next).and_then(|entity| directed_faces(entity, device))
+                {
+                    pending.push_back((neighbor, side.opposite(), faces));
+                }
+            }
+        }
+        targets
+    }
+
+    fn retain_overlap_targets(
+        game: &Game<'_>,
+        pos: Pos,
+        side: Direction,
+        found: Vec<End>,
+    ) -> Vec<End> {
+        NETWORKS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let dimension =
+                cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+            let targets = dimension
+                .live
+                .entry(pos)
+                .or_default()
+                .overlap_targets
+                .entry(side as u8)
+                .or_default();
+            for end in found {
+                if !targets.contains(&end) {
+                    targets.push(end);
+                }
+            }
+            targets.clone()
+        })
+    }
+
+    /// Follow inbound flows back to the FluidNetwork that owns each source.
+    /// A direction change can leave an already discovered destination in the
+    /// network when this search cannot reach the source.
+    fn reset_overlap_sources(
+        game: &Game<'_>,
+        line: &Line,
+        index: usize,
+        side: Direction,
+        start: DirectedFaces,
+    ) {
+        let mut pending = VecDeque::from([(index, bit(side), start)]);
+        let mut visited = BTreeSet::from([index]);
+        let mut sources = Vec::new();
+        while let Some((device, mask, faces)) = pending.pop_front() {
+            let hop = line.devices[device];
+            for side in Direction::ALL.into_iter().filter(|&side| {
+                mask & bit(side) != 0 && faces[side as usize].is_some_and(|face| face.inbound)
+            }) {
+                if line.source(hop.pos, side).is_some() {
+                    sources.push((hop.pos, side));
+                }
+                let next = relative(hop.pos, side, 1);
+                if let Some(&next) = line.by_pos.get(&next)
+                    && visited.insert(next)
+                    && let Some(faces) = device_at(game, line.devices[next].pos)
+                        .and_then(|entity| directed_faces(entity, line.devices[next]))
+                {
+                    pending.push_back((next, line.devices[next].ports, faces));
+                }
+            }
+        }
+        NETWORKS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let dimension =
+                cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+            for (pos, side) in sources {
+                if let Some(state) = dimension.live.get_mut(&pos) {
+                    state.source_ticks[side as usize] = 0;
+                    state.overlap_targets.remove(&(side as u8));
+                }
+            }
+        });
+    }
+
+    fn tick_overlap(
+        game: &mut Game<'_>,
+        entity: &mut ModBlockEntity,
+        line: &Line,
+        index: usize,
+        rpm: f32,
+    ) -> bool {
+        let hop = line.devices[index];
+        let Some(saved) = directed_faces(entity, hop) else {
+            return false;
+        };
+        let primary = pump_speed(game, hop.pump, hop.pos, rpm) / hop.divisor as f32;
+        let secondary = hop.other.map_or(0.0, |other| {
+            pump_speed(game, other.pump, hop.pos, rpm) / other.divisor as f32
+        });
+        let pressures = Direction::ALL.map(|side| {
+            let pressure = |main, alt| {
+                let first = if main & bit(side) != 0 { primary } else { 0.0 };
+                let second = if alt & bit(side) != 0 { secondary } else { 0.0 };
+                first + second
+            };
+            flow::Pressure {
+                inbound: pressure(hop.inlets, hop.other.map_or(0, |other| other.inlets)),
+                outward: pressure(hop.outlets, hop.other.map_or(0, |other| other.outlets)),
+            }
+        });
+        let inputs = Direction::ALL.map(|side| {
+            if pressures[side as usize].inbound == 0.0 {
+                return None;
+            }
+            if let Some(source) = line.source(hop.pos, side) {
+                return Endpoint::at(game, source, (hop.pos, entity))?.sample();
+            }
+            let entity = device_at(game, relative(hop.pos, side, 1))?;
+            let (flow, inbound) = stored(entity, side.opposite())??;
+            if inbound { None } else { flow.complete() }
+        });
+        let source_flow = Direction::ALL
+            .into_iter()
+            .filter(|&side| {
+                let i = side as usize;
+                line.source(hop.pos, side).is_some()
+                    && inputs[i].is_some_and(|input| {
+                        saved[i].is_some_and(|face| face.inbound && face.flow.fluid == input)
+                    })
+            })
+            .fold(0, |mask, side| mask | bit(side));
+        let (phase, ready) = controls(
+            game,
+            hop.pos,
+            entity.revision(),
+            Some((line, hop)),
+            [primary, secondary],
+            source_flow,
+        );
+        let before = std::array::from_fn(|i| {
+            if phase == PRESSURE_REBUILD_TICKS {
+                saved[i]
+            } else {
+                pressures[i].flip(saved[i]?)
+            }
+        });
+        let mut after = before;
+        if phase == 0 {
+            let mut internal = None;
+            let mut inbound_count = 0;
+            for face in before {
+                if let Some(fluid) = complete_face(face, true) {
+                    if let Some(inside) = internal.filter(|&inside| inside != fluid) {
+                        react_to_flow_collision(game, line, hop.pos, entity, inside, fluid);
+                        return false;
+                    }
+                    internal = Some(fluid);
+                    inbound_count += 1;
+                }
+            }
+            after = std::array::from_fn(|i| {
+                let from_self = inbound_count == 1 && complete_face(before[i], true).is_some();
+                pressures[i].tick(
+                    before[i],
+                    inputs[i],
+                    if from_self { None } else { internal },
+                )
+            });
+            for side in Direction::ALL.into_iter().filter(|&side| {
+                ready & bit(side) != 0 && after[side as usize].is_some_and(|face| face.inbound)
+            }) {
+                let i = side as usize;
+                let (Some(source), Some(kind)) = (line.source(hop.pos, side), inputs[i]) else {
+                    continue;
+                };
+                let found = overlap_targets(game, line, index, side, before, kind);
+                let targets = retain_overlap_targets(game, hop.pos, side, found);
+                transfer(
+                    game,
+                    hop.pos,
+                    entity,
+                    source,
+                    &targets,
+                    kind,
+                    flow::transfer_rate(pressures[i].inbound),
+                );
+            }
+            for side in Direction::ALL {
+                let i = side as usize;
+                if before[i].is_some_and(|face| face.inbound)
+                    && after[i].is_some_and(|face| !face.inbound)
+                {
+                    reset_overlap_sources(game, line, index, side, before);
+                }
+            }
+        }
+        if entity.id == PUMP {
+            let reset = NETWORKS.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
+                    .reset_overlap_inlets
+                    .remove(&hop.pos)
+                    .is_some()
+            });
+            if reset
+                && primary > 0.0
+                && let Some(inlet) = hop.inlets().next()
+            {
+                reset_overlap_sources(game, line, index, inlet, after);
+            }
+        }
+        let mut changed = false;
+        for side in Direction::ALL
+            .into_iter()
+            .filter(|&side| hop.ports & bit(side) != 0)
+        {
+            let i = side as usize;
+            let force = saved[i].map(|face| face.inbound) != after[i].map(|face| face.inbound);
+            changed |= save_face(entity, side, pressures[i], after[i], force);
+        }
+        changed
     }
 
     pub(in crate::game) fn tick(
@@ -2102,108 +3893,206 @@ pub(super) mod pump {
         let Some(origin) = state(game, pos) else {
             return false;
         };
-        let Some(axis) = device_axis(origin) else {
+        if port_mask(origin) == 0 {
             return false;
-        };
-        let Some(line) = line(game, pos, origin) else {
-            // An open, unsupported or unloaded path must not discard saved
-            // connections. It has no authority to drain either endpoint.
-            controls(game, pos, entity.revision(), None, 0.0, false);
-            return false;
-        };
-        let front = line.front;
-        let Some(before) = faces(entity, front) else {
-            return false;
-        };
-        let pressure = if pos == line.pump {
-            rpm.abs()
-        } else {
-            let p = line.pump;
-            match game.world.block_entities.get(&(p[0], p[1], p[2])) {
-                Some(BlockEntity::Mod(entity)) if entity.id == PUMP => {
-                    crate::game::create_port::running_speed(game, &entity.nbt).abs()
+        }
+        let recovery = collision_recovery(game, pos, entity);
+        let now = game.world.game_time;
+        match recovery {
+            Some(CollisionRecovery::Junction { resume_at }) if now < resume_at => return false,
+            Some(CollisionRecovery::Split {
+                resume_at,
+                role: SplitRole::Pipe,
+                ..
+            }) if now < resume_at => {
+                if now + i64::from(PRESSURE_REBUILD_TICKS) == resume_at {
+                    // The neighbor tick drops faces that no longer connect.
+                    return Direction::ALL
+                        .into_iter()
+                        .filter(|&side| port_mask(origin) & bit(side) == 0)
+                        .fold(false, |changed, side| {
+                            entity.nbt.remove(&side.name().into()).is_some() || changed
+                        });
                 }
-                _ => 0.0,
+                return false;
             }
+            Some(CollisionRecovery::Split {
+                resume_at,
+                role: SplitRole::Pump,
+                ..
+            }) if now < resume_at => {
+                if let Some(front) = front_of_pump(origin) {
+                    let hop = Hop::new(pos, bit(front.opposite()), bit(front), pos);
+                    republish_split_pressure(game, pos, rpm);
+                    return faces(entity, hop)
+                        .is_some_and(|before| save(entity, hop, rpm.abs(), before, before));
+                }
+            }
+            _ => {}
+        }
+        let Some((line, index)) = line(game, pos, origin) else {
+            let managed = NETWORKS.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                cache
+                    .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
+                    .live
+                    .get(&pos)
+                    .is_some_and(|state| {
+                        state.line.is_some()
+                            && state
+                                .owner
+                                .is_some_and(|owner| owner.is_same_create_entity(entity.revision()))
+                    })
+            });
+            // An unsupported or unloaded path has no authority to drain
+            // storage. End visual flow only on a connection we managed.
+            controls(game, pos, entity.revision(), None, [0.0; 2], 0);
+            return managed && clear_connections(entity, true);
         };
-        let is_source = line.devices.first() == Some(&pos);
-        let valve_closed_here = line.valve == Some((pos, false));
-        let input = if pressure == 0.0 || valve_closed_here {
-            None
-        } else if is_source {
-            tank::sample(game, line.source)
-        } else {
-            other_faces(game, relative(pos, front.opposite(), 1), front)
-                .and_then(|faces| faces.outlet?.complete())
+        let hop = line.devices[index];
+        if !hop.matches(origin) {
+            return false;
+        }
+        if line.overlap {
+            return tick_overlap(game, entity, &line, index, rpm);
+        }
+        let Some(before) = faces(entity, hop) else {
+            return false;
         };
-        let source_flow = is_source
-            && input.is_some_and(|fluid| before.inlet.is_some_and(|inlet| inlet.fluid == fluid));
+        let pressure = pump_speed(game, hop.pump, pos, rpm) / hop.divisor as f32
+            + hop.other.map_or(0.0, |other| {
+                pump_speed(game, other.pump, pos, rpm) / other.divisor as f32
+            });
+        let valve_closed_here = origin.name == VALVE && !enabled(origin);
+        let mut inputs = [None; 6];
+        let mut sources = [None; 6];
+        let mut source_flow = 0;
+        if pressure > 0.0 && !valve_closed_here {
+            for side in hop.inlets() {
+                let i = side as usize;
+                let source = line.source(pos, side);
+                sources[i] = source;
+                inputs[i] = match source {
+                    Some(end) => Endpoint::at(game, end, (pos, entity))
+                        .and_then(|mut endpoint| endpoint.sample()),
+                    None => device_at(game, relative(pos, side, 1)).and_then(|entity| {
+                        face(entity, side.opposite(), false)?.and_then(flow::Flow::complete)
+                    }),
+                };
+                if source.is_some()
+                    && inputs[i]
+                        .is_some_and(|fluid| before[i].is_some_and(|inlet| inlet.fluid == fluid))
+                {
+                    source_flow |= bit(side);
+                }
+            }
+        }
         let (phase, ready) = controls(
             game,
             pos,
             entity.revision(),
-            Some(&line),
-            pressure,
+            Some((&line, hop)),
+            [pressure, 0.0],
             source_flow,
         );
-        if phase == 2 {
-            return false;
+        let mut changed = maintain_open(pos, entity, &line, phase, pressure > 0.0);
+        if phase != 0 {
+            // Pressure is visible while the network waits to advance flow.
+            return save(entity, hop, pressure, before, before) || changed;
         }
-        if phase == 1 {
-            return save(entity, front, pressure, before, before);
+        let internal = match internal_fluid(hop, before) {
+            Ok(fluid) => fluid,
+            Err((first, other)) if pressure > 0.0 => {
+                react_to_flow_collision(game, &line, pos, entity, first, other);
+                return changed;
+            }
+            Err(_) => None,
+        };
+        if ready != 0 {
+            for side in hop.inlets().filter(|&side| ready & bit(side) != 0) {
+                let i = side as usize;
+                let (Some(source), Some(fluid)) = (sources[i], inputs[i]) else {
+                    continue;
+                };
+                let destinations = ready_targets(game, &line, index, side, before, fluid);
+                let (transferred, refresh) = transfer(
+                    game,
+                    pos,
+                    entity,
+                    source,
+                    &destinations,
+                    fluid,
+                    flow::transfer_rate(pressure),
+                );
+                changed |= transferred;
+                if refresh {
+                    // Keep existing flow through both pressure rebuild phases.
+                    let surfaces = source_surfaces(game, &line.open_sources);
+                    *line.source_surfaces.borrow_mut() = surfaces.clone();
+                    NETWORKS.with(|cache| {
+                        let mut cache = cache.borrow_mut();
+                        let live = &mut cache
+                            .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
+                            .live;
+                        for hop in &line.devices {
+                            if let Some(state) = live.get_mut(&hop.pos) {
+                                state.phase = PRESSURE_REBUILD_TICKS;
+                                state.source_ticks = [0; 6];
+                                state.source_surfaces = surfaces.clone();
+                                state.refresh_surface = false;
+                            }
+                        }
+                    });
+                    break;
+                }
+            }
         }
-        if ready
-            && let Some(fluid) = input
-            && line.valve.is_none_or(|(at, open)| {
-                open && state(game, at).is_some_and(|s| s.name == VALVE && dry(s))
-            })
-            && before.complete(fluid)
-            && line.devices.iter().skip(1).all(|&device| {
-                state(game, device).is_some_and(|s| {
-                    if device == line.pump {
-                        front_of_pump(s) == Some(line.front)
-                    } else {
-                        matches!(s.name.as_str(), PIPE | VALVE) && device_axis(s) == Some(axis)
-                    }
-                }) && other_faces(game, device, front).is_some_and(|pair| pair.complete(fluid))
-            })
-        {
-            tank::transfer_pair(
-                game,
-                line.source,
-                line.target,
-                fluid,
-                flow::transfer_rate(pressure),
-            );
-        }
-        let mut after = before;
+        let mut after = [None; 6];
         if pressure > 0.0 {
-            after.tick(input, pressure);
-        } else {
-            after = flow::Faces::default();
+            for side in hop.inlets() {
+                let i = side as usize;
+                after[i] = flow::advance_face(before[i], inputs[i], pressure);
+            }
+            for side in hop.outlets() {
+                after[side as usize] =
+                    flow::advance_face(before[side as usize], internal, pressure);
+            }
         }
-        trace(game, pos, &line, pressure, after, is_source);
-        before != after && save(entity, front, pressure, before, after)
+        trace(game, hop, &line, pressure, after, entity);
+        let resumed_pipe = matches!(
+            recovery,
+            Some(CollisionRecovery::Split {
+                role: SplitRole::Pipe,
+                ..
+            })
+        );
+        changed | ((before != after || resumed_pipe) && save(entity, hop, pressure, before, after))
     }
 
     fn trace(
         game: &Game<'_>,
-        pos: Pos,
+        hop: Hop,
         line: &Line,
         pressure: f32,
-        faces: flow::Faces,
-        source: bool,
+        faces: FaceFlows,
+        entity: &ModBlockEntity,
     ) {
         if !trace_enabled() {
             return;
         }
         let flow = |face: Option<flow::Flow>| face.map(|f| (f.fluid.id(), f.progress));
+        let inlet = hop.inlets().next().and_then(|side| faces[side as usize]);
+        let outlet = hop.outlets().next().and_then(|side| faces[side as usize]);
+        let source = hop
+            .inlets()
+            .any(|side| line.source(hop.pos, side).is_some());
         log::info!(
             "Create fluid pump: {}",
             serde_json::json!({
-                "time": game.world.game_time, "pos": pos, "pressure": pressure, "front": line.front.name(),
-                "inlet": flow(faces.inlet), "outlet": flow(faces.outlet),
-                "storage": source.then(|| [tank::amount(game, line.source), tank::amount(game, line.target)]),
+                "time": game.world.game_time, "pos": hop.pos, "pressure": pressure, "front": line.front.name(),
+                "inlet": flow(inlet), "outlet": flow(outlet),
+                "storage": source.then(|| line.sources.iter().copied().chain(line.targets.iter().map(|target| target.end))
+                    .map(|end| Endpoint::at(game, end, (hop.pos, entity)).map(|endpoint| endpoint.amount())).collect::<Vec<_>>()),
             })
         );
     }
@@ -2229,9 +4118,7 @@ pub(super) mod pump {
     }
 
     fn front_of_pump(state: &BlockState) -> Option<Direction> {
-        (state.name == PUMP && dry(state))
-            .then(|| front(state))
-            .flatten()
+        (state.name == PUMP).then(|| front(state)).flatten()
     }
 
     pub(in crate::game) fn reacts(game: &Game<'_>, pos: Pos) -> bool {
@@ -2248,7 +4135,7 @@ pub(super) mod pump {
         if !reacts(game, pos) {
             return false;
         }
-        if let Some(front) = state(game, pos).and_then(front_of_pump)
+        if let Some(front) = state(game, pos).and_then(front)
             && game.native_set_block_property(pos, "facing", front.opposite().name())
         {
             crate::game::create_port_sounds::cog_wrench(game, pos);
@@ -2256,18 +4143,77 @@ pub(super) mod pump {
         true
     }
 
-    pub(in crate::game) fn placement(
+    fn pipe_shape(
         game: &GameLevel<'_>,
-        mut state: BlockStateId,
-        ctx: &PlacementContext,
-        block: &str,
+        mut id: BlockStateId,
+        pos: Pos,
+        preferred: Direction,
+        ignore: Option<Direction>,
     ) -> Option<BlockStateId> {
-        let pos = [ctx.pos.x, ctx.pos.y, ctx.pos.z];
-        let target = game.native_state_block(game.world.block(pos[0], pos[1], pos[2]))?;
-        if matches!(target, "minecraft:water" | "minecraft:lava") {
+        let before = game.registry.state(id)?;
+        let joined = Direction::ALL.map(|side| {
+            let [x, y, z] = relative(pos, side, 1);
+            if ignore == Some(side) || !game.world.loaded(x, z) {
+                return pipe_open(before, side);
+            }
+            game.registry
+                .state(game.world.block(x, y, z))
+                .is_some_and(|state| connects(state, side))
+        });
+        if !joined.contains(&true)
+            && Direction::ALL
+                .iter()
+                .filter(|&&side| pipe_open(before, side))
+                .count()
+                == 2
+        {
+            return Some(id);
+        }
+        let ports = flow::placed_ports(joined, preferred);
+        for (side, open) in Direction::ALL.into_iter().zip(ports) {
+            id = game.native_state_with_property(
+                id,
+                side.name(),
+                if open { "true" } else { "false" },
+            )?;
+        }
+        Some(id)
+    }
+
+    pub(in crate::game) fn update_shape(
+        game: &GameLevel<'_>,
+        ticks: &mut horizon_world::level::Ticks,
+        pos: Pos,
+        id: BlockStateId,
+        side: Direction,
+    ) -> Option<BlockStateId> {
+        if game.native_state_block(id) != Some(PIPE) {
             return None;
         }
+        if game.facts.get(id).waterlogged {
+            game.native_schedule_fluid_tick(ticks, pos, "minecraft:water", 5);
+        }
+        pipe_shape(game, id, pos, side, Some(side.opposite()))
+    }
+
+    pub(in crate::game) fn placement(
+        game: &GameLevel<'_>,
+        state: BlockStateId,
+        ctx: &PlacementContext,
+        block: &str,
+        fluid: horizon_world::fluid::FluidState,
+    ) -> Option<BlockStateId> {
+        let pos = [ctx.pos.x, ctx.pos.y, ctx.pos.z];
+        let wet = fluid == horizon_world::fluid::FluidState::WATER;
+        let state = game.native_state_with_property(
+            state,
+            "waterlogged",
+            if wet { "true" } else { "false" },
+        )?;
         let look = crate::game::create_port::nearest(ctx.yaw, ctx.pitch);
+        if block == PIPE {
+            return pipe_shape(game, state, pos, look, None);
+        }
         if block == VALVE {
             use create_engine::kinetics::Axis;
             let facing = if ctx.sneaking { look } else { look.opposite() };
@@ -2277,7 +4223,7 @@ pub(super) mod pump {
                 let at = relative(pos, side, 1);
                 game.registry
                     .state(game.world.block(at[0], at[1], at[2]))
-                    .is_some_and(|s| s.name == tank::BLOCK || device_axis(s) == Some(side.axis()))
+                    .is_some_and(|s| connects(s, side))
             };
             let first = match facing.axis() {
                 axis @ (Axis::X | Axis::Z) => {
@@ -2317,7 +4263,7 @@ pub(super) mod pump {
                 else {
                     return false;
                 };
-                adjacent.name == tank::BLOCK || device_axis(adjacent) == Some(side.axis())
+                connects(adjacent, side)
             })
             .collect();
         if block == PUMP {
@@ -2345,17 +4291,6 @@ pub(super) mod pump {
                 .unwrap_or(base);
             return game.native_state_with_property(state, "facing", front.name());
         }
-        let axis = joined.first().map_or(look.axis(), |side| side.axis());
-        if joined.iter().any(|side| side.axis() != axis) {
-            return None;
-        }
-        for side in Direction::ALL {
-            state = game.native_state_with_property(
-                state,
-                side.name(),
-                if side.axis() == axis { "true" } else { "false" },
-            )?;
-        }
         Some(state)
     }
 
@@ -2368,10 +4303,11 @@ pub(super) mod pump {
         let Some(block) = state(game, pos) else {
             return;
         };
-        let Some(axis) = device_axis(block) else {
-            return;
-        };
-        if block.name == PUMP {
+        let axis = straight_axis(block);
+        if block.name == PUMP
+            && let Some(facing) = front(block)
+        {
+            let axis = facing.axis();
             let angle = create_engine::visual::angle(
                 draw.game_time as f64 + f64::from(draw.partial),
                 crate::game::create_port::number(&entity.nbt, "Speed"),
@@ -2379,14 +4315,13 @@ pub(super) mod pump {
             );
             draw.push();
             draw.rotate_about(create_engine::visual::positive_axis(axis), angle, [0.5; 3]);
-            crate::game::create_port::face_south(
-                draw,
-                [Direction::East, Direction::Up, Direction::South][axis.index()],
-            );
+            crate::game::create_port::face_south(draw, facing);
             game.native_draw_model(draw, "create:block/mechanical_pump/cog", 0xFFFFFF);
             draw.pop();
         }
-        if block.name == VALVE {
+        if block.name == VALVE
+            && let Some(axis) = axis
+        {
             let (Some(facing), Some(shaft)) = (front(block), valve_axis(block, true)) else {
                 return;
             };
@@ -2400,17 +4335,11 @@ pub(super) mod pump {
             draw.rotate_about([0.0, 1.0, 0.0], angle, [0.5; 3]);
             game.native_draw_model(draw, "create:block/shaft", 0xFFFFFF);
             draw.pop();
-            let angle = Pointer::read(&entity.nbt).unwrap_or_default().value * -90.0;
+            let angle = pointer_angle(game, pos, entity, draw.partial);
             let offset = if axis.index() == 1 || shaft.index() == 0 {
                 90.0
             } else {
                 0.0
-            };
-            let yaw = match facing {
-                Direction::North => 180.0,
-                Direction::East => 270.0,
-                Direction::West => 90.0,
-                _ => 0.0,
             };
             let pitch = match facing {
                 Direction::Up => 0.0,
@@ -2418,7 +4347,9 @@ pub(super) mod pump {
                 _ => 90.0,
             };
             draw.push();
-            draw.rotate_about([0.0, 1.0, 0.0], yaw, [0.5; 3]);
+            if !matches!(facing, Direction::Up | Direction::Down) {
+                crate::game::create_port::face_south(draw, facing);
+            }
             draw.rotate_about([1.0, 0.0, 0.0], pitch, [0.5; 3]);
             draw.rotate_about([0.0, 1.0, 0.0], offset + angle, [0.5; 3]);
             if game.native_draw_model(draw, "create:block/fluid_valve/pointer", 0xFFFFFF) {
@@ -2429,29 +4360,38 @@ pub(super) mod pump {
         if !crate::game::create_port::original_assets() {
             return;
         }
-        // Straight PipeAttachmentModel quads supply the tube beyond its core.
+        // PipeAttachmentModel quads supply the tube beyond its core.
         use create_assets::PipeAttachment::{Connection, Drain, Rim, RimConnector};
-        for side in Direction::ALL
-            .into_iter()
-            .filter(|side| side.axis() == axis)
-        {
+        let sides = Direction::ALL.into_iter().filter(|&side| {
+            if block.name == PIPE {
+                pipe_open(block, side)
+            } else {
+                axis == Some(side.axis())
+            }
+        });
+        for side in sides {
             let neighbor = state(game, relative(pos, side, 1));
             let models: &[create_assets::PipeAttachment] = if block.name == VALVE {
-                if neighbor.is_some_and(|state| state.name == tank::BLOCK) {
+                if neighbor.is_some_and(|state| is_endpoint(&state.name, side.opposite())) {
                     &[Drain]
                 } else {
                     &[]
                 }
-            } else if neighbor.is_some_and(|state| state.name == tank::BLOCK) {
+            } else if neighbor.is_some_and(|state| is_endpoint(&state.name, side.opposite())) {
                 &[RimConnector, Drain]
             } else if block.name == PUMP {
                 &[]
-            } else if let Some(state) = neighbor.filter(|state| device_axis(state) == Some(axis)) {
-                if state.name == PUMP {
-                    &[RimConnector]
-                } else {
+            } else if neighbor.is_some_and(|state| state.name == PIPE) {
+                if axis == Some(side.axis()) {
                     &[Connection]
+                } else {
+                    &[RimConnector]
                 }
+            } else if neighbor
+                .and_then(device_ports)
+                .is_some_and(|ports| ports.contains(&side.opposite()))
+            {
+                &[RimConnector]
             } else {
                 &[RimConnector, Rim]
             };
@@ -2461,6 +4401,19 @@ pub(super) mod pump {
                     trace_attachment(pos, model);
                 }
             }
+        }
+        if block.name == PIPE
+            && [Direction::East, Direction::Up, Direction::South]
+                .into_iter()
+                .any(|face| {
+                    Direction::ALL
+                        .into_iter()
+                        .filter(|&side| side.axis() != face.axis() && pipe_open(block, side))
+                        .count()
+                        > 2
+                })
+        {
+            game.native_draw_model(draw, create_assets::PIPE_CASING, 0xFFFFFF);
         }
     }
 }
@@ -2477,14 +4430,23 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
         .block_entities
         .iter()
         .filter_map(|(&(x, y, z), e)| match e {
-            BlockEntity::Mod(e) if matches!(e.id.as_str(), ID | tank::BLOCK) => {
+            BlockEntity::Mod(e)
+                if matches!(
+                    e.id.as_str(),
+                    ID | tank::BLOCK | pump::PIPE | pump::PUMP | pump::VALVE
+                ) =>
+            {
                 Some(([x, y, z], e.as_ref()))
             }
             _ => None,
         })
         .collect();
     tank::client_tick(session, &dimension, time, &entries);
-    let entries = entries.into_iter().filter_map(|(pos, e)| (e.id == ID).then(|| (pos, e.revision())));
+    pump::client_tick(session, &dimension, time, &entries);
+    let rims = pump::rim_events(game, session, &dimension, time, &entries);
+    let entries = entries
+        .into_iter()
+        .filter_map(|(pos, e)| (e.id == ID).then(|| (pos, e.revision())));
     let entries: Vec<_> = entries.collect();
     let live: std::collections::BTreeSet<_> = entries.iter().map(|(pos, _)| *pos).collect();
     MOTION.with(|cache| {
@@ -2531,23 +4493,36 @@ pub(super) fn client_tick(game: &mut Game<'_>) {
             m.tick = Some(time);
         }
     });
+    for (pos, side, fluid, splash, jet) in rims {
+        use crate::game::create_port_particles as particles;
+        if let Some(inbound) = jet {
+            particles::fluid_jet(game, pos, side, fluid, inbound, splash);
+        } else {
+            particles::fluid_rim(game, pos, side, fluid, splash);
+        }
+    }
 }
-fn draw_fluids(
+fn rendered_fluids(
     game: &Game<'_>,
     pos: Pos,
     entity: &ModBlockEntity,
-    draw: &mut BlockEntityDraw,
-) -> f32 {
-    let rendered = MOTION.with(|cache| {
+    partial: f32,
+) -> [(Option<rules::Fluid<fluids::Key>>, f32); 4] {
+    MOTION.with(|cache| {
         let mut cache = cache.borrow_mut();
         let motion = cache
             .dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id())
-            .get(&pos);
+            .get(&pos)
+            .filter(|motion| {
+                motion
+                    .owner
+                    .is_some_and(|owner| owner.is_same_create_entity(entity.revision()))
+            });
         std::array::from_fn::<_, 4, _>(|i| {
             if let Some(m) = motion {
                 return (
                     m.rendered_fluids[i].clone(),
-                    m.fluid_levels[i].at(draw.partial) * rules::TANK_CAPACITY as f32,
+                    m.fluid_levels[i].at(partial) * rules::TANK_CAPACITY as f32,
                 );
             }
             let key = if i < 2 { "InputTanks" } else { "OutputTanks" };
@@ -2556,7 +4531,44 @@ fn draw_fluids(
                 .map_or(0.0, |l| l[i % 2].value * rules::TANK_CAPACITY as f32);
             (fluid, units)
         })
+    })
+}
+
+/// MechanicalMixerBlockEntity.renderParticles reads both client inventories and
+/// the rendered fluid at partial tick zero, in the source half/slot order.
+pub(super) fn mixer_particle_contents(
+    game: &Game<'_>,
+    pos: Pos,
+) -> Option<(Vec<ItemStack>, [Option<Fluid>; 4])> {
+    let BlockEntity::Mod(entity) = game.world.block_entities.get(&(pos[0], pos[1], pos[2]))? else {
+        return None;
+    };
+    if entity.id != ID || !crate::game::create_port::inventory_supported(entity) {
+        return None;
+    }
+    let items = entity
+        .items
+        .iter()
+        .take(18)
+        .flatten()
+        .filter(|stack| stack.count > 0)
+        .cloned()
+        .collect();
+    let fluids = rendered_fluids(game, pos, entity, 0.0).map(|(fluid, units)| {
+        fluid
+            .filter(|fluid| units >= 1.0 && fluid.key.components.is_empty())
+            .and_then(|fluid| Fluid::from_id(&fluid.key.id))
     });
+    Some((items, fluids))
+}
+
+fn draw_fluids(
+    game: &Game<'_>,
+    pos: Pos,
+    entity: &ModBlockEntity,
+    draw: &mut BlockEntityDraw,
+) -> f32 {
+    let rendered = rendered_fluids(game, pos, entity, draw.partial);
     let total: f32 = rendered.iter().map(|(_, units)| units).sum();
     if total < 1.0 {
         return 0.0;
@@ -2572,7 +4584,8 @@ fn draw_fluids(
             continue;
         }
         let next = x + (units / total).clamp(0.0, 1.0) * 12.0 / 16.0;
-        game.native_draw_fluid_box(
+        super::create_port_fluid_render::draw(
+            game,
             draw,
             &native_fluid(&fluid),
             [x, 2.0 / 16.0, 2.0 / 16.0, next, height, 14.0 / 16.0],

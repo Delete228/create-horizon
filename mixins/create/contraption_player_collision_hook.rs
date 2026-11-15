@@ -11,6 +11,9 @@ fn contraption_player_collision(game: &crate::game::Game<'_>, mut result: Vec<Aa
         excluded,
         standing,
         false,
+        |record| {
+            crate::game::create_port_contraption_contact::suppress_ordinary_collision(game, record)
+        },
     );
     result
 }

@@ -6,7 +6,10 @@ use std::cell::{Cell, OnceCell};
 
 use super::{Game, native_ticks::TickRound};
 use create_engine::{
-    contraption::{contact::ContactBox, rotary_contact::rotary_contact},
+    contraption::{
+        contact::ContactBox,
+        rotary_contact::{RotaryContact, rotary_contact},
+    },
     kinetics::Axis,
     source_trig::rotate,
 };
@@ -47,7 +50,10 @@ struct Carrier {
     shapes: OnceCell<Vec<ContactBox>>,
     bounds: Aabb,
     obstacles: OnceCell<Vec<Aabb>>,
+    has_slime: bool,
 }
+
+pub(super) const SLIME_BLOCK: &str = "minecraft:slime_block";
 
 impl Carrier {
     fn new(record: Record) -> Option<Self> {
@@ -58,11 +64,13 @@ impl Carrier {
         let mut radius_squared = 0.0_f64;
         let mut lower = f64::INFINITY;
         let mut upper = f64::NEG_INFINITY;
-        for (local, _) in record.blocks.iter() {
+        let mut has_slime = false;
+        for (local, state) in record.blocks.iter() {
             let [x, y, z] = local.map(f64::from);
             radius_squared = radius_squared.max(x * x + z * z);
             lower = lower.min(y);
             upper = upper.max(y + 1.0);
+            has_slime |= state.name == SLIME_BLOCK;
         }
         // Include the corner of each cube and the source collider's broad-phase slack.
         let radius = radius_squared.sqrt() + 2.0;
@@ -83,6 +91,7 @@ impl Carrier {
             shapes: OnceCell::new(),
             bounds,
             obstacles: OnceCell::new(),
+            has_slime,
         })
     }
 
@@ -97,12 +106,24 @@ impl Carrier {
     }
 }
 
+struct Contact {
+    position: Vec3,
+    velocity: Vec3,
+    surface: bool,
+    bounced: bool,
+}
+
 pub(super) fn tick_items(
     game: &mut Game<'_>,
     round: &mut TickRound,
     original: impl FnOnce(&mut Game<'_>, &mut TickRound),
 ) {
     if game.native_authoritative() && game.world.attachments.has(&ACTIVE) {
+        if game.level_pass.running == Some(true) {
+            // This runs after scheduled block work and before the block
+            // entity list, even when the world has no dropped items.
+            super::create_port_portable_storage::tick_piston_docks(game);
+        }
         // Create resolves these contacts after the whole level tick. Coarse
         // rotor boxes in the ordinary item move would bounce it prematurely.
         with_collision_filter((None, true), || original(game, round));
@@ -145,21 +166,82 @@ pub(super) fn tick_post(game: &mut Game<'_>) {
             item.velocity.z.abs(),
         );
         let bounds = item.bounds().inflate(reach);
-        if let Some((position, velocity, surface)) = carriers
+        if let Some(result) = carriers
             .iter()
             .filter(|carrier| carrier.bounds.intersects(bounds))
             .find_map(|carrier| contact(game, item, carrier))
         {
             let item = &mut game.dropped[index];
-            item.needs_sync |= item.position != position || item.velocity != velocity;
-            item.position = position;
-            item.velocity = velocity;
-            item.on_ground |= surface;
+            item.needs_sync |= item.position != result.position || item.velocity != result.velocity;
+            item.position = result.position;
+            item.velocity = result.velocity;
+            item.on_ground |= result.surface;
+            if result.bounced {
+                game.with_level(|_, level, _| {
+                    level.native_play_sound(
+                        "minecraft:block.slime_block.fall",
+                        result.position.components(),
+                        4,
+                        0.5,
+                        1.0,
+                    );
+                });
+            }
         }
     }
 }
 
-fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<(Vec3, Vec3, bool)> {
+fn vector([x, y, z]: [f64; 3]) -> Vec3 {
+    Vec3::new(x, y, z)
+}
+
+fn pivot(record: &Record) -> Vec3 {
+    vector(record.anchor.map(|p| f64::from(p) + 0.5))
+}
+
+fn contact_point_motion(record: &Record, position: Vec3) -> Vec3 {
+    let relative = position.subtract(pivot(record));
+    let local = rotate(relative.components(), -record.previous_angle, Axis::Y);
+    vector(rotate(local, record.angle, Axis::Y)).subtract(relative)
+}
+
+pub(super) fn upright_slime_bounce(
+    record: &Record,
+    position: Vec3,
+    bounds: Aabb,
+    velocity: Vec3,
+    response: RotaryContact,
+) -> Option<Vec3> {
+    if (response.separation == [0.0; 3] && response.impact_fraction == 1.0)
+        || response.normal == [0.0; 3]
+        || response.location == [0.0; 3]
+    {
+        return None;
+    }
+    let mut hit = position
+        .add_vector(bounds.center())
+        .scale(0.5)
+        .add_vector(vector(response.location));
+    if response.impact_fraction != 1.0 {
+        hit.y += velocity.y * response.impact_fraction;
+    }
+    let offset = hit.subtract(pivot(record));
+    let local = rotate(offset.components(), -record.previous_angle, Axis::Y)
+        .map(|coordinate| (coordinate + 0.5).floor() as i32);
+    if !record
+        .blocks
+        .iter()
+        .any(|(pos, state)| *pos == local && state.name == SLIME_BLOCK)
+    {
+        return None;
+    }
+    let normal = vector(response.normal);
+    let incoming = velocity.subtract(contact_point_motion(record, position));
+    let delta = normal.scale(0.8 * 2.0 * incoming.dot(normal));
+    (delta.length_squared() >= f64::from(0.1_f32)).then(|| velocity.subtract(delta))
+}
+
+fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<Contact> {
     let bounds = item.bounds();
     let body = ContactBox {
         min: bounds.min_position().components(),
@@ -175,9 +257,23 @@ fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<(Vec
         carrier.shapes().iter().copied(),
         0.0,
     );
-    if (!response.surface && response.separation == [0.0; 3])
+    if (!response.surface && response.separation == [0.0; 3] && response.impact_fraction == 1.0)
         || item.inside_block(&game.world, game.collision)
     {
+        return None;
+    }
+    if carrier.has_slime
+        && let Some(velocity) =
+            upright_slime_bounce(record, item.position, bounds, item.velocity, response)
+    {
+        return Some(Contact {
+            position: item.position,
+            velocity,
+            surface: false,
+            bounced: true,
+        });
+    }
+    if !response.surface && response.separation == [0.0; 3] {
         return None;
     }
     let entities = carrier.obstacles.get_or_init(|| {
@@ -205,7 +301,6 @@ fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<(Vec
         },
         false,
     );
-    let vector = |[x, y, z]: [f64; 3]| Vec3::new(x, y, z);
     let wanted = vector(response.separation);
     let allowed = world
         .resolve_with_context(bounds, wanted, 0.0, false, context)
@@ -220,11 +315,7 @@ fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<(Vec
         }
     }
     if response.surface {
-        let origin = vector(record.anchor.map(|p| f64::from(p) + 0.5));
-        let relative = position.add_vector(origin.scale(-1.0)).components();
-        let previous = rotate(relative, -record.previous_angle, Axis::Y);
-        let current = rotate(previous, record.angle, Axis::Y);
-        let transfer = Vec3::new(current[0] - relative[0], 0.0, current[2] - relative[2]);
+        let transfer = contact_point_motion(record, position);
         let allowed = world
             .resolve_with_context(bounds.move_by(allowed), transfer, 0.0, false, context)
             .ok()?;
@@ -232,5 +323,10 @@ fn contact(game: &Game<'_>, item: &ItemEntity, carrier: &Carrier) -> Option<(Vec
         velocity[0] *= 0.5;
         velocity[2] *= 0.5;
     }
-    Some((position, vector(velocity), response.surface))
+    Some(Contact {
+        position,
+        velocity: vector(velocity),
+        surface: response.surface,
+        bounced: false,
+    })
 }

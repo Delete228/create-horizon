@@ -135,12 +135,18 @@ def run(session, report):
         cmd('item replace entity @s weapon.mainhand with create:wrench')
         call('wait', 6)
         report['reopened_after_restart'] = board(LINEAR, title, 5)
-        call('key', 'escape', 'tap')
-        call('release')
-        call('wait', 8)
+        choose(report['reopened_after_restart'], 12)
+        assert_values([13, 5, 8, 1, 8])
+        report['edit_after_restart'] = value(LINEAR)
         aim(MOTOR)
         report['motor'] = motor_checks(call, session.graphics, session.log, session.scratch, MOTOR)
+        call('save')
+        session.restart()
+        wait_loaded(call, [LINEAR, MOTOR])
+        assert value(MOTOR) == report['motor']['speed']
+        assert_values([13, 5, 8, 1, 8])
         report['persisted'] = [5, 5, 8, 1, 8]
+        report['persisted_after_edit'] = [13, 5, 8, 1, 8]
 
 
 def main():

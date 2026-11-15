@@ -1,8 +1,8 @@
 // Copyright (c) The Create Team / The Creators of Create
 // Copyright (c) 2026 create-horizon contributors
 // SPDX-License-Identifier: MIT
-// BeltPressingCallbacks adapter, pinned Create6.0.10. Ordinary pressing recipes
-// and default bulkPressing=false; no sequenced-assembly or basin compression.
+// BeltPressingCallbacks adapter, pinned Create6.0.10, for ordinary pressing
+// recipes and the source bulkPressing option.
 use super::{Game, create_port as port, create_port_belt as belt};
 use crate::{containers::BlockEntity, items::ItemStack};
 use create_engine::{
@@ -43,7 +43,7 @@ fn state(game: &Game<'_>, pos: Pos) -> Option<BeltPressState> {
         running: port::integer(&entity.nbt, "Running") != 0,
         ticks: port::integer(&entity.nbt, "Ticks"),
         rpm: port::running_speed(game, &entity.nbt),
-        bulk: false,
+        bulk: super::create_port_server_config::bulk_pressing(),
     })
 }
 pub(super) fn received(
@@ -78,6 +78,7 @@ pub(super) fn received(
 struct Context<'a, 'b> {
     game: &'a mut Game<'b>,
     pos: Pos,
+    bulk: bool,
 }
 impl BeltPressContext<ItemStack> for Context<'_, '_> {
     fn clear_particles(&mut self) {
@@ -88,14 +89,19 @@ impl BeltPressContext<ItemStack> for Context<'_, '_> {
     }
     fn process(&mut self, input: &Transported<ItemStack>) -> Option<Vec<Stack<ItemStack>>> {
         let original = belt::game_stack(&input.stack);
-        let output = port::result(self.game, &original)?;
+        let outputs = port::press_outputs(self.game, &original, self.bulk)?;
         self.game.native_with_mod_block_entity(self.pos, |entity| {
             entity.set_client_update_fields(Compound::from([(
                 "ParticleItems".into(),
                 Tag::List(vec![horizon_items::item_nbt::item_to_nbt(&original)]),
             )]));
         });
-        Some(vec![belt::core_stack(self.game, output)])
+        Some(
+            outputs
+                .into_iter()
+                .map(|stack| belt::core_stack(self.game, stack))
+                .collect(),
+        )
     }
     fn upright(&mut self, stack: &Stack<ItemStack>) -> bool {
         belt::upright(self.game, &stack.payload)
@@ -115,7 +121,15 @@ pub(super) fn held(
     let Some(state) = state(game, pos) else {
         return ProcessingResult::Pass.into();
     };
-    let output = pressing::belt_held(item, state, &mut Context { game, pos });
+    let output = pressing::belt_held(
+        item,
+        state,
+        &mut Context {
+            game,
+            pos,
+            bulk: state.bulk,
+        },
+    );
     if output.send_data {
         game.native_block_entity_sync(pos);
     }

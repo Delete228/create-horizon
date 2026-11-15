@@ -38,7 +38,7 @@ def main():
     cases += [f'T {rpm} {timer} {count} {valid} {duration} {output} {ticks} {remove}'
               for rpm, timer, count, valid, duration, output, ticks, remove in itertools.product(
                   [0, .5, -16, 64, 256, 8192], [0, 1, -15, 100], [0, 1, 4], [0, 1],
-                  [0, 1, 200], [0, 63, 64], [1, 12, 205], [-1, 1])]
+                  [0, 1, 200], [0, 63, 64, 98, 99], [1, 12, 205], [-1, 1])]
     cases += [f'R {seed} {count} {chance}' for seed, count, chance in itertools.product(
         [0, 1, 17, 123456789, 281474976710655], [0, 1, 2, 9, 64, 99], [0, .01, .25, .5, .75, .99, 1, 2])]
     inputs = '\n'.join(cases) + '\n'

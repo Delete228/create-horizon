@@ -907,6 +907,10 @@ def foundation():
         item_decl={"template":"minecraft:iron_ingot","max_stack_size":1 if item in ['wrench','goggles','super_glue', *SANDPAPERS] else 64}
         if item == 'raw_zinc':
             item_decl['template'] = 'minecraft:raw_iron'
+        if item == 'bar_of_chocolate':
+            item_decl['template'] = 'minecraft:cookie'
+            # Create 6.0.10 calculates saturation as 6 * 0.3F * 2.
+            item_decl['components'] = {'minecraft:food': {'nutrition': 6, 'saturation': 3.6000001430511475}}
         if item=='goggles':item_decl['components']={'minecraft:equippable':{'slot':'head','equip_sound':'minecraft:item.armor.equip_generic','dispensable':True,'swappable':True,'damage_on_hurt':False}}
         if item == 'super_glue':
             item_decl['components'] = {'minecraft:max_damage': 99, 'minecraft:damage': 0}
@@ -979,7 +983,8 @@ def foundation():
         return value
     for folder, retained in [(CONTENT / "data/create/recipe", reference["recipes"]),
                              (CONTENT / "data/create/tags", reference["tags"]),
-                             (CONTENT / "data/c/tags/item", reference["tags"])]:
+                             (CONTENT / "data/c/tags/item", reference["tags"]),
+                             (CONTENT / "data/c/tags/fluid", reference["tags"])]:
         for path in folder.rglob("*.json"):
             if path.relative_to(CONTENT / "data").as_posix() not in retained: path.unlink()
     for path, value in reference["recipes"].items(): write("data/" + path, current(value))
@@ -1019,7 +1024,8 @@ def foundation():
                         'crushed_raw_zinc': 'Crushed Raw Zinc',
                         'copper_nugget': 'Copper Nugget',
                         'powdered_obsidian': 'Powdered Obsidian',
-                        'experience_nugget': 'Nugget of Experience'})
+                        'experience_nugget': 'Nugget of Experience',
+                        'bar_of_chocolate': 'Bar of Chocolate'})
     extra_blocks.update({'basin': 'Basin', 'mechanical_mixer': 'Mechanical Mixer'})
     extra_blocks.update({'blaze_burner': 'Blaze Burner', 'lit_blaze_burner': 'Lit Blaze Burner'})
     extra_blocks['encased_chain_drive'] = 'Encased Chain Drive'
@@ -1081,7 +1087,16 @@ def foundation():
         lang=json.loads(path.read_text())
         lang.update({"block.create."+k:v for k,v in extra_blocks.items()})
         lang.update({"item.create."+k:v for k,v in extra_items.items()})
+        lang.update({'fluid.create.honey': 'Мёд' if locale == 'ru_ru' else 'Honey',
+                     'fluid.create.chocolate': 'Шоколад' if locale == 'ru_ru' else 'Chocolate'})
         lang["itemGroup.create.palettes"] = "Create's Building Blocks"
+        lang.update({
+            "create.gui.goggles.fluid_container": "Fluid Container Info:" if locale == "en_us"
+            else "Содержимое резервуара:",
+            "create.gui.goggles.fluid_container.capacity": "Capacity: " if locale == "en_us"
+            else "Вместимость: ",
+            "create.generic.unit.millibuckets": "mB" if locale == "en_us" else "мБ",
+        })
         lang['create.contraptions.moving_container'] = (
             'Moving %1$s' if locale == 'en_us' else '%1$s на штуковине')
         filter_labels = {
@@ -1129,6 +1144,7 @@ def foundation():
         lang.update({'create.contraptions.chassis.' + key: values[locale == 'ru_ru']
                      for key, values in chassis_labels.items()})
         if locale == "ru_ru":
+            lang['item.create.bar_of_chocolate'] = 'Шоколадная плитка'
             lang.update({'block.create.linear_chassis': 'Линейное шасси',
                          'block.create.secondary_linear_chassis': 'Вторичное линейное шасси',
                          'block.create.radial_chassis': 'Радиальное шасси'})

@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT
 // Canonical SmartFluidTankBehaviour tank saves, verified against the authored
 // Java 6.0.10 Basin fixture. Unknown state is unsupported, never an empty tank.
-use create_engine::basin::{Fluid, FluidLevel, TANK_CAPACITY};
+use create_engine::{
+    basin::{Fluid, FluidLevel, TANK_CAPACITY},
+    fluid_transport::Fluid as Kind,
+};
 use horizon_world::nbt::{Compound, Tag};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,10 +79,12 @@ pub(super) fn read_content(
     if !fields(content, &["Fluid"]) {
         return Err(Unsupported("unknown basin tank content fields"));
     }
-    let fluid = compound(
-        content.get(&"Fluid".into()),
-        "noncanonical nested basin fluid",
-    )?;
+    read_stack(content.get(&"Fluid".into()), capacity).map(Some)
+}
+
+/// NeoForge FluidStack's own save payload, also used by Basin FluidOverflow.
+pub(super) fn read_stack(tag: Option<&Tag>, capacity: u32) -> Result<Fluid<Key>, Unsupported> {
+    let fluid = compound(tag, "noncanonical nested basin fluid")?;
     if !fields(fluid, &["id", "amount", "components"]) {
         return Err(Unsupported("unknown basin fluid fields"));
     }
@@ -87,7 +92,7 @@ pub(super) fn read_content(
         return Err(Unsupported("missing basin fluid id"));
     };
     let id = id.to_string_lossy();
-    if !matches!(id.as_str(), "minecraft:water" | "minecraft:lava") {
+    if Kind::from_id(&id).is_none() {
         return Err(Unsupported("unsupported basin fluid id"));
     }
     let Some(Tag::Int(amount)) = fluid.get(&"amount".into()) else {
@@ -103,34 +108,37 @@ pub(super) fn read_content(
         Some(Tag::Compound(value)) => value.clone(),
         _ => return Err(Unsupported("noncanonical basin fluid components")),
     };
-    Ok(Some(Fluid {
+    Ok(Fluid {
         key: Key { id, components },
         amount: *amount as u32,
-    }))
+    })
 }
 
 pub(super) fn write_content(fluid: Option<&Fluid<Key>>, capacity: u32) -> Result<Tag, Unsupported> {
     let mut content = Compound::new();
     if let Some(fluid) = fluid {
-        if fluid.amount == 0
-            || fluid.amount > capacity
-            || !matches!(fluid.key.id.as_str(), "minecraft:water" | "minecraft:lava")
-        {
-            return Err(Unsupported("unsupported replacement basin fluid"));
-        }
-        let mut payload = Compound::from([
-            ("id".into(), Tag::String(fluid.key.id.as_str().into())),
-            ("amount".into(), Tag::Int(fluid.amount as i32)),
-        ]);
-        if !fluid.key.components.is_empty() {
-            payload.insert(
-                "components".into(),
-                Tag::Compound(fluid.key.components.clone()),
-            );
-        }
-        content.insert("Fluid".into(), Tag::Compound(payload));
+        content.insert("Fluid".into(), write_stack(fluid, capacity)?);
     }
     Ok(Tag::Compound(content))
+}
+
+pub(super) fn write_stack(fluid: &Fluid<Key>, capacity: u32) -> Result<Tag, Unsupported> {
+    if fluid.amount == 0 || fluid.amount > capacity || Kind::from_id(&fluid.key.id).is_none() {
+        return Err(Unsupported("unsupported replacement basin fluid"));
+    }
+    let amount = i32::try_from(fluid.amount)
+        .map_err(|_| Unsupported("basin fluid amount is out of range"))?;
+    let mut payload = Compound::from([
+        ("id".into(), Tag::String(fluid.key.id.as_str().into())),
+        ("amount".into(), Tag::Int(amount)),
+    ]);
+    if !fluid.key.components.is_empty() {
+        payload.insert(
+            "components".into(),
+            Tag::Compound(fluid.key.components.clone()),
+        );
+    }
+    Ok(Tag::Compound(payload))
 }
 pub(super) fn read_half(value: Option<&Tag>) -> Result<Tanks, Unsupported> {
     let Some(Tag::List(segments)) = value else {

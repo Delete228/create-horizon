@@ -6,6 +6,7 @@ fn create_visual_tick(game: &mut crate::game::Game<'_>) {
         // The server's vanilla item_slime packets use this sprite cache.
         game.ensure_item_particle_sprites();
         crate::game::create_port_sticker::client_tick(game);
+        crate::game::create_port_portable_storage::client_tick(game);
     }
     crate::game::create_port_burner_sync::tick(game);
     crate::game::create_port_nativeaudio::begin_tick(game);

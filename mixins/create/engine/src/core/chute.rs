@@ -2,10 +2,9 @@
 // Copyright (c) 2026 create-horizon contributors
 // SPDX-License-Identifier: MIT
 
-//! Dry vertical transit and the ordinary Chute's `ItemHelper.extract(UPTO)`.
+//! Chute transit and the ordinary Chute's `ItemHelper.extract(UPTO)`.
 
 pub const ENTRY: f32 = 1.0;
-const GRAVITY: f32 = -0.2;
 const WAIT: f32 = 0.5;
 const PULL_LIMIT: u32 = 16;
 
@@ -15,15 +14,40 @@ pub enum Step {
     Output,
 }
 
-pub fn step(position: f32, can_output: impl FnOnce() -> bool) -> Step {
-    let next = position + GRAVITY;
-    if next >= WAIT {
+pub fn motion(push: f32, pull: f32) -> f32 {
+    let fan = (push + pull) / 64.0;
+    (fan.clamp(-20.0, 20.0) + if fan <= 0.0 { -4.0 } else { 0.0 }) / 20.0
+}
+
+pub fn suction_range(speed: f32) -> f32 {
+    if speed >= 128.0 {
+        3.0
+    } else if speed >= 64.0 {
+        2.0
+    } else if speed >= 32.0 {
+        1.0
+    } else {
+        (speed / 32.0).max(0.0)
+    }
+}
+
+pub fn step(position: f32, motion: f32, can_output: impl FnOnce() -> bool) -> Step {
+    let next = position + motion;
+    if motion == 0.0 {
+        return Step::Position(next);
+    }
+    let (past_midpoint, past_end) = if motion > 0.0 {
+        (next > WAIT, next > 1.0)
+    } else {
+        (next < WAIT, next < 0.0)
+    };
+    if !past_midpoint {
         return Step::Position(next);
     }
     if !can_output() {
         return Step::Position(WAIT);
     }
-    if next < 0.0 {
+    if past_end {
         Step::Output
     } else {
         Step::Position(next)
@@ -72,16 +96,50 @@ mod tests {
     #[test]
     fn gravity_uses_the_java_f32_threshold_and_waits_at_the_midpoint() {
         let mut pos = ENTRY;
+        let gravity = motion(0.0, 0.0);
         for expected in [0.8, 0.6, 0.40000004, 0.20000003, 2.9802322e-8] {
-            assert_eq!(step(pos, || true), Step::Position(expected));
+            assert_eq!(step(pos, gravity, || true), Step::Position(expected));
             pos = expected;
         }
-        assert_eq!(step(pos, || true), Step::Output);
-        assert_eq!(step(0.6, || false), Step::Position(0.5));
-        assert_eq!(step(0.5, || false), Step::Position(0.5));
-        assert_eq!(step(0.5, || true), Step::Position(0.3));
-        assert_eq!(step(0.10000001, || true), Step::Output);
-        assert_eq!(step(0.8, || panic!("above midpoint")), Step::Position(0.6));
+        assert_eq!(step(pos, gravity, || true), Step::Output);
+        assert_eq!(step(0.6, gravity, || false), Step::Position(0.5));
+        assert_eq!(step(0.5, gravity, || false), Step::Position(0.5));
+        assert_eq!(step(0.5, gravity, || true), Step::Position(0.3));
+        assert_eq!(step(0.10000001, gravity, || true), Step::Output);
+        assert_eq!(
+            step(0.8, gravity, || panic!("above midpoint")),
+            Step::Position(0.6)
+        );
+    }
+
+    #[test]
+    fn a_fan_reverses_the_item_and_the_side_that_can_block_it() {
+        let upward = motion(128.0, 0.0);
+        assert_eq!(upward, 0.1);
+        assert_eq!(motion(-128.0, 0.0), -0.3);
+        assert_eq!(
+            step(0.4, upward, || panic!("at midpoint")),
+            Step::Position(0.5)
+        );
+        assert_eq!(step(0.5, upward, || false), Step::Position(0.5));
+        assert_eq!(step(0.9, upward, || true), Step::Position(1.0));
+        assert_eq!(step(1.0, upward, || true), Step::Output);
+    }
+
+    #[test]
+    fn lower_suction_uses_the_source_thresholds() {
+        for (speed, range) in [
+            (-128.0, 0.0),
+            (16.0, 0.5),
+            (32.0, 1.0),
+            (63.0, 1.0),
+            (64.0, 2.0),
+            (127.0, 2.0),
+            (128.0, 3.0),
+            (256.0, 3.0),
+        ] {
+            assert_eq!(suction_range(speed), range);
+        }
     }
 
     #[test]

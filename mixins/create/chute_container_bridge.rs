@@ -22,9 +22,10 @@ impl Game<'_> {
 
     /// ItemHandlerHelper.insertItemStacked tries occupied matching slots before
     /// empties. Use Horizon's ordinary container predicates and writes.
-    pub(in crate::game) fn chute_insert(
+    pub(in crate::game) fn insert_stacked_from_side(
         &mut self,
         pos: Pos,
+        face: Direction,
         stack: &ItemStack,
         simulate: bool,
     ) -> Option<u32> {
@@ -36,7 +37,7 @@ impl Game<'_> {
         let max = containers.max_stack(stack);
         let mut matching = Vec::new();
         let mut empty = Vec::new();
-        for slot in view.slots_to_add(Some(Direction::Up)) {
+        for slot in view.slots_to_add(Some(face)) {
             if !containers.can_place(&view, slot, stack) {
                 continue;
             }
@@ -62,8 +63,7 @@ impl Game<'_> {
                     count,
                     ..stack.clone()
                 };
-                let (rest, _) =
-                    self.move_in_item(None, &view, portion, slot, Some(Direction::Up));
+                let (rest, _) = self.move_in_item(None, &view, portion, slot, Some(face));
                 moved += count - rest.map_or(0, |stack| stack.count);
             }
         }

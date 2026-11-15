@@ -94,6 +94,13 @@ impl Layout {
     pub fn target_position(self, pos: Pos) -> Pos {
         offset(pos, self.target_direction())
     }
+
+    /// The front overlay shows arrows when two crafters point at each other.
+    /// RecipeGridHandler still sees a target in this layout.
+    pub fn shows_belt_to(self, target: Self) -> bool {
+        self.facing == target.facing
+            && self.target_direction() != target.target_direction().opposite()
+    }
 }
 
 fn offset(pos: Pos, direction: Direction) -> Pos {
@@ -327,6 +334,17 @@ pub fn countdown_speed(rpm: f32) -> i32 {
     (rpm.abs() as i32).clamp(4, 250)
 }
 
+/// MechanicalCrafterRenderer selects a horizontal tile from the same sprite.
+pub fn belt_u_offset(phase: Phase, rpm: f32, client_ticks: u64) -> Option<f32> {
+    if phase != Phase::Exporting {
+        return None;
+    }
+    // Catnip's AnimationTickHolder wraps every 24 hours and uses whole ticks here.
+    let ticks = (client_ticks % 1_728_000) as f32;
+    let texture_index = (countdown_speed(rpm) as f32 / 128.0 * ticks) as i32;
+    Some((texture_index % 4) as f32 / 4.0)
+}
+
 impl Cycle {
     pub fn begin(self, has_preceding: bool) -> Self {
         if has_preceding {
@@ -470,6 +488,70 @@ mod tests {
             Pointing::from_clicked_face(Direction::North, Direction::South),
             Pointing::Left
         );
+    }
+
+    #[test]
+    fn opposite_crafters_keep_the_recipe_target_but_show_arrows() {
+        for facing in [
+            Direction::South,
+            Direction::West,
+            Direction::North,
+            Direction::East,
+        ] {
+            let mut pointing = Pointing::Up;
+            for _ in 0..4 {
+                let source = Layout { facing, pointing };
+                let opposite = Layout {
+                    pointing: pointing.next().next(),
+                    ..source
+                };
+                let next = source.target_position([0; 3]);
+                assert_eq!(target([0; 3], source, &mut |_| Some(opposite)), Some(next));
+                assert!(!source.shows_belt_to(opposite));
+                assert!(source.shows_belt_to(source));
+                assert!(source.shows_belt_to(Layout {
+                    pointing: pointing.next(),
+                    ..source
+                }));
+                assert!(!source.shows_belt_to(Layout {
+                    facing: facing.opposite(),
+                    ..source
+                }));
+                pointing = pointing.next();
+            }
+        }
+    }
+
+    #[test]
+    fn belt_uv_selects_the_java_export_frame_on_whole_client_ticks() {
+        for phase in [
+            Phase::Idle,
+            Phase::Accepting,
+            Phase::Assembling,
+            Phase::Waiting,
+            Phase::Crafting,
+            Phase::Inserting,
+        ] {
+            assert_eq!(belt_u_offset(phase, 128.0, 3), None);
+        }
+        let export = Phase::Exporting;
+        assert_eq!(
+            [0, 1, 2, 3, 4, 5].map(|tick| belt_u_offset(export, 128.0, tick)),
+            [
+                Some(0.0),
+                Some(0.25),
+                Some(0.5),
+                Some(0.75),
+                Some(0.0),
+                Some(0.25)
+            ],
+        );
+        assert_eq!(belt_u_offset(export, 0.0, 3), Some(0.0));
+        assert_eq!(belt_u_offset(export, -32.0, 11), Some(0.5));
+        assert_eq!(belt_u_offset(export, 1.0, 31), Some(0.0));
+        assert_eq!(belt_u_offset(export, 1.0, 32), Some(0.25));
+        assert_eq!(belt_u_offset(export, 256.0, 4), Some(0.75));
+        assert_eq!(belt_u_offset(export, 128.0, 1_728_001), Some(0.25));
     }
 
     #[test]

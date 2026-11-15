@@ -46,6 +46,7 @@ def click(host, work, name, facing, item):
         call('mouse', 'right', 'down')
         call('wait', 2)
         call('mouse', 'right', 'up')
+        call('wait', 2)
         step(host, 1, CHUTE)
         return
     host.call('camera', {'position': feet, 'target': aim})
@@ -150,6 +151,32 @@ def open_outlet(host, work):
     return dict(waiting=waiting, loaded=loaded)
 
 
+def legacy_filter_amount(host, work, cold_restart=None):
+    setup(host)
+    cmd = host.command
+    cmd(f'data merge block {xyz(CHUTE)} {{Filter:{{id:"minecraft:snowball",count:1}},FilterAmount:0,UpTo:0b}}')
+    if cold_restart:
+        cold_restart()
+    [loaded] = step(host, 1, CHUTE)
+    assert number(loaded, 'FilterAmount') == 16 and number(loaded, 'UpTo') == 1, loaded
+
+    put(cmd, SOURCE, 'minecraft:air')
+    step(host, 1, CHUTE)
+    cmd('gamemode survival')
+    click(host, work, 'legacy-filter-replacement', 'south', FILTER)
+    replaced = block(host, CHUTE)
+    assert items(replaced['nbt'], 'Filter') == {STICK: 3}, replaced
+    assert number(replaced, 'FilterAmount') == 16 and number(replaced, 'UpTo') == 1, replaced
+
+    put(cmd, SOURCE, 'minecraft:chest')
+    cmd(f'item replace block {xyz(SOURCE)} container.1 with {CARGO} 24')
+    put(cmd, SIGNAL, 'minecraft:air')
+    [pulled, source] = step(host, 1, CHUTE, SOURCE)
+    cargo, remaining = items(pulled['nbt'], 'Item'), items(source['nbt'], 'Items')
+    assert cargo == {STICK: 16} and remaining == {STICK: 8}, (pulled, source)
+    return dict(amount=16, up_to=True, cargo=cargo, remaining=remaining)
+
+
 def run_java(host, work, report):
     assert json.loads((java.BASE / 'manifest.json').read_text())['create_sha256'] == java.CREATE_SHA256
     initial = host.call('state', {})
@@ -165,6 +192,7 @@ def run_java(host, work, report):
         filter_clicks(host, work)
         report.update(transport(host, work))
         report['open_outlet'] = open_outlet(host, work)
+        report['legacy_filter_amount'] = legacy_filter_amount(host, work)
     finally:
         host.command('gamemode creative')
         host.command('item replace entity @s weapon.mainhand with minecraft:air')
@@ -191,13 +219,14 @@ def run_native(session, reference, report):
         filter_clicks(host, session.scratch)
         observed = transport(host, session.scratch, cold_restart)
         observed['open_outlet'] = open_outlet(host, session.scratch)
+        observed['legacy_filter_amount'] = legacy_filter_amount(host, session.scratch, cold_restart)
         assert observed == {key: reference[key] for key in observed}, (observed, reference)
         report.update(observed, cold_restart=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('game', 'resources', 'ctl', 'reference'):
+    for name in ('game', 'resources', 'ctl', 'reference', 'create-jar'):
         parser.add_argument('--' + name, type=Path)
     args = parser.parse_args()
     report = {'passed': False, 'create': PINS['create_revision']}
@@ -207,7 +236,7 @@ def main():
             parser.error('Native checks require --game, --resources, --ctl and --reference')
         reference = json.loads(args.reference.read_text())
         assert reference['passed'] and reference['create'] == report['create'], reference
-        session = NativeCheckSession(args.game, args.resources, args.ctl, None,
+        session = NativeCheckSession(args.game, args.resources, args.ctl, args.create_jar,
                                      name='smart-chute-native', world='CreateSmartChute')
         work = session.scratch
         report.update(game=str(args.game.resolve()), reference=str(args.reference.resolve()))

@@ -329,13 +329,15 @@ pub(super) fn client_tick(
         distance,
         player.shift_key_down,
     );
-    game.native_push_player(std::array::from_fn(|i| (after[i] - before[i]) as f32));
-    if let Some(player) = game.player.as_ref() {
+    if let Some(player) = game.player.as_mut() {
+        // AirCurrent changes the velocity while the next movement step owns
+        // ground contact. A generic upward knockback clears contact early.
+        if after.iter().all(|component| component.is_finite()) {
+            player.velocity = Vec3::new(after[0], after[1], after[2]);
+        }
+        player.fall_distance = 0.0;
         let velocity = [player.velocity.x, player.velocity.y, player.velocity.z];
         super::create_port_nativeaudio::enable_fan(game, rpm, velocity);
-    }
-    if let Some(player) = game.player.as_mut() {
-        player.fall_distance = 0.0;
     }
 }
 

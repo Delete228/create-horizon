@@ -29,7 +29,10 @@ fn main() {
         let line = line.unwrap();
         let values: Vec<_> = line.split_whitespace().collect();
         match values[0] {
-            "M" => println!("{}", fan::max_distance(values[1].parse().unwrap())),
+            "M" => println!(
+                "{}",
+                fan::Config::DEFAULT.max_distance(values[1].parse().unwrap())
+            ),
             "V" => println!("{}", fan::propeller_speed(values[1].parse().unwrap())),
             "P" => {
                 let direction = [
@@ -58,9 +61,19 @@ fn main() {
                     let can_process = phase[2] == "1";
                     for _ in 0..phase[3].parse::<usize>().unwrap() {
                         let converted = if values[0] == "D" {
-                            processing.dropped(kind, count, can_process)
+                            processing.dropped(
+                                kind,
+                                count,
+                                can_process,
+                                fan::Config::DEFAULT.processing_time,
+                            )
                         } else {
-                            processing.transported(kind, count, can_process)
+                            processing.transported(
+                                kind,
+                                count,
+                                can_process,
+                                fan::Config::DEFAULT.processing_time,
+                            )
                         };
                         result.push_str(&format!(
                             "{}:{}:{} ",

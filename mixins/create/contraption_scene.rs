@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 use glam::{DQuat, DVec3};
-use horizon_core::geometry::{Aabb, Vec3};
+use horizon_core::geometry::{Aabb, Vec3, VoxelShape};
 use horizon_world::{
     attachments::{AttachmentCodec, AttachmentError, AttachmentSync, AttachmentType, Attachments},
-    block_collision::BlockCollisionRegistry,
+    block_collision::{BlockCollisionRegistry, DynamicCollisionWorld},
     chunk::BlockState,
     nbt::{Compound, Tag},
 };
@@ -13,18 +13,20 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicI64, Ordering},
     },
 };
 
 pub type Pos = [i32; 3];
 pub const MAX_BLOCKS: usize = 64;
-pub const MAX_PLAIN_ROTARY_BLOCKS: usize = 2048;
+pub const MAX_PACKED_BLOCKS: usize = 2048;
 pub const MAX_RECORDS: usize = 4;
 pub const KEY: &str = "moving_structures";
 pub const POSE_KEY: &str = "moving_structure_poses";
 pub const ACTOR_VISUAL_KEY: &str = "actor_visuals";
+// Keep the original key so parked empty tanks from older builds remain loadable.
+pub const TANK_STORAGE_KEY: &str = "mounted_empty_tanks";
 
 #[derive(Clone, Debug)]
 pub struct Record {
@@ -230,6 +232,57 @@ fn encode_geometry(scene: &SceneGeometry) -> Result<Compound, AttachmentError> {
     encode_records(&scene.records, scene.generation)
 }
 
+#[derive(Clone, Copy)]
+enum PackedLayout {
+    Rotary,
+    RopePulley(Stroke),
+    VerticalPiston(Stroke, i32),
+    Gantry(Stroke, usize),
+}
+
+impl PackedLayout {
+    fn new(
+        stroke: Option<Stroke>,
+        clock_hand: Option<ClockHand>,
+        axis: usize,
+        anchor: Pos,
+        controller: Pos,
+    ) -> Option<Self> {
+        if clock_hand.is_some() {
+            return None;
+        }
+        match stroke {
+            None => Some(Self::Rotary),
+            Some(stroke) => match stroke.kind {
+                StrokeKind::RopePulley if axis == 1 => Some(Self::RopePulley(stroke)),
+                StrokeKind::Piston if axis == 1 => {
+                    let sign @ (-1 | 1) = anchor[1].checked_sub(controller[1])? else {
+                        return None;
+                    };
+                    Some(Self::VerticalPiston(stroke, sign))
+                }
+                StrokeKind::Gantry => Some(Self::Gantry(stroke, axis)),
+                _ => None,
+            },
+        }
+    }
+
+    fn permits(self, state: &BlockState) -> bool {
+        plain_packed_state(state)
+            || matches!(self, Self::VerticalPiston(_, sign) if packed_piston_part(state, sign).is_some())
+            || matches!(self, Self::Gantry(_, axis) if packed_gantry_carriage(state, axis))
+    }
+
+    fn fits(self, controller: Pos, anchor: Pos, axis: usize, blocks: &[(Pos, BlockState)]) -> bool {
+        match self {
+            Self::Rotary => fits_rotary_column(controller, anchor, axis, blocks),
+            Self::RopePulley(stroke) => fits_packed_pulley(anchor, stroke, blocks),
+            Self::VerticalPiston(stroke, sign) => fits_packed_piston(anchor, stroke.limit, sign, blocks),
+            Self::Gantry(stroke, axis) => fits_packed_gantry(anchor, stroke.limit, axis, blocks),
+        }
+    }
+}
+
 fn encode_records(
     records: &[Record],
     generation: Option<i64>,
@@ -238,6 +291,7 @@ fn encode_records(
         return Err(AttachmentError::Encode);
     }
     let mut packed = false;
+    let mut version = if generation.is_some() { 2 } else { 1 };
     let entries = records
         .iter()
         .map(|record| {
@@ -263,16 +317,28 @@ fn encode_records(
                     .collect();
                 entry.insert("Blocks".into(), Tag::List(blocks));
             } else {
+                let layout = PackedLayout::new(
+                    record.stroke,
+                    record.clock_hand,
+                    record.axis,
+                    record.anchor,
+                    record.controller,
+                )
+                .ok_or(AttachmentError::Encode)?;
                 if generation.is_none()
-                    || record.stroke.is_some()
-                    || record.clock_hand.is_some()
-                    || record.blocks.len() > MAX_PLAIN_ROTARY_BLOCKS
+                    || record.blocks.len() > MAX_PACKED_BLOCKS
                     || record
                         .blocks
                         .iter()
-                        .any(|(_, state)| !plain_rotary_state(state))
+                        .any(|(_, state)| !layout.permits(state))
                 {
                     return Err(AttachmentError::Encode);
+                }
+                if !matches!(layout, PackedLayout::Rotary) {
+                    if !layout.fits(record.controller, record.anchor, record.axis, &record.blocks) {
+                        return Err(AttachmentError::Encode);
+                    }
+                    version = 3;
                 }
                 packed = true;
                 let mut indices = BTreeMap::new();
@@ -322,10 +388,7 @@ fn encode_records(
         })
         .collect::<Result<_, AttachmentError>>()?;
     let mut scene = Compound::from([
-        (
-            "Version".into(),
-            Tag::Int(if generation.is_some() { 2 } else { 1 }),
-        ),
+        ("Version".into(), Tag::Int(version)),
         ("Entries".into(), Tag::List(entries)),
     ]);
     if let Some(generation) = generation {
@@ -345,9 +408,9 @@ fn encode_records(
 
 fn decode_geometry(encoded: &Compound) -> Result<SceneGeometry, AttachmentError> {
     let invalid = AttachmentError::Decode;
-    let generation = match encoded.get(&"Version".into()) {
-        Some(Tag::Int(1)) => None,
-        Some(Tag::Int(2)) => Some(read_generation(encoded)?),
+    let (version, generation) = match encoded.get(&"Version".into()) {
+        Some(Tag::Int(1)) => (1, None),
+        Some(Tag::Int(version @ 2..=3)) => (*version, Some(read_generation(encoded)?)),
         _ => return Err(invalid),
     };
     let Some(Tag::List(entries)) = encoded.get(&"Entries".into()) else {
@@ -435,12 +498,16 @@ fn decode_geometry(encoded: &Compound) -> Result<SceneGeometry, AttachmentError>
             if clock_hand.is_some() && (stroke.is_some() || !return_home) {
                 return Err(invalid);
             }
-            let packed = generation.is_some() && stroke.is_none() && clock_hand.is_none();
+            let packed = if version >= 3 || (generation.is_some() && stroke.is_none()) {
+                PackedLayout::new(stroke, clock_hand, axis, anchor, controller)
+            } else {
+                None
+            };
             let blocks = decode_blocks(entry, packed, if stroke.is_some() { 81 } else { 15 })?;
             if !right_distance
                 || (blocks.is_empty() && !pulley)
                 || (blocks.len() > MAX_BLOCKS
-                    && !fits_rotary_column(controller, anchor, axis, &blocks))
+                    && packed.is_none_or(|layout| !layout.fits(controller, anchor, axis, &blocks)))
                 || (pulley
                     && (axis != 1
                         || anchor[1] >= controller[1]
@@ -452,18 +519,7 @@ fn decode_geometry(encoded: &Compound) -> Result<SceneGeometry, AttachmentError>
                 return Err(invalid);
             }
             if gantry.is_some()
-                && !blocks.iter().any(|(local, state)| {
-                    *local == [0; 3]
-                        && state.name == "create:gantry_carriage"
-                        && state
-                            .properties
-                            .get("facing")
-                            .is_some_and(|facing| match axis {
-                                0 => matches!(facing.as_str(), "up" | "down" | "north" | "south"),
-                                1 => matches!(facing.as_str(), "east" | "west" | "north" | "south"),
-                                _ => matches!(facing.as_str(), "up" | "down" | "east" | "west"),
-                            })
-                })
+                && !blocks.iter().any(|(local, state)| *local == [0; 3] && gantry_carriage(state, axis))
             {
                 return Err(invalid);
             }
@@ -511,7 +567,7 @@ fn decode_geometry(encoded: &Compound) -> Result<SceneGeometry, AttachmentError>
     })
 }
 
-pub fn plain_rotary_state(state: &BlockState) -> bool {
+pub fn plain_packed_state(state: &BlockState) -> bool {
     if !state.properties.is_empty() {
         return false;
     }
@@ -566,9 +622,105 @@ fn fits_rotary_column(
     })
 }
 
+fn fits_linear_column(anchor: Pos, local: Pos, axis: usize, signed_limit: i64) -> bool {
+    // A straight stroke stays within the bounding interval of its endpoints.
+    [0, signed_limit].into_iter().all(|offset| {
+        (0..3).all(|i| {
+            let cell = i64::from(anchor[i]) + i64::from(local[i]);
+            let end = cell + if axis == i { offset } else { 0 };
+            i32::try_from(end).is_ok_and(|p| i == 1 || p >> 4 == anchor[i] >> 4)
+        })
+    })
+}
+
+fn fits_packed_pulley(anchor: Pos, stroke: Stroke, blocks: &[(Pos, BlockState)]) -> bool {
+    let rope_top = i64::from(stroke.initial) + 1;
+    blocks.iter().any(|(local, _)| *local == [0; 3])
+        && blocks.iter().all(|(local, _)| {
+            let [x, y, z] = *local;
+            // A vertical stroke keeps the same X/Z footprint. The source
+            // leaves the controller and existing rope above its origin in place.
+            local.iter().all(|offset| offset.unsigned_abs() <= 15)
+                && (x != 0 || z != 0 || !(1..=rope_top).contains(&i64::from(y)))
+                && fits_linear_column(anchor, *local, 1, -i64::from(stroke.limit))
+        })
+}
+
+/// Exact dry Head/Pole registry state. Returns whether this is the head.
+fn packed_piston_part(state: &BlockState, sign: i32) -> Option<bool> {
+    let facing = if sign == 1 { "up" } else { "down" };
+    let property = |name| state.properties.get(name).map(String::as_str);
+    if property("facing") != Some(facing) || property("waterlogged") != Some("false") {
+        return None;
+    }
+    match (state.name.as_str(), state.properties.len()) {
+        ("create:piston_extension_pole", 2) => Some(false),
+        ("create:mechanical_piston_head", 3)
+            if matches!(property("type"), Some("normal" | "sticky")) => Some(true),
+        _ => None,
+    }
+}
+
+fn fits_packed_piston(anchor: Pos, limit: u32, sign: i32, blocks: &[(Pos, BlockState)]) -> bool {
+    if !(1..=64).contains(&limit) {
+        return false;
+    }
+    let mut train = 0;
+    let rear = -(limit as i32 + 1);
+    blocks.iter().all(|(local, state)| {
+        let [x, y, z] = *local;
+        if local.iter().any(|value| value.unsigned_abs() > 63)
+            || !fits_linear_column(anchor, *local, 1, i64::from(sign) * i64::from(limit))
+        {
+            return false;
+        }
+        let ordinal = y * sign;
+        let on_train = x == 0 && z == 0 && (rear..=-1).contains(&ordinal);
+        if let Some(head) = packed_piston_part(state, sign) {
+            train += 1;
+            on_train && head == (ordinal == -1)
+        } else {
+            !on_train
+        }
+    }) && train == limit + 1
+}
+
+fn gantry_carriage(state: &BlockState, axis: usize) -> bool {
+    state.name == "create:gantry_carriage"
+        && state.properties.get("facing").is_some_and(|facing| match axis {
+            0 => matches!(facing.as_str(), "up" | "down" | "north" | "south"),
+            1 => matches!(facing.as_str(), "east" | "west" | "north" | "south"),
+            2 => matches!(facing.as_str(), "up" | "down" | "east" | "west"),
+            _ => false,
+        })
+}
+
+fn packed_gantry_carriage(state: &BlockState, axis: usize) -> bool {
+    gantry_carriage(state, axis)
+        && state.properties.len() == 2
+        && matches!(
+            state.properties.get("axis_along_first").map(String::as_str),
+            Some("false" | "true")
+        )
+}
+
+fn fits_packed_gantry(anchor: Pos, limit: u32, axis: usize, blocks: &[(Pos, BlockState)]) -> bool {
+    let mut carriage = false;
+    blocks.iter().all(|(local, state)| {
+        if packed_gantry_carriage(state, axis) {
+            if *local != [0; 3] || carriage {
+                return false;
+            }
+            carriage = true;
+        }
+        local.iter().all(|value| value.unsigned_abs() <= 81)
+            && fits_linear_column(anchor, *local, axis, i64::from(limit))
+    }) && carriage
+}
+
 fn decode_blocks(
     entry: &Tag,
-    packed: bool,
+    packed: Option<PackedLayout>,
     max_offset: u32,
 ) -> Result<Arc<[(Pos, BlockState)]>, AttachmentError> {
     let invalid = AttachmentError::Decode;
@@ -589,10 +741,11 @@ fn decode_blocks(
                 Ok((local, state))
             })
             .collect(),
-        (Some(Tag::IntArray(data)), Some(Tag::List(palette))) if packed => {
+        (Some(Tag::IntArray(data)), Some(Tag::List(palette))) if packed.is_some() => {
+            let layout = packed.ok_or(invalid)?;
             let (cells, remainder) = data.as_chunks::<4>();
             if !remainder.is_empty()
-                || !(MAX_BLOCKS + 1..=MAX_PLAIN_ROTARY_BLOCKS).contains(&cells.len())
+                || !(MAX_BLOCKS + 1..=MAX_PACKED_BLOCKS).contains(&cells.len())
                 || palette.is_empty()
                 || palette.len() > cells.len()
             {
@@ -602,7 +755,7 @@ fn decode_blocks(
                 .iter()
                 .map(|tag| {
                     let state = BlockState::from_nbt(tag).map_err(|_| invalid)?;
-                    plain_rotary_state(&state).then_some(state).ok_or(invalid)
+                    layout.permits(&state).then_some(state).ok_or(invalid)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             cells
@@ -812,7 +965,7 @@ pub fn apply_scene_sync(
     replace: bool,
 ) -> Result<Vec<Record>, AttachmentError> {
     if replace {
-        for name in [KEY, POSE_KEY] {
+        for name in [KEY, POSE_KEY, TANK_STORAGE_KEY] {
             map.apply_sync(AttachmentSync {
                 namespace: "create".into(),
                 name: name.into(),
@@ -1101,6 +1254,32 @@ pub fn full_cube_payload(state: &BlockState) -> bool {
             && (!state.name.ends_with("_slab") || dry_slab_type(state) == Some("double")))
 }
 
+fn tank_payload_shape() -> &'static VoxelShape {
+    static TANK: OnceLock<VoxelShape> = OnceLock::new();
+    TANK.get_or_init(|| {
+        // Contraption.getSimplifiedEntityColliders asks FluidTankBlock for
+        // its empty-context shape, which leaves the bottom quarter open.
+        VoxelShape::from_box(Aabb::new(
+            Vec3::new(0.0, 0.25, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+        ))
+        .expect("the tank collision box has fixed finite bounds")
+    })
+}
+
+pub fn payload_collision_shape<W: DynamicCollisionWorld>(
+    binding: &BlockCollisionRegistry<'_>,
+    lookup: &mut W,
+    state: &BlockState,
+    local: Pos,
+) -> Option<VoxelShape> {
+    if state.name == "create:fluid_tank" {
+        return Some(tank_payload_shape().clone());
+    }
+    let id = binding.registry().id(state)?;
+    binding.collision_shape(lookup, id, local).ok()
+}
+
 pub fn upright_side_payload(record: &Record) -> bool {
     record.axis == 1
         && record.stroke.is_none()
@@ -1122,6 +1301,7 @@ pub fn append_collisions(
     excluded_controller: Option<Pos>,
     standing_bounds: Option<Aabb>,
     exclude_upright: bool,
+    excluded: impl Fn(&Record) -> bool,
 ) {
     if !world.attachments.has(&ACTIVE) {
         return;
@@ -1137,6 +1317,7 @@ pub fn append_collisions(
         for record in records.iter() {
             if Some(record.controller) == excluded_controller
                 || (exclude_upright && upright_side_payload(record))
+                || excluded(record)
             {
                 continue;
             }
@@ -1164,10 +1345,8 @@ pub fn append_collisions(
                 }
                 // Captured non-cubes have static shapes keyed by block state.
                 // World-dependent shapes need a local block view.
-                let Some(id) = binding.registry().id(state) else {
-                    continue;
-                };
-                let Ok(shape) = binding.collision_shape(&mut lookup, id, *local) else {
+                let Some(shape) = payload_collision_shape(binding, &mut lookup, state, *local)
+                else {
                     continue;
                 };
                 for aabb in shape.boxes() {
@@ -1289,6 +1468,23 @@ mod collision_tests {
         assert_eq!(turned.len(), 1);
         assert_eq!(turned[0].min_position().components(), [-0.5, 0.0, -0.5]);
         assert_eq!(turned[0].max_position().components(), [0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn moving_tank_keeps_its_bottom_quarter_clear() {
+        let [hull] = tank_payload_shape().boxes() else {
+            panic!("the tank uses one empty-context collision box");
+        };
+        assert_eq!(hull.min_position().components(), [0.0, 0.25, 0.0]);
+        assert_eq!(hull.max_position().components(), [1.0, 1.0, 1.0]);
+        let centered = hull.move_by(Vec3::new(-0.5, -0.5, -0.5));
+        for angle in [0.0, 37.0, 90.0] {
+            let strips = block_cross_section([2, 0], collision_rotation(angle), centered);
+            assert!(!strips.is_empty());
+            assert!(strips.iter().all(|bounds| {
+                bounds.min_position().y == -0.25 && bounds.max_position().y == 0.5
+            }));
+        }
     }
 
     #[test]
@@ -1572,7 +1768,7 @@ mod scene_attachment_tests {
         rotor.anchor = [8, 65, 7];
         rotor.axis = 1;
         let stone = rotor.blocks[0].1.clone();
-        rotor.blocks = (0..MAX_PLAIN_ROTARY_BLOCKS)
+        rotor.blocks = (0..MAX_PACKED_BLOCKS)
             .map(|i| {
                 (
                     [i as i32 % 13 - 6, i as i32 / 169, i as i32 / 13 % 13 - 6],
@@ -1630,5 +1826,160 @@ mod scene_attachment_tests {
         rotor.blocks = rotors[0].blocks.clone();
         rotor.stroke = carrier().stroke;
         assert!(encode_records(&[rotor], Some(1)).is_err());
+    }
+
+    #[test]
+    fn packed_pulley_preserves_the_stroke_and_rejects_foreign_cells() {
+        let mut pulley = carrier();
+        pulley.controller = [7, 140, 7];
+        pulley.anchor = [7, 139, 7];
+        pulley.axis = 1;
+        pulley.angle = 0.0;
+        pulley.previous_angle = 0.0;
+        pulley.stroke = Some(Stroke {
+            kind: StrokeKind::RopePulley,
+            initial: 8,
+            limit: 205,
+            offset: 4.75,
+            previous: 5.0,
+            waiting: false,
+        });
+        let stone = pulley.blocks[0].1.clone();
+        let small = encode_records(std::slice::from_ref(&pulley), Some(1)).unwrap();
+        assert_eq!(small.get(&"Version".into()), Some(&Tag::Int(2)));
+        assert!(decode_geometry(&small).is_ok());
+        pulley.blocks = (0..MAX_PACKED_BLOCKS)
+            .map(|i| {
+                let i = i as i32;
+                ([i % 16 - 7, -(i / 256), i / 16 % 16 - 7], stone.clone())
+            })
+            .collect();
+        let mut server = Attachments::default();
+        plan_scene_update(None, vec![pulley.clone()])
+            .unwrap()
+            .unwrap()
+            .apply(&mut server)
+            .unwrap();
+        let mut client = Attachments::default();
+        let (bytes, records) = network(&mut client, server.synced(), true);
+        assert!(bytes < 34_000, "{bytes}");
+        assert!(records[0].same_geometry(&pulley));
+        assert_eq!(Pose::from(&records[0]), Pose::from(&pulley));
+
+        let mut encoded = encode_records(std::slice::from_ref(&pulley), Some(1)).unwrap();
+        assert_eq!(encoded.get(&"Version".into()), Some(&Tag::Int(3)));
+        encoded.insert("Version".into(), Tag::Int(2));
+        assert!(decode_geometry(&encoded).is_err());
+
+        for invalid in [[-8, 0, -7], [0, 1, 0], [-7, -16, -7]] {
+            let mut damaged = pulley.blocks.to_vec();
+            damaged[0].0 = invalid;
+            pulley.blocks = damaged.into();
+            assert!(encode_records(std::slice::from_ref(&pulley), Some(1)).is_err());
+        }
+    }
+
+    #[test]
+    fn packed_pistons_count_and_validate_the_full_dry_train() {
+        for (sign, facing, kind) in [(1, "up", "normal"), (-1, "down", "sticky")] {
+            let mut piston = carrier();
+            piston.controller = [7, 140, 7];
+            piston.anchor = [7, 140 + sign, 7];
+            piston.axis = 1;
+            piston.angle = 0.0;
+            piston.previous_angle = 0.0;
+            let stone = piston.blocks[0].1.clone();
+            let mut blocks: Vec<_> = (0..60)
+                .map(|i| ([i % 8 - 3, sign * (i / 8), 0], stone.clone()))
+                .collect();
+            for distance in 1..=5 {
+                let head = distance == 1;
+                let mut properties = [
+                    ("facing".into(), facing.into()),
+                    ("waterlogged".into(), "false".into()),
+                ]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+                if head {
+                    properties.insert("type".into(), kind.into());
+                }
+                blocks.push((
+                    [0, -distance * sign, 0],
+                    BlockState {
+                        name: if head {
+                            "create:mechanical_piston_head".into()
+                        } else {
+                            "create:piston_extension_pole".into()
+                        },
+                        properties: properties.into(),
+                    },
+                ));
+            }
+            piston.blocks = blocks.clone().into();
+            let mut server = Attachments::default();
+            plan_scene_update(None, vec![piston.clone()])
+                .unwrap()
+                .unwrap()
+                .apply(&mut server)
+                .unwrap();
+            let mut client = Attachments::default();
+            let (_, records) = network(&mut client, server.synced(), true);
+            assert!(records[0].same_geometry(&piston));
+            assert_eq!(Pose::from(&records[0]), Pose::from(&piston));
+
+            blocks[60].1.properties.insert("waterlogged".into(), "true".into());
+            piston.blocks = blocks.into();
+            assert!(encode_records(&[piston], Some(1)).is_err());
+        }
+    }
+
+    #[test]
+    fn packed_gantry_requires_its_carriage_and_both_loaded_column_ends() {
+        let mut gantry = carrier();
+        gantry.controller = [6, 64, 7];
+        gantry.anchor = [5, 64, 7];
+        gantry.axis = 0;
+        gantry.angle = 0.0;
+        gantry.previous_angle = 0.0;
+        gantry.stroke = Some(Stroke {
+            kind: StrokeKind::Gantry,
+            initial: 1,
+            limit: 3,
+            offset: 1.75,
+            previous: 1.5,
+            waiting: false,
+        });
+        let mut blocks = gantry.blocks.to_vec();
+        blocks[0].0 = [0, 8, 0];
+        blocks.push((
+            [0; 3],
+            BlockState {
+                name: "create:gantry_carriage".into(),
+                properties: [
+                    ("facing".into(), "up".into()),
+                    ("axis_along_first".into(), "false".into()),
+                ]
+                .into(),
+            },
+        ));
+        gantry.blocks = blocks.clone().into();
+        let mut server = Attachments::default();
+        plan_scene_update(None, vec![gantry.clone()])
+            .unwrap()
+            .unwrap()
+            .apply(&mut server)
+            .unwrap();
+        let mut client = Attachments::default();
+        let (_, records) = network(&mut client, server.synced(), true);
+        assert!(records[0].same_geometry(&gantry));
+        assert_eq!(Pose::from(&records[0]), Pose::from(&gantry));
+
+        blocks[0].0 = [8, 8, 0]; // Source x=13 fits; far endpoint x=16 does not.
+        gantry.blocks = blocks.clone().into();
+        assert!(encode_records(std::slice::from_ref(&gantry), Some(1)).is_err());
+        blocks[0].0 = [0, 8, 0];
+        blocks[64].0 = [1, 0, 0];
+        gantry.blocks = blocks.into();
+        assert!(encode_records(&[gantry], Some(1)).is_err());
     }
 }

@@ -330,7 +330,18 @@ def native_run(session, expected, actuators, queued):
             call('wait', 8)
         if not actuators:
             assert value(WINDMILL, 'LastGenerated') == expected['live_generation'][1]
-    return dict(selections_after_restart=selections, **result)
+        # The integrated server now has the owner's UUID from the save. It
+        # must still use the live connected player for a new edit.
+        changed = []
+        for (pos, _, title, labels), current in zip(cases, selections, strict=True):
+            wanted = (current + 1) % len(labels)
+            choose(pos, wanted, current, title, labels)
+            changed.append(wanted)
+        call('save')
+        session.restart()
+        wait_loaded(call, points)
+        assert [value(pos) for pos in points] == changed
+    return dict(selections_after_restart=selections, edits_after_restart=changed, **result)
 
 
 def main():

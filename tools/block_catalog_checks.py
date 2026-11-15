@@ -25,14 +25,16 @@ COLUMNS = '3296 1744 3343 1775'
 CELLS = {f'create:{name}': (ORIGIN[0] + 4 * (i % 12), ORIGIN[1], ORIGIN[2] + 4 * (i // 12))
          for i, name in enumerate(BLOCKS)}
 BE_ID = re.compile(r'\bid\s*:\s*"([^"]+)"')
-PIPE = 'create:fluid_pipe'
-SIDES = ('down', 'up', 'north', 'south', 'west', 'east')
+TANK = 'create:fluid_tank'
 
 
 def snapshot(observation):
     entity = BE_ID.search(observation.get('nbt', ''))
-    return dict(id=observation['id'],
-                properties={k: v.lower() for k, v in observation['properties'].items()},
+    properties = {k: v.lower() for k, v in observation['properties'].items()}
+    if observation['id'] == TANK:
+        for internal in ('create_connections', 'create_light'):
+            assert properties.pop(internal, '0') == '0', observation
+    return dict(id=observation['id'], properties=properties,
                 entity=entity[1] if entity else None)
 
 
@@ -90,14 +92,6 @@ def differences(reference, observed):
             if row != reference[name]}
 
 
-def expected_pipe_difference(*connected):
-    # The native fluid adapter only simulates dry straight lines. The source
-    # registry opens all six sides and Java's neighbor prepass closes four.
-    return {PIPE: dict(java={side: str(side in connected).lower()
-                                 for side in (*SIDES, 'waterlogged')},
-                       native=dict.fromkeys((*SIDES, 'waterlogged'), 'false'))}
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--java', action='store_true')
@@ -135,11 +129,7 @@ def main():
     assert report['resolved'] == len(CELLS), result
     if not args.java:
         assert all(name == row['id'] for name, row in strict.items()), result
-        assert report['registry_differences'] in ({}, expected_pipe_difference(*SIDES)), result
-        pipe = expected_pipe_difference('east', 'west')
-        java_pipe = {**source['blocks'][PIPE], 'properties': pipe[PIPE]['java']}
-        native_pipe = {**source['blocks'][PIPE], 'properties': pipe[PIPE]['native']}
-        assert report['differences'] in ({}, {PIPE: dict(java=java_pipe, native=native_pipe)}), result
+        assert not report['registry_differences'] and not report['differences'], result
 
 
 if __name__ == '__main__':

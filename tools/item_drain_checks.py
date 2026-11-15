@@ -5,9 +5,11 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import time
+from typing import NamedTuple
 
 from bearing_native_checks import Batch
 from burner_heat_java_checks import field, items, number
@@ -29,6 +31,32 @@ BUCKET = 'minecraft:bucket'
 FULL = 'minecraft:water_bucket'
 DIAMOND = 'minecraft:diamond'
 VIEW_Z = 981
+WATER_BOTTLE = 'minecraft:potion'
+POTION_CONTENTS = 'minecraft:potion_contents'
+WATER_CONTENTS = '{potion:"minecraft:water"}'
+
+
+class Liquid(NamedTuple):
+    source: str
+    container: str
+    fluid: str
+    amount: int
+    blocked_fluid: str
+    blocked_amount: int
+
+    def marked(self, key, marker):
+        components = {'minecraft:custom_data': f'{{{key}:{marker}}}'}
+        if self.source == WATER_BOTTLE:
+            components[POTION_CONTENTS] = WATER_CONTENTS
+        return components
+
+
+LIQUIDS = {
+    'water': Liquid(FULL, BUCKET, 'minecraft:water', 1000, 'minecraft:water', 1000),
+    'lava': Liquid('minecraft:lava_bucket', BUCKET, 'minecraft:lava', 1000, 'minecraft:water', 500),
+    'honey': Liquid('minecraft:honey_bottle', 'minecraft:glass_bottle', 'create:honey', 250, 'create:honey', 1300),
+    'water-bottle': Liquid(WATER_BOTTLE, 'minecraft:glass_bottle', 'minecraft:water', 250, 'minecraft:water', 1300),
+}
 
 
 def points(z):
@@ -38,15 +66,15 @@ def points(z):
 PROBES = [pos for z in LANES.values() for pos in points(z)]
 
 
-def tank(command, amount):
+def tank(command, amount, kind='minecraft:water'):
     _, drain, _ = points(LANES['full'])
-    fluid = f'Fluid:{{id:"minecraft:water",amount:{amount}}}' if amount else ''
+    fluid = f'Fluid:{{id:"{kind}",amount:{amount}}}' if amount else ''
     level = f'{amount / 1500}f'
     command(f'data merge block {xyz(drain)} {{Tanks:[{{TankContent:{{{fluid}}},'
             f'Level:{{Value:{level},Target:{level},Speed:0.25f}}}}]}}')
 
 
-def setup(command, advance, lava=False):
+def setup(command, advance, liquid=LIQUIDS['water']):
     command(f'fill {REGION} minecraft:air')
     command(f'kill {DROPS}')
     for z in LANES.values():
@@ -57,15 +85,15 @@ def setup(command, advance, lava=False):
             command(f'setblock {x+i} {y} {z} create:belt[facing=east,slope=horizontal,part={part}]')
         command(f'setblock {x} {y} {z-1} create:creative_motor[facing=south]{{ScrollValue:-32}}')
     advance(24)
-    tank(command, 500 if lava else 1000)
+    tank(command, liquid.blocked_amount, liquid.blocked_fluid)
     _, _, depot = points(LANES['blocked'])
     command(f'data merge block {xyz(depot)} {{HeldItem:{{Item:{{id:"{DIAMOND}",count:1}},'
             'Pos:0.5f,PrevPos:0.5f,Angle:180,InDirection:1}}')
-    full_bucket = 'minecraft:lava_bucket' if lava else FULL
     for marker, z in enumerate(LANES.values(), 1):
         belt, _, _ = points(z)
-        command(f'data merge block {xyz(belt)} {{Inventory:{{PositiveOrder:1b,Items:[{{Item:{{id:"{full_bucket}",count:1,'
-                f'components:{{"minecraft:custom_data":{{drain_marker:{marker}}}}}}},'
+        components = ','.join(f'"{key}":{value}' for key, value in liquid.marked('drain_marker', marker).items())
+        command(f'data merge block {xyz(belt)} {{Inventory:{{PositiveOrder:1b,Items:[{{Item:{{id:"{liquid.source}",count:1,'
+                f'components:{{{components}}}}},'
                 'Pos:3.74f,PrevPos:3.74f,Offset:0f,PrevOffset:0f,InSegment:3,InDirection:5,Angle:180}]}}')
 
 
@@ -81,19 +109,21 @@ def held(raw, *, pose):
     record = field(raw, 'HeldItem')
     values = dict(items=items(record, 'Item'), marker=int(number({'nbt': record}, 'drain_marker', 0)),
                   from_side=int(number({'nbt': record}, 'InDirection')))
+    if WATER_BOTTLE in values['items']:
+        assert re.search(r'\bpotion\s*:\s*"minecraft:water"', record), record
     if pose:
         values['pose'] = [number({'nbt': record}, key) for key in ('Pos', 'PrevPos', 'Offset', 'PrevOffset', 'Angle')]
     return values
 
 
-def snapshot(values, lava=False):
+def snapshot(values, liquid=LIQUIDS['water']):
     out = {}
     for name, belt, drain, depot in zip(LANES, values[::3], values[1::3], values[2::3], strict=True):
         assert 'create:belt' in belt and DRAIN in drain and DEPOT in depot, (belt, drain, depot)
         tank = field(drain, 'Tanks')
         fluid = field(tank, 'TankContent')
         amount = int(number({'nbt': fluid}, 'amount', 0))
-        expected_fluid = 'minecraft:lava' if lava and amount != 500 else 'minecraft:water'
+        expected_fluid = liquid.blocked_fluid if name == 'full' and amount == liquid.blocked_amount else liquid.fluid
         assert not amount or expected_fluid in fluid, fluid
         out[name] = dict(belt=items(belt, 'Inventory'), tank=amount,
                          ticks=int(number({'nbt': drain}, 'ProcessingTicks')),
@@ -101,24 +131,23 @@ def snapshot(values, lava=False):
     return out
 
 
-def verify(phases, lava=False):
+def verify(phases, liquid=LIQUIDS['water']):
     warm = phases['warm']
     first = warm[0]['open']
-    full_bucket = 'minecraft:lava_bucket' if lava else FULL
-    assert not first['belt'] and first['drain'] == dict(items={full_bucket: 1}, marker=1, from_side=5,
+    assert not first['belt'] and first['drain'] == dict(items={liquid.source: 1}, marker=1, from_side=5,
                                                        pose=[0, 0, 0, 0, 180]), first
     assert warm[4]['open']['ticks'] == 20 and warm[4]['open']['drain']['pose'][0] == .5, warm[4]
     assert warm[18]['open']['tank'] == 0 and warm[18]['open']['ticks'] == 6, warm[18]
     exchanged = warm[19]['open']
-    assert exchanged['tank'] == 1000 and exchanged['ticks'] == 5, exchanged
-    assert exchanged['drain']['items'] == {BUCKET: 1} and exchanged['drain']['marker'] == 0, exchanged
-    result = dict(items={BUCKET: 1}, marker=0, from_side=5)
+    assert exchanged['tank'] == liquid.amount and exchanged['ticks'] == 5, exchanged
+    assert exchanged['drain']['items'] == {liquid.container: 1} and exchanged['drain']['marker'] == 0, exchanged
+    result = dict(items={liquid.container: 1}, marker=0, from_side=5)
     assert warm[28]['open']['drain']['pose'][0] == 1 and warm[28]['open']['depot'] is None, warm[28]
     assert warm[29]['open']['drain'] is None and warm[29]['open']['depot'] == result, warm[29]
     parked = warm[-1]
-    assert parked['full']['ticks'] == 20 and parked['full']['tank'] == (500 if lava else 1000), parked
-    assert parked['full']['drain']['items'] == {full_bucket: 1} and parked['full']['drain']['marker'] == 2, parked
-    assert parked['blocked']['drain']['items'] == {BUCKET: 1} and parked['blocked']['drain']['pose'][:2] == [1, 1], parked
+    assert parked['full']['ticks'] == 20 and parked['full']['tank'] == liquid.blocked_amount, parked
+    assert parked['full']['drain']['items'] == {liquid.source: 1} and parked['full']['drain']['marker'] == 2, parked
+    assert parked['blocked']['drain']['items'] == {liquid.container: 1} and parked['blocked']['drain']['pose'][:2] == [1, 1], parked
     assert parked['blocked']['depot']['items'] == {DIAMOND: 1}, parked
     assert phases['cold'][0] == parked, phases['cold']
     first_resume = phases['resumed'][0]
@@ -127,7 +156,7 @@ def verify(phases, lava=False):
     assert phases['resumed'][-1]['full']['depot'] == result, phases['resumed'][-1]
 
 
-def java_run(work, lava=False):
+def java_run(work, liquid=LIQUIDS['water']):
     host = Original()
     base = reference_java.BASE
     assert json.loads((base / 'manifest.json').read_text())['create_sha256'] == reference_java.CREATE_SHA256
@@ -141,7 +170,7 @@ def java_run(work, lava=False):
     try:
         host.command(f'forceload add {LOAD}')
         host.call('observe_ticks', {'positions': [list(map(int, state['position']))], 'ticks': 40})
-        setup(host.command, advance, lava)
+        setup(host.command, advance, liquid)
         warm = advance(PHASES['warm'])
         host.call('quit', {})
         deadline = time.monotonic() + 60
@@ -163,7 +192,7 @@ def java_run(work, lava=False):
         phases = dict(warm=warm, cold=[dict(blocks=blocks)], resumed=advance(PHASES['resumed']))
         drops = host.command(f'execute if entity {DROPS} run say loose_item_drain')
         assert not any('loose_item_drain' in line for line in drops['messages']), drops
-        return {name: [snapshot([b['nbt'] for b in row['blocks']], lava) for row in rows]
+        return {name: [snapshot([b['nbt'] for b in row['blocks']], liquid) for row in rows]
                 for name, rows in phases.items()}
     finally:
         host.command(f'fill {REGION} minecraft:air')
@@ -173,14 +202,14 @@ def java_run(work, lava=False):
         (work / 'transcript.json').write_text(json.dumps(host.trace, indent=2) + '\n')
 
 
-def native_run(session, lava=False):
+def native_run(session, liquid=LIQUIDS['water']):
     phases = {}
     n = len(PROBES)
     for label, names in [('before-restart', ('warm',)), ('after-restart', ('cold', 'resumed'))]:
         batch = Batch()
         batch.load((X, Y + 4, 983))
         if label == 'before-restart':
-            setup(batch.command, batch.tick, lava)
+            setup(batch.command, batch.tick, liquid)
         for name in names:
             if name == 'resumed':
                 release(batch.command)
@@ -194,13 +223,13 @@ def native_run(session, lava=False):
         offset = 0
         for name in names:
             end = offset + n * (PHASES[name] or 1)
-            phases[name] = [snapshot(values[i:i+n], lava) for i in range(offset, end, n)]
+            phases[name] = [snapshot(values[i:i+n], liquid) for i in range(offset, end, n)]
             offset = end
         assert len(values) == offset + 1 and 'loose_item_drain' not in values[-1], values[-1]
     return phases
 
 
-def visual_scenario(command, capture, settle):
+def visual_scenario(command, capture, settle, liquid):
     position = (X, Y, VIEW_Z)
     block = xyz(position)
     camera = (X + 1.7, Y, VIEW_Z + 2.25)
@@ -212,14 +241,16 @@ def visual_scenario(command, capture, settle):
     captures = {}
     for name, fraction, ticks in [('dry', 0, 0), ('tilted', .375, 0), ('jet', .5, 10), ('tank', 0, 0)]:
         if name in ('tilted', 'jet'):
+            potion = f',components:{{"{POTION_CONTENTS}":{WATER_CONTENTS}}}' if liquid.source == WATER_BOTTLE else ''
             command(f'data merge block {block} {{ProcessingTicks:{ticks},HeldItem:{{'
-                    f'Item:{{id:"{FULL}",count:1}},Pos:{fraction}f,PrevPos:{fraction}f,'
+                    f'Item:{{id:"{liquid.source}",count:1{potion}}},Pos:{fraction}f,PrevPos:{fraction}f,'
                     'Offset:0f,PrevOffset:0f,InDirection:5,Angle:180}}')
         elif name == 'tank':
             command(f'data remove block {block} HeldItem')
+            level = liquid.amount / 1500
             command(f'data merge block {block} {{ProcessingTicks:0,Tanks:[{{'
-                    'TankContent:{Fluid:{id:"minecraft:water",amount:1000}},'
-                    'Level:{Value:.6666667f,Target:.6666667f,Speed:.25f,Force:1b}}]}')
+                    f'TankContent:{{Fluid:{{id:"{liquid.fluid}",amount:{liquid.amount}}}}},'
+                    f'Level:{{Value:{level}f,Target:{level}f,Speed:.25f,Force:1b}}}}]}}')
             settle()
         image = capture(name, camera, target)
         assert image.stat().st_size > 1024, image
@@ -227,7 +258,7 @@ def visual_scenario(command, capture, settle):
     return captures
 
 
-def java_visual(work):
+def java_visual(work, liquid):
     host = Original()
     assert json.loads((reference_java.BASE / 'manifest.json').read_text())['create_sha256'] == reference_java.CREATE_SHA256
     initial = host.call('state', {})
@@ -251,7 +282,7 @@ def java_visual(work):
         host.call('tick', {'frozen': True})
         host.command(f'forceload add {LOAD}')
         host.call('observe_ticks', {'positions': [(X, Y, VIEW_Z)], 'ticks': 24})
-        return visual_scenario(host.command, capture, settle)
+        return visual_scenario(host.command, capture, settle, liquid)
     finally:
         host.command(f'fill {REGION} minecraft:air')
         host.command(f'forceload remove {LOAD}')
@@ -261,7 +292,7 @@ def java_visual(work):
         (work / 'transcript.json').write_text(json.dumps(host.trace, indent=2) + '\n')
 
 
-def native_visual(session):
+def native_visual(session, liquid):
     def capture(name, camera, target):
         session.call('command', f'tp @s {xyz(camera)}')
         session.call('look-at', *target)
@@ -281,23 +312,26 @@ def native_visual(session):
         session.call('command', 'time set noon')
         session.call('command', 'tick freeze')
         session.call('key', 'f1', 'tap')
-        return visual_scenario(lambda command: session.call('command', command), capture, settle)
+        return visual_scenario(lambda command: session.call('command', command), capture, settle, liquid)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--java', action='store_true')
-    parser.add_argument('--lava', action='store_true', help='Use lava and test the rejection of mixed fluids')
+    fluids = parser.add_mutually_exclusive_group()
+    fluids.add_argument('--lava', action='store_true', help='Use lava and test the rejection of mixed fluids')
+    fluids.add_argument('--honey', action='store_true', help='Use honey bottles and test partial tank capacity')
+    fluids.add_argument('--water-bottle', action='store_true', help='Use regular water bottles and test partial capacity')
     parser.add_argument('--screenshots', action='store_true', help='Capture four poses instead of running the timing fixture')
     for flag in ('game', 'resources', 'ctl', 'reference', 'create-jar'):
         parser.add_argument('--' + flag, type=Path)
     args = parser.parse_args()
+    kind = 'water-bottle' if args.water_bottle else 'honey' if args.honey else 'lava' if args.lava else 'water'
+    liquid = LIQUIDS[kind]
     if args.screenshots:
-        if args.lava:
-            parser.error('--lava is only available for the gameplay fixture')
         if args.java:
             work = Path(tempfile.mkdtemp(prefix='drain-visual-java-', dir=ROOT / '.local'))
-            captures = java_visual(work)
+            captures = java_visual(work, liquid)
         else:
             if not all((args.game, args.resources, args.ctl, args.create_jar)):
                 parser.error('Horizon captures require --game, --resources, --ctl and --create-jar')
@@ -305,7 +339,7 @@ def main():
                                          size=(905, 1045), name='drain-visual-native', world='CreateItemDrainVisual')
             work = session.scratch
             try:
-                captures = native_visual(session)
+                captures = native_visual(session, liquid)
             finally:
                 for folder in (session.resources, work / '.horizon-cache', work / 'horizon-mods'):
                     shutil.rmtree(folder, ignore_errors=True)
@@ -315,30 +349,30 @@ def main():
         return
     if args.java:
         work = Path(tempfile.mkdtemp(prefix='item-drain-java-', dir=ROOT / '.local'))
-        phases = java_run(work, args.lava)
+        phases = java_run(work, liquid)
     else:
         if not all((args.game, args.resources, args.ctl, args.reference)):
             parser.error('Horizon runs require --game, --resources, --ctl and --reference')
         reference = json.loads(args.reference.read_text())
         assert reference['passed'] and reference['create'] == PINS['create_revision']
-        assert reference.get('lava', False) == args.lava
-        session = NativeCheckSession(args.game, args.resources, args.ctl, None, graphics=False,
+        assert reference.get('fluid', 'lava' if reference.get('lava', False) else 'water') == kind
+        session = NativeCheckSession(args.game, args.resources, args.ctl, args.create_jar, graphics=False,
                                      name='item-drain-native', world='CreateItemDrain')
         work = session.scratch
         try:
-            phases = native_run(session, args.lava)
+            phases = native_run(session, liquid)
         finally:
             session.control_temp.cleanup()
             for path in (session.resources, work / '.horizon-cache', work / 'horizon-mods'):
                 shutil.rmtree(path, ignore_errors=True)
     (work / 'observed.json').write_text(json.dumps(phases, indent=2) + '\n')
-    verify(phases, args.lava)
+    verify(phases, liquid)
     if not args.java:
         for name, expected in reference['phases'].items():
             for tick, (got, wanted) in enumerate(zip(phases[name], expected, strict=True), 1):
                 assert got == wanted, (name, tick, got, wanted)
     path = work / 'result.json'
-    path.write_text(json.dumps(dict(passed=True, create=PINS['create_revision'], lava=args.lava, phases=phases), indent=2) + '\n')
+    path.write_text(json.dumps(dict(passed=True, create=PINS['create_revision'], fluid=kind, phases=phases), indent=2) + '\n')
     print(path)
 
 

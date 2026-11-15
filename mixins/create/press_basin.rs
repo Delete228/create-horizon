@@ -18,15 +18,27 @@ use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 const ID: &str = "create:mechanical_press";
 const BASIN_MODE: i32 = 2;
+const SCAN_INTERVAL: u8 = 10;
 type Pos = [i32; 3];
 
-#[derive(Default)]
 struct Running {
     owner: Option<ModRevision>,
     recipe: Option<Arc<Recipe>>,
     tick: Option<i64>,
     removed: bool,
-    handled: bool,
+    scan_cooldown: u8,
+}
+impl Default for Running {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            recipe: None,
+            tick: None,
+            removed: false,
+            // The original behavior waits ten powered ticks on construction.
+            scan_cooldown: SCAN_INTERVAL,
+        }
+    }
 }
 thread_local! {
     static WORLDS: RefCell<SessionCache<BTreeMap<Pos, Running>>> = RefCell::new(SessionCache::default());
@@ -76,7 +88,10 @@ pub(super) fn basin_removed(game: &Game<'_>, pos: Pos) {
     let owner = entity.revision();
     with_world(game, |world| {
         let state = world.entry(pos).or_default();
-        if state.owner.is_some_and(|old| !old.is_same_create_entity(owner)) {
+        if state
+            .owner
+            .is_some_and(|old| !old.is_same_create_entity(owner))
+        {
             *state = Running::default();
         }
         state.owner = Some(owner);
@@ -95,17 +110,26 @@ fn start(entity: &mut ModBlockEntity, cycle: &mut PressCycle) {
     entity.nbt.remove(&"ParticleItems".into());
 }
 
-/// `None` leaves WORLD/BELT processing to its existing adapter. `Some` consumes
-/// this tick and says whether the ordinary BE update should be synchronized.
-/// Called after resolving actual kinetic speed, while this BE is detached.
-pub(super) fn tick(
-    game: &mut Game<'_>,
-    pos: Pos,
-    entity: &mut ModBlockEntity,
-    rpm: f32,
-) -> Option<bool> {
+pub(super) enum Tick {
+    Handled(bool),
+    NonBasin { scan_due: bool },
+}
+
+/// PressingBehaviour.applyInWorld resets the cooldown once it finds a grounded
+/// item, including a non-recipe first item in the ordinary mode.
+pub(super) fn reset_scan(game: &Game<'_>, pos: Pos) {
+    with_world(game, |world| {
+        if let Some(state) = world.get_mut(&pos) {
+            state.scan_cooldown = 0;
+        }
+    });
+}
+
+/// Advance the transient source cooldown and dispatch Basin behavior. The
+/// caller handles the remaining modes after resolving this tick's speed.
+pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity, rpm: f32) -> Tick {
     if entity.id != ID {
-        return None;
+        return Tick::NonBasin { scan_due: false };
     }
     let integer = super::create_port::integer;
     for key in ["Running", "Finished", "NeedsUpdate"] {
@@ -118,17 +142,18 @@ pub(super) fn tick(
     let mut state = with_world(game, |world| world.remove(&pos).unwrap_or_default());
     let owner = entity.revision();
     if state.tick.is_some_and(|tick| tick > now)
-        || state.owner.is_some_and(|old| !old.is_same_create_entity(owner))
+        || state
+            .owner
+            .is_some_and(|old| !old.is_same_create_entity(owner))
     {
         state = Running::default();
     }
     state.owner = Some(owner);
     if state.tick == Some(now) {
-        let handled = state.handled;
         with_world(game, |world| {
             world.insert(pos, state);
         });
-        return handled.then_some(false);
+        return Tick::Handled(false);
     }
     let mut cycle = PressCycle {
         running: integer(&entity.nbt, "Running") != 0,
@@ -139,6 +164,7 @@ pub(super) fn tick(
     let mut pending = integer(&entity.nbt, "NeedsUpdate") != 0;
     let mut sync = false;
     let mut handled = false;
+    let mut scan_due = false;
     // BasinOperating.tick aborts before its ordinary behavior tick when an
     // actual removal callback raised the flag. A missing cold-loaded Basin
     // alone is not that callback and must not invent an abort.
@@ -165,6 +191,15 @@ pub(super) fn tick(
                 state.recipe = Some(recipe);
                 start(entity, &mut cycle);
                 sync = true;
+            }
+        }
+        // PressingBehaviour's idle branch counts only powered ticks and
+        // resets its interval before excluding transport blocks or a Basin.
+        if !cycle.running && rpm != 0.0 {
+            state.scan_cooldown = state.scan_cooldown.saturating_sub(1);
+            if state.scan_cooldown == 0 {
+                state.scan_cooldown = SCAN_INTERVAL;
+                scan_due = true;
             }
         }
         if cycle.running && integer(&entity.nbt, "Mode") == BASIN_MODE {
@@ -236,9 +271,12 @@ pub(super) fn tick(
         entity.nbt.insert("LastTick".into(), Tag::Long(now));
     }
     state.tick = Some(now);
-    state.handled = handled;
     with_world(game, |world| {
         world.insert(pos, state);
     });
-    handled.then_some(sync)
+    if handled {
+        Tick::Handled(sync)
+    } else {
+        Tick::NonBasin { scan_due }
+    }
 }

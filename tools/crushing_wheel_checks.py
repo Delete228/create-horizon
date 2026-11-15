@@ -29,6 +29,7 @@ CONTROLLER = 'create:crushing_wheel_controller'
 CHUTE = 'create:chute[facing=down,shape=normal,waterlogged=false]'
 COBBLE = 'minecraft:cobblestone'
 GRAVEL = 'minecraft:gravel'
+UNPORTED = 'minecraft:netherrack'
 LANES = {
     'single': (882, COBBLE, 1),
     'priority': (887, GRAVEL, 4),
@@ -116,19 +117,17 @@ def dropped(host):
     return result
 
 
-def verify(trace, first_output, final_output, *, original):
+def verify(trace, first_output, final_output):
     first = trace['active'][0]
     assert first['single']['remaining'] == 250 and first['single']['inventory'] == {COBBLE: 1}, first
     assert first['priority']['remaining'] < 250 and first['priority']['inventory'] == {GRAVEL: 4}, first
     diamond = {'minecraft:diamond': 1}
-    if original:
-        assert first['unknown']['remaining'] == 100 and first['unknown']['inventory'] == diamond, first
+    assert first['unknown']['remaining'] == 100 and first['unknown']['inventory'] == diamond, first
     for marker, lane in enumerate(LANES, 1):
         row = first[lane]
         assert row['state'] == {'valid': 'true', 'facing': 'down'}, row
         assert row['speed'] == 1.28 and row['recipe_time'] == 0 and not row['applied'], row
-        if original or lane != 'unknown':
-            assert row['marker'] == marker and not row['chute'], row
+        assert row['marker'] == marker and not row['chute'], row
     saved = trace['active'][-1]['pause']
     assert all(row['pause']['speed'] == 0 and row['pause']['remaining'] == saved['remaining']
                and row['pause']['state']['valid'] == 'false' for row in trace['paused']), trace['paused']
@@ -140,11 +139,10 @@ def verify(trace, first_output, final_output, *, original):
         before, after = timeline[applied][name], timeline[applied + 1][name]
         assert before['inventory'] and before['remaining'] == 0 and before['recipe_time'] == 0, before
         assert not after['inventory'] and not after['applied'], after
-    if not original:
-        # The bounded port leaves unsupported input in the Chute. Java consumes it.
-        assert all(row['unknown']['chute'] == diamond and not row['unknown']['inventory']
-                   and row['unknown']['remaining'] == 0 and not row['unknown']['applied']
-                   for row in timeline), timeline
+    consumed = next(i for i, row in enumerate(timeline, 1) if row['unknown']['applied'])
+    assert consumed == 6, consumed
+    assert all(not row['unknown']['chute'] and not row['unknown']['inventory']
+               and row['unknown']['remaining'] == 0 for row in timeline[consumed - 1:]), timeline
     [single] = first_output['single']
     assert single['items'] == {GRAVEL: 1} and single['motion'] == [0, 0, 0], single
     assert single['position'][::2] == [X + .5, LANES['single'][0] + .5], single
@@ -317,25 +315,36 @@ def native_run(session):
     native_drops(after)
     tick(after, 105)
     native_drops(after)
+    seed_chute(after.command, LANES['unknown'][0], UNPORTED, 1, 74)
+    after.tick(20)
+    native_probe(after)
     values = after.run(session, 'after-restart')
-    assert len(values) == 107 * controller_rows + 2 * entity_rows, len(values)
+    assert len(values) == 108 * controller_rows + 2 * entity_rows, len(values)
+    protected = parse(values[-controller_rows:], 1)[0]['unknown']
+    assert protected['chute'] == {UNPORTED: 1} and not protected['inventory'], protected
+    values = values[:-controller_rows]
     cold = parse(values[:controller_rows], 1)[0]
     trace['resumed'] += parse(values[controller_rows:2 * controller_rows], 1)
     first_output = native_drop_values(values[2 * controller_rows:2 * controller_rows + entity_rows])
     trace['settled'] = parse(values[2 * controller_rows + entity_rows:-entity_rows], 105)
     final_output = native_drop_values(values[-entity_rows:])
-    return dict(trace=trace, cold=cold, first_output=first_output, final_output=final_output)
+    return dict(trace=trace, cold=cold, first_output=first_output, final_output=final_output,
+                protected=protected)
 
 
 def compare(actual, reference):
-    assert actual['cold'] == actual['trace']['resumed'][0], actual['cold']
+    # This run restarts between the two resumed ticks. Java's separate cold
+    # reference confirms an already consumed input loses its applied flag.
+    before = actual['trace']['resumed'][0]
+    restart = reference.get('restart')
+    loaded = restart['loaded']['unknown'] if restart else dict(before['unknown'], applied=False)
+    assert actual['cold'] == dict(before, unknown=loaded), actual['cold']
     for phase, expected in reference['trace'].items():
         for tick, (wanted, got) in enumerate(zip(expected, actual['trace'][phase], strict=True), 1):
             for lane, row in wanted.items():
                 observed = got[lane]
-                if lane == 'unknown':
-                    assert observed['state'] == row['state'] and observed['speed'] == row['speed'], observed
-                    continue
+                if lane == 'unknown' and (phase == 'settled' or phase == 'resumed' and tick == 2):
+                    row = loaded
                 assert abs(row['remaining'] - observed['remaining']) < 1e-5, (phase, tick, lane, row, observed)
                 observed = dict(observed, remaining=row['remaining'])
                 if lane == 'priority' and row['applied']:
@@ -349,7 +358,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--java', action='store_true')
     parser.add_argument('--java-restart', action='store_true')
-    for name in ('game', 'resources', 'ctl', 'reference'):
+    for name in ('game', 'resources', 'ctl', 'reference', 'create-jar'):
         parser.add_argument('--' + name, type=Path)
     args = parser.parse_args()
     if args.java_restart and not args.java:
@@ -362,19 +371,19 @@ def main():
             parser.error('Horizon runs require --game, --resources, --ctl and --reference')
         reference = json.loads(args.reference.read_text())
         assert reference['passed'] and reference['create'] == PINS['create_revision']
-        session = NativeCheckSession(args.game, args.resources, args.ctl, None, name='crushing-wheel-native',
+        session = NativeCheckSession(args.game, args.resources, args.ctl, args.create_jar, name='crushing-wheel-native',
                                      graphics=False, world='CreateCrushingWheel')
         work = session.scratch
         try:
             result = native_run(session)
         finally:
             session.control_temp.cleanup()
-            for path in (session.resources, work / '.horizon-cache'):
+            for path in (session.resources, work / '.horizon-cache', work / 'horizon-mods'):
                 shutil.rmtree(path, ignore_errors=True)
     (work / 'observed.json').write_text(json.dumps(result, indent=2) + '\n')
     if not args.java:
         compare(result, reference)
-    verify(result['trace'], result['first_output'], result['final_output'], original=args.java)
+    verify(result['trace'], result['first_output'], result['final_output'])
     path = work / 'result.json'
     path.write_text(json.dumps(dict(passed=True, create=PINS['create_revision'], **result), indent=2) + '\n')
     print(path)

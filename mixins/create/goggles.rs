@@ -170,10 +170,64 @@ fn current_stress(value: f32) -> Text {
         .append(tr("gui.goggles.at_current_speed").with_style(&Style::color(text::DARK_GRAY)))
 }
 
+/// IHaveGoggleInformation.containedFluidTooltip for a single fluid compartment.
+pub(super) fn fluid_container(
+    game: &Game<'_>,
+    capacity: u32,
+    fluid: Option<(&str, u32)>,
+) -> Vec<Text> {
+    let quantity = |amount: u32, color| {
+        numeral(f64::from(amount))
+            .append(tr("generic.unit.millibuckets"))
+            .with_style(&Style::color(color))
+    };
+    let mut lines = vec![indent(game, tr("gui.goggles.fluid_container"), 0)];
+    if let Some((id, amount)) = fluid {
+        let name = match id {
+            "minecraft:water" => "block.minecraft.water",
+            "minecraft:lava" => "block.minecraft.lava",
+            "create:honey" => "fluid.create.honey",
+            "create:chocolate" => "fluid.create.chocolate",
+            _ => return Vec::new(),
+        };
+        lines.push(indent(game, Text::translate(name, &[]).with_style(&Style::color(text::GRAY)), 1));
+        lines.push(indent(
+            game,
+            quantity(amount, text::GOLD)
+                .append(Text::colored(" / ", text::GRAY))
+                .append(quantity(capacity, text::DARK_GRAY)),
+            1,
+        ));
+    } else {
+        lines.push(indent(
+            game,
+            tr("gui.goggles.fluid_container.capacity")
+                .with_style(&Style::color(text::GRAY))
+                .append(quantity(capacity, text::GOLD)),
+            1,
+        ));
+    }
+    lines
+}
+
 fn providers(game: &Game<'_>, pos: Pos, block: &str, nbt: &Compound, goggles: bool) -> Vec<Text> {
     if block == "create:basin" {
         return if goggles {
             super::create_port_basin_tooltip::lines(game, nbt)
+        } else {
+            Vec::new()
+        };
+    }
+    if block == super::create_port_fluid_tank::BLOCK {
+        return if goggles {
+            super::create_port_fluid_tank::tooltip(game, pos)
+        } else {
+            Vec::new()
+        };
+    }
+    if block == super::create_port_basin_recipes::item_drain::BLOCK {
+        return if goggles {
+            super::create_port_basin_recipes::item_drain::tooltip(game, pos)
         } else {
             Vec::new()
         };

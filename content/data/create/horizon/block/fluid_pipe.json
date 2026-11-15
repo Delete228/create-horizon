@@ -33,12 +33,12 @@
     }
   },
   "default_state": {
-    "down": "false",
-    "up": "false",
-    "north": "false",
-    "south": "false",
-    "west": "false",
-    "east": "false",
+    "down": "true",
+    "up": "true",
+    "north": "true",
+    "south": "true",
+    "west": "true",
+    "east": "true",
     "waterlogged": "false"
   },
   "shapes": {

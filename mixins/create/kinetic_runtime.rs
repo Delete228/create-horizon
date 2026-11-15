@@ -301,12 +301,28 @@ pub(super) fn publish(game: &mut Game<'_>, network: &Network, current: Pos) {
         {
             continue;
         }
+        let previous = super::create_port::number(&entity.nbt, "Speed");
+        let is_fan = entity.id == "create:encased_fan";
+        let frozen = game.clock.frozen();
         let speed = game.native_with_mod_block_entity(pos, |entity| {
-            super::create_port::apply_network(entity, network, other.as_deref(), pos);
+            super::create_port::apply_network(entity, network, other.as_deref(), pos, frozen);
             super::create_port::number(&entity.nbt, "Speed")
         });
         if matches!(node.kind, Kind::CrushingWheel) && let Some(speed) = speed {
             super::create_port_saw_processing::crushing::wheel_updated(game, pos, node.axis, speed);
+        }
+        if matches!(node.kind, Kind::Pump)
+            && let Some(speed) = speed
+            && previous.abs() != speed.abs()
+        {
+            super::create_port_basin::pump::drive_changed(game, pos, speed);
+        }
+        if is_fan
+            && let Some(speed) = speed
+            && previous != speed
+        {
+            let running = if frozen { 0.0 } else { speed };
+            super::create_port_chute::publish_fan_air(game, pos, running);
         }
         game.native_block_entity_sync(pos);
     }
@@ -335,8 +351,9 @@ pub(super) fn generated_changed(game: &mut Game<'_>, pos: Pos) {
     *rpm = with_lifetime(game, pos, entity, |state| state.callback(*rpm));
     invalidate();
     let network = self::network(game, node, 0);
+    let frozen = game.clock.frozen();
     game.native_with_mod_block_entity(pos, |entity| {
-        super::create_port::apply_network(entity, &network, None, pos);
+        super::create_port::apply_network(entity, &network, None, pos, frozen);
     });
     publish(game, &network, pos);
     game.native_block_entity_sync(pos);
@@ -406,8 +423,9 @@ fn publish_transmission(game: &mut Game<'_>, pos: Pos) {
     let network = self::network(game, node, 0);
     let other =
         matches!(node.kind, Kind::Clutch { powered: true }).then(|| self::network(game, node, 1));
+    let frozen = game.clock.frozen();
     game.native_with_mod_block_entity(pos, |entity| {
-        super::create_port::apply_network(entity, &network, other.as_deref(), pos);
+        super::create_port::apply_network(entity, &network, other.as_deref(), pos, frozen);
     });
     publish(game, &network, pos);
     if let Some(other) = other {

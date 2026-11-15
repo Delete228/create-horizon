@@ -97,7 +97,14 @@ pub(super) fn default_nbt() -> Compound {
 
 pub(super) fn update_tag(entity: &ModBlockEntity) -> Compound {
     let mut update: Compound = [
-        "Mode", "HeldItem", "State", "Timer", "Speed", "Powered", "Filter", "NetworkStatus",
+        "Mode",
+        "HeldItem",
+        "State",
+        "Timer",
+        "Speed",
+        "Powered",
+        "Filter",
+        "NetworkStatus",
         "create_horizon",
     ]
     .into_iter()
@@ -295,12 +302,18 @@ pub(super) fn draw_station(
         )
     });
     draw_arm(
-        game, draw, facing, first, shaft_angle, arm, hand_pose(mode, holding),
+        game,
+        draw,
+        facing,
+        first,
+        shaft_angle,
+        arm,
+        hand_pose(mode, holding),
     );
     draw_filter(game, pos, facing, first, entity, draw);
     if let Some(stack) = get(&entity.nbt, "HeldItem")
         .and_then(item_from_nbt)
-        .filter(supported_item)
+        .filter(|stack| stationary_item(game, stack))
     {
         draw_held_item(
             game,
@@ -415,7 +428,15 @@ pub(super) fn draw_moving(
         .properties
         .get("axis_along_first")
         .is_some_and(|value| value == "true");
-    draw_arm(game, draw, facing, first, 0.0, extension, HandPose::Pointing);
+    draw_arm(
+        game,
+        draw,
+        facing,
+        first,
+        0.0,
+        extension,
+        HandPose::Pointing,
+    );
 }
 
 fn get<'a>(nbt: &'a Compound, key: &str) -> Option<&'a Tag> {
@@ -430,11 +451,14 @@ pub(super) fn mode(nbt: &Compound) -> Option<Mode> {
     matches!(value.as_str(), "USE" | "PUNCH").then(|| Mode::from_saved(&value))
 }
 
-fn supported_moving_item(item: &ItemStack) -> bool {
+fn farming_item(item: &ItemStack) -> bool {
     (SAPLINGS.contains(&item.item.as_ref()) || item.item.as_ref() == BONE_MEAL)
         && (1..=64).contains(&item.count)
         && item.damage == 0
-        && item.data().is_none()
+}
+
+fn supported_moving_item(item: &ItemStack) -> bool {
+    farming_item(item) && item.data().is_none()
 }
 
 fn supported_item(item: &ItemStack) -> bool {
@@ -452,6 +476,17 @@ fn supported_item(item: &ItemStack) -> bool {
         || (item.item.starts_with("minecraft:") && item.item.ends_with("_axe") && item.count == 1)
 }
 
+fn supported_stationary_action(item: &ItemStack, mode: Mode, facing: Direction) -> bool {
+    supported_item(item)
+        || (mode == Mode::Use
+            && facing == Direction::Down
+            && farming_item(item)
+            // The direct planting helper cannot apply a BlockItem state override.
+            && item
+                .data()
+                .is_none_or(|data| data.other("minecraft:block_state").is_none()))
+}
+
 fn held_kind(item: &ItemStack) -> Held<'_> {
     if item.item.as_ref() == BONE_MEAL {
         Held::Other
@@ -461,14 +496,19 @@ fn held_kind(item: &ItemStack) -> Held<'_> {
 }
 
 fn read_hand(nbt: &Compound) -> Option<Option<ItemStack>> {
+    read_hand_matching(nbt, supported_item)
+}
+
+fn read_hand_matching(
+    nbt: &Compound,
+    accepts: impl FnOnce(&ItemStack) -> bool,
+) -> Option<Option<ItemStack>> {
     let hand = match get(nbt, "Inventory") {
         None => None,
         Some(Tag::List(items)) if items.is_empty() => None,
         Some(Tag::List(items)) if items.len() == 1 => {
             let item = item_from_nbt(&items[0])?;
-            if !supported_item(&item)
-                || encode_items(&[Some(item.clone())]) != Tag::List(items.clone())
-            {
+            if !accepts(&item) || encode_items(&[Some(item.clone())]) != Tag::List(items.clone()) {
                 return None;
             }
             Some(item)
@@ -555,7 +595,24 @@ fn write_hand(nbt: &mut Compound, hand: Option<ItemStack>) {
 }
 
 fn consistent_hand(entity: &ModBlockEntity) -> Option<Option<ItemStack>> {
-    let hand = read_hand(&entity.nbt)?;
+    consistent_live_slot(entity, read_hand(&entity.nbt)?)
+}
+
+fn stationary_item(game: &Game<'_>, item: &ItemStack) -> bool {
+    item.item.as_ref() != "minecraft:air"
+        && (1..=99).contains(&item.count)
+        && game.items().get(&item.item).is_some()
+}
+
+fn stationary_hand(game: &Game<'_>, entity: &ModBlockEntity) -> Option<Option<ItemStack>> {
+    let hand = read_hand_matching(&entity.nbt, |item| stationary_item(game, item))?;
+    consistent_live_slot(entity, hand)
+}
+
+fn consistent_live_slot(
+    entity: &ModBlockEntity,
+    hand: Option<ItemStack>,
+) -> Option<Option<ItemStack>> {
     // Java-shaped commands may initialize only Inventory. The native slot
     // tracks hand swaps and is spillable when an ordinary block breaks. A
     // stack received from the player's inventory may retain a wire patch.
@@ -576,7 +633,7 @@ fn entity<'a>(game: &'a Game<'_>, pos: Pos) -> Option<&'a ModBlockEntity> {
     else {
         return None;
     };
-    (entity.id == BLOCK && consistent_hand(entity).is_some()).then_some(entity)
+    (entity.id == BLOCK && stationary_hand(game, entity).is_some()).then_some(entity)
 }
 
 fn station_state(nbt: &Compound) -> Option<Stationary> {
@@ -865,7 +922,7 @@ pub(super) fn tick_station(
     let (Some(aim), Some(mut cycle), Some(hand), Some(filter)) = (
         stationary_aim(pos, facing),
         station_state(&entity.nbt),
-        consistent_hand(entity),
+        stationary_hand(game, entity),
         read_filter(&entity.nbt),
     ) else {
         return false;
@@ -883,6 +940,14 @@ pub(super) fn tick_station(
         entity.items = vec![Some(stack.clone())];
         write_hand(&mut entity.nbt, hand.clone());
         changed = true;
+    }
+    // A stationary hand can store any registered stack. Its automation
+    // still runs only the interactions implemented by the port.
+    if hand
+        .as_ref()
+        .is_some_and(|item| !supported_stationary_action(item, cycle.mode, facing))
+    {
+        return changed;
     }
     cycle.reach = f32::from_bits(entity.data.first().copied().unwrap_or(0) as u32);
     let previous = cycle;
@@ -949,7 +1014,8 @@ fn use_lever(game: &mut Game<'_>, aim: Aim, facing: Direction) {
     use horizon_client::mod_api::NativeUseTarget;
 
     let [x, _, z] = aim.clicked;
-    if !contraption::resident(game, aim.clicked) || !game.border.contains(f64::from(x), f64::from(z))
+    if !contraption::resident(game, aim.clicked)
+        || !game.border.contains(f64::from(x), f64::from(z))
     {
         return;
     }
@@ -1016,9 +1082,13 @@ pub(super) fn placed(game: &mut Game<'_>, pos: Pos) {
 fn exchange_target(game: &Game<'_>, pos: Pos, hit: [f64; 3], held: Option<&ItemStack>) -> bool {
     if !game.native_on("create")
         || game.native_block(pos) != BLOCK
-        || !game.may_build()
+        || game.spectator()
         || game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft)
-        || held.is_some_and(|held| !supported_item(held))
+        || held.is_some_and(|held| {
+            !stationary_item(game, held)
+                || super::create_port_chassis::wrench(game, held)
+                || (held.item.as_ref() == BLOCK && game.may_build())
+        })
     {
         return false;
     }
@@ -1047,7 +1117,9 @@ pub(super) fn wrench(game: &mut Game<'_>, pos: Pos, face: Direction) -> bool {
         };
         if game
             .native_with_mod_block_entity(pos, |entity| {
-                entity.nbt.insert("Mode".into(), Tag::String(next.saved_name().into()));
+                entity
+                    .nbt
+                    .insert("Mode".into(), Tag::String(next.saved_name().into()));
             })
             .is_some()
         {
@@ -1155,13 +1227,21 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
     let Some(entity) = entity(game, hit.pos) else {
         return false;
     };
-    let (Some(previous), Some(filter)) = (read_hand(&entity.nbt), read_filter(&entity.nbt)) else {
+    let Some(previous) = stationary_hand(game, entity) else {
         return false;
     };
-    if let (Some(item), Some(filter)) = (held.as_ref(), filter)
-        && item.item != filter.item
+    if kinetics::running_speed(game, &entity.nbt) != 0.0
+        && let Some(item) = held.as_ref()
     {
-        return false;
+        let supported = contraption::facing(game, pos)
+            .zip(mode(&entity.nbt))
+            .is_some_and(|(facing, mode)| supported_stationary_action(item, mode, facing));
+        if !supported
+            || !read_filter(&entity.nbt)
+                .is_some_and(|filter| !filter_rejects_hand(filter.as_ref(), Some(item)))
+        {
+            return false;
+        }
     }
     if held.is_none() && previous.is_none() {
         return true;

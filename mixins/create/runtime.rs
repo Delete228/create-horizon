@@ -164,7 +164,7 @@ pub(super) fn entity(block: &str, entity: &mut Option<(String, Compound)>) {
         *entity = Some((block.into(), Compound::new()));
         return;
     }
-    use super::create_port_basin::tank;
+    use super::create_port_fluid_tank as tank;
     if block == tank::BLOCK && entity.is_none() {
         *entity = Some((block.into(), tank::default_nbt()));
         return;
@@ -258,7 +258,7 @@ pub(super) fn ticks(block: &str, ticks: &mut bool) {
         || super::create_port_chute::funnel::is_funnel(block)
         || block == crusher::CONTROLLER
         || block == item_drain::BLOCK
-        || block == super::create_port_basin::tank::BLOCK
+        || block == super::create_port_fluid_tank::BLOCK
         || block == super::create_port_basin::pump::PIPE
     {
         *ticks = true;
@@ -470,7 +470,8 @@ pub(super) fn predicts_use(game: &Game<'_>, pos: [i32; 3], face: [i32; 3]) -> bo
     !inventory_blocked(game, pos)
         && (crate::game::create_port_burner::reacts(game, pos)
             || crate::game::create_port_basin::reacts(game, pos)
-            || crate::game::create_port_basin::tank::predicts_use(game, pos)
+            || crate::game::create_port_basin::predicts_wrench(game, pos)
+            || crate::game::create_port_fluid_tank::predicts_use(game, pos)
             || crate::game::create_port_basin::pump::reacts(game, pos)
             || item_drain::predicts_use(game, pos)
             || super::create_port_belt::predicts_dye(game, pos)
@@ -507,6 +508,7 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], ca
     if crafter::right_click(game, pos, face)
         || super::create_port_saw_filter::right_click(game, pos)
         || super::create_port_basin_filter::right_click(game, pos)
+        || super::create_port_basin::wrench(game, pos, face)
         || super::create_port_chute::funnel::right_click(game, pos, face)
         || super::create_port_contraption::right_click(game, pos)
         || super::create_port_piston::right_click(game, pos, face)
@@ -529,7 +531,7 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], ca
         return;
     }
     if crate::game::create_port_basin::right_click(game, pos)
-        || crate::game::create_port_basin::tank::right_click(game, pos)
+        || crate::game::create_port_fluid_tank::right_click(game, pos)
         || crate::game::create_port_basin::pump::right_click(game, pos)
         || item_drain::right_click(game, pos)
     {
@@ -949,7 +951,7 @@ pub(super) fn result(game: &Game<'_>, stack: &ItemStack) -> Option<ItemStack> {
         let Some(outputs) = recipe.json["results"].as_array() else {
             continue;
         };
-        // The first milestone supports deterministic, single-input/single-output bulk pressing.
+        // This adapter supports deterministic, single-input/single-output pressing recipes.
         if inputs.len() != 1
             || outputs.len() != 1
             || outputs[0]
@@ -969,11 +971,29 @@ pub(super) fn result(game: &Game<'_>, stack: &ItemStack) -> Option<ItemStack> {
         let Some(output) = game.native_recipe_result(&outputs[0]) else {
             continue;
         };
-        if output.count <= game.native_max_stack_size(&output.item)? {
+        let maximum = game.native_max_stack_size(&output.item)?;
+        if (1..=stack_maximum_override(&output).unwrap_or(maximum)).contains(&output.count) {
             return Some(output);
         }
     }
     None
+}
+
+pub(super) fn press_outputs(game: &Game<'_>, input: &ItemStack, bulk: bool) -> Option<Vec<ItemStack>> {
+    let output = result(game, input)?;
+    let operations = if bulk { input.count } else { 1 };
+    if !(1..=99).contains(&operations) {
+        return None;
+    }
+    let maximum = stack_maximum(game, &output);
+    let mut remaining = output.count * operations;
+    let mut stacks = Vec::new();
+    while remaining > 0 {
+        let count = remaining.min(maximum);
+        stacks.push(ItemStack { count, ..output.clone() });
+        remaining -= count;
+    }
+    Some(stacks)
 }
 
 fn slide_depot(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) -> bool {
@@ -1070,6 +1090,7 @@ pub(super) fn apply_network(
     network: &create_engine::kinetics::Network,
     other_half: Option<&create_engine::kinetics::Network>,
     pos: [i32; 3],
+    frozen: bool,
 ) {
     let old_theoretical = match entity.nbt.get(&"create_horizon".into()) {
         Some(Tag::Compound(data)) => number(data, "TheoreticalSpeed"),
@@ -1121,6 +1142,9 @@ pub(super) fn apply_network(
     crate::game::create_port_press_basin::on_speed_changed(entity, old_theoretical, theoretical);
     crate::game::create_port_mixer::on_speed_changed(entity, old_rpm, rpm);
     crate::game::create_port_press_basin::on_speed_changed(entity, old_rpm, rpm);
+    if entity.id == super::create_port_basin::pump::VALVE && old_rpm != rpm {
+        super::create_port_basin::pump::valve_speed_changed(entity, if frozen { 0.0 } else { rpm });
+    }
 }
 
 pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEntity) {
@@ -1131,8 +1155,8 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         }
         return;
     }
-    if block == super::create_port_basin::tank::BLOCK {
-        super::create_port_basin::tank::tick(game, pos, entity);
+    if block == super::create_port_fluid_tank::BLOCK {
+        super::create_port_fluid_tank::tick(game, pos, entity);
         return;
     }
     if block == item_drain::BLOCK {
@@ -1277,7 +1301,13 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         network_rpm(&network, other_half.as_deref(), pos)
     };
     if !blocked_attachment {
-        apply_network(entity, &network, other_half.as_deref(), pos);
+        apply_network(
+            entity,
+            &network,
+            other_half.as_deref(),
+            pos,
+            game.clock.frozen(),
+        );
     } else {
         entity
             .nbt
@@ -1310,7 +1340,7 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
                     );
                 }
                 let stopped = crate::game::create_port_kinetic_runtime::network(game, start, 0);
-                apply_network(entity, &stopped, None, pos);
+                apply_network(entity, &stopped, None, pos, game.clock.frozen());
                 crate::game::create_port_kinetic_runtime::publish(game, &stopped, pos);
                 game.native_block_entity_sync(pos);
             }
@@ -1361,9 +1391,7 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
     ) {
         sync |= crate::game::create_port_drill::tick(game, pos, entity, running_rpm);
     }
-    if block == super::create_port_drill::SAW
-        && game.native_block_property(pos, "facing").as_deref() == Some("up")
-    {
+    if block == super::create_port_drill::SAW {
         sync |= super::create_port_saw_processing::tick(game, pos, entity, running_rpm);
     }
     if matches!(block.as_str(), "create:speedometer" | "create:stressometer") {
@@ -1416,19 +1444,16 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
         }
     }
     if block == "create:mechanical_press" {
+        use super::create_port_press_basin::{self as press_basin, Tick};
+
         // ParticleItems is source client-only/transient data, not saved state.
         entity.nbt.remove(&"ParticleItems".into());
-        crate::game::create_port_press_basin::on_speed_changed(entity, old_rpm, rpm);
-        crate::game::create_port_press_basin::on_speed_changed(
-            entity,
-            old_running_rpm,
-            running_rpm,
-        );
-        if let Some(changed) =
-            crate::game::create_port_press_basin::tick(game, pos, entity, running_rpm)
-        {
+        press_basin::on_speed_changed(entity, old_rpm, rpm);
+        press_basin::on_speed_changed(entity, old_running_rpm, running_rpm);
+        let tick = press_basin::tick(game, pos, entity, running_rpm);
+        if let Tick::Handled(changed) = tick {
             sync |= changed;
-        } else {
+        } else if let Tick::NonBasin { scan_due } = tick {
             // PressingBehaviour.write always emits these defaults, including an
             // untouched first belt cycle (start(BELT) does not reset Finished).
             entity.nbt.entry("Finished".into()).or_insert(Tag::Byte(0));
@@ -1447,14 +1472,11 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
                     "create:depot" | "create:belt"
                 ))
             };
-            let world_plan = if mode == 0 {
-                crate::game::create_port_world_items::inputs(game, pos)
+            let world_ready = scan_due && mode == 0
+                && crate::game::create_port_world_items::inputs(game, pos, 0.125)
                     .into_iter()
-                    .find_map(|input| result(game, &input.stack).map(|output| (input, output)))
-            } else {
-                None
-            };
-            let action = cycle.tick(running_rpm, world_plan.is_some());
+                    .any(|input| result(game, &input.stack).is_some());
+            let action = cycle.tick(running_rpm, world_ready);
             if action == Action::Started {
                 entity.clear_client_update_fields();
                 entity.nbt.remove(&"ParticleItems".into());
@@ -1466,25 +1488,18 @@ pub(super) fn tick(game: &mut Game<'_>, pos: [i32; 3], entity: &mut ModBlockEnti
                 entity.nbt.insert("NeedsUpdate".into(), Tag::Byte(1));
             }
             if action == Action::Press {
-                let mut particle = world_plan.as_ref().map(|(input, _)| input.stack.clone());
-                // tryProcessInWorld stores the original stack reference, then
-                // shrinks that stack in the nonbulk count>1 branch before writeClient.
-                if world_plan.is_some()
-                    && let Some(item) = &mut particle
-                    && item.count > 1
-                {
-                    item.count -= 1;
-                }
-                if let Some(item) = particle {
+                if mode == 0 {
+                    let bulk = super::create_port_server_config::bulk_pressing();
+                    let (grounded, particles) = super::create_port_world_items::strike(game, pos, bulk);
+                    if grounded {
+                        press_basin::reset_scan(game, pos);
+                    }
                     entity.set_client_update_fields(Compound::from([(
                         "ParticleItems".into(),
-                        Tag::List(vec![horizon_items::item_nbt::item_to_nbt(&item)]),
+                        Tag::List(particles),
                     )]));
                 }
                 crate::game::create_port_sounds::press(game, pos, rpm);
-                if let Some((input, output)) = world_plan {
-                    crate::game::create_port_world_items::press(game, input, output);
-                }
             }
             entity
                 .nbt
@@ -1509,7 +1524,16 @@ pub(super) fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         *tag = Some(super::create_port_crusher_client::update_tag(entity));
         return;
     }
-    if matches!(entity.id.as_str(), item_drain::BLOCK | super::create_port_basin::tank::BLOCK | super::create_port_basin::pump::PIPE) && tag.is_none() {
+    if entity.id == super::create_port_fluid_tank::BLOCK && tag.is_none() {
+        *tag = Some(super::create_port_fluid_tank::update_tag(entity));
+        return;
+    }
+    if matches!(
+        entity.id.as_str(),
+        item_drain::BLOCK | super::create_port_basin::pump::PIPE | super::create_port_portable_storage::BLOCK
+    )
+        && tag.is_none()
+    {
         *tag = Some(entity.nbt.clone());
         return;
     }
@@ -1517,7 +1541,11 @@ pub(super) fn update_tag(entity: &ModBlockEntity, tag: &mut Option<Compound>) {
         || entity.id == super::create_port_chute::funnel::ENTITY)
         && tag.is_none()
     {
-        *tag = Some(entity.nbt.clone());
+        let mut snapshot = entity.nbt.clone();
+        if super::create_port_chute::is_chute(&entity.id) {
+            super::create_port_chute::update_render_tag(entity, &mut snapshot);
+        }
+        *tag = Some(snapshot);
         return;
     }
     if entity.id == super::create_port_deployer::BLOCK && tag.is_none() {
@@ -1575,7 +1603,7 @@ pub(super) fn container(block: &str, container: &mut Option<ModContainer>) {
     crate::game::create_port_basin::container(block, container);
     crate::game::create_port_millstone::container(block, container);
     if super::create_port_chute::is_chute(block) && container.is_none() {
-        *container = Some(super::create_port_chute::container(block));
+        *container = Some(super::create_port_chute::container());
     }
     if matches!(block, super::create_port_drill::SAW | crusher::CONTROLLER) && container.is_none() {
         *container = Some(super::create_port_saw_processing::container());
@@ -1606,6 +1634,7 @@ pub(super) fn models(models: &mut Vec<String>) {
     models.extend([
         "create:block/blaze_burner/fallback_fire".to_owned(),
         "create:block/blaze_burner/fallback_soul_fire".to_owned(),
+        create_assets::FLUID_SPRITE_MODEL.to_owned(),
     ]);
     for part in create_assets::WHEEL_PARTS {
         for wood in create_assets::WOODS {
@@ -1686,8 +1715,8 @@ pub(super) fn draw(
         super::create_port_basin::pump::draw(game, pos, entity, draw);
         return;
     }
-    if block == super::create_port_basin::tank::BLOCK {
-        super::create_port_basin::tank::draw(game, pos, entity, draw);
+    if block == super::create_port_fluid_tank::BLOCK {
+        super::create_port_fluid_tank::draw(game, pos, entity, draw);
         return;
     }
     if block == item_drain::BLOCK {

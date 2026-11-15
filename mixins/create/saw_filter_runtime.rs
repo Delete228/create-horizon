@@ -75,7 +75,7 @@ pub(super) fn filter_display(
     use super::create_port_motor_value_world::{FilterDisplay, FilterLabel};
 
     let slot = Slot::at(game, hit.pos)?;
-    let filter = saw::read_filter(game, entity(game, hit.pos)?)?;
+    let filter = saw::read_filter(game.items(), entity(game, hit.pos)?)?;
     Some(FilterDisplay::sample(
         slot.center,
         [slot.yaw, 90.0, 0.0],
@@ -116,8 +116,8 @@ fn click<'a>(game: &Game<'_>, hit: &Hit, held: Option<&'a ItemStack>) -> Option<
     if held.is_some_and(|item| {
         let name = item.item.as_ref();
         matches!(name, "create:wrench" | "create:mechanical_arm")
-            || !saw::ordinary_filter_item(game, item)
-    }) || saw::read_filter(game, entity).is_none()
+            || !saw::ordinary_filter_item(game.items(), item)
+    }) || saw::read_filter(game.items(), entity).is_none()
     {
         return Some(Click::Blocked);
     }
@@ -196,7 +196,8 @@ pub(super) fn draw(game: &Game<'_>, pos: Pos, entity: &ModBlockEntity, draw: &mu
     }) {
         return;
     }
-    let (Some(slot), Some(Some(item))) = (Slot::at(game, pos), saw::read_filter(game, entity))
+    let (Some(slot), Some(Some(item))) =
+        (Slot::at(game, pos), saw::read_filter(game.items(), entity))
     else {
         return;
     };

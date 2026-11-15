@@ -19,6 +19,9 @@ pub struct RotaryContact {
     pub separation: [f64; 3],
     pub impact_fraction: f64,
     pub surface: bool,
+    pub normal: [f64; 3],
+    /// The world-oriented offset from the midpoint between the body center and feet.
+    pub location: [f64; 3],
 }
 
 fn dot(left: [f64; 3], right: [f64; 3]) -> f64 {
@@ -40,39 +43,65 @@ fn signed_epsilon(depth: f64) -> f64 {
 struct AxisTest {
     direction: [f64; 3],
     offset: f64,
-    combined_extent: f64,
+    block_extent: f64,
+    body_extent: f64,
     velocity: f64,
+    block_axis: bool,
+}
+
+struct BoxResponse {
+    separation: [f64; 3],
+    impact: f64,
+    normal: [f64; 3],
+    location: [f64; 3],
 }
 
 fn box_response(
     axes: impl IntoIterator<Item = AxisTest>,
     up: [f64; 3],
     max_step: f32,
-) -> Option<([f64; 3], f64)> {
+) -> Option<BoxResponse> {
     let mut minimum = (f64::MAX, [0.0; 3]);
+    let mut normal = (f64::MAX, [0.0; 3]);
+    let mut location = [0.0; 3];
     let mut step = f64::MAX;
     let mut entry = -1.0f64;
     let mut exit = f64::MAX;
     for axis in axes {
         let distance = axis.offset.abs();
-        let gap = distance - axis.combined_extent;
+        let combined_extent = axis.block_extent + axis.body_extent;
+        let gap = distance - combined_extent;
         if gap > 0.0 {
             if axis.velocity * axis.offset >= 0.0 || gap > axis.velocity.abs() {
                 return None;
             }
             entry = entry.max(gap / axis.velocity.abs());
-            exit = exit.min((gap + axis.combined_extent) / axis.velocity.abs());
+            exit = exit.min((gap + axis.block_extent + axis.body_extent) / axis.velocity.abs());
         } else {
             let projected_up = dot(axis.direction, up);
             if projected_up != 0.0 {
-                let lift = (axis.combined_extent - axis.offset * projected_up.signum())
-                    / projected_up.abs();
+                let lift =
+                    (combined_extent - axis.offset * projected_up.signum()) / projected_up.abs();
                 step = step.min(lift);
             }
         }
         // A centered axis has no separating sign. Original later axes win ties.
-        if distance != 0.0 && -gap <= minimum.0.abs() {
-            minimum = (gap.abs().copysign(axis.offset), axis.direction);
+        if distance != 0.0 {
+            let depth = gap.abs().copysign(axis.offset);
+            if axis.block_axis && -gap <= normal.0.abs() {
+                normal = (depth, axis.direction);
+            }
+            if -gap <= minimum.0.abs() {
+                minimum = (depth, axis.direction);
+                let extent = if axis.block_axis {
+                    axis.block_extent
+                } else {
+                    axis.body_extent
+                };
+                let inset = if depth == 0.0 { 0.0 } else { 0.125 };
+                let offset = axis.offset.signum() * -extent - axis.offset.signum() * inset;
+                location = axis.direction.map(|n| n * offset);
+            }
         }
     }
     let mut separation = [0.0; 3];
@@ -85,12 +114,19 @@ fn box_response(
     }
     // Java keeps a vertical-pass surface candidate even when the swept
     // intervals miss in time. Only a discrete or in-tick hit changes motion.
-    let impact = if entry > 0.0 && entry <= exit && entry < 1.0 {
+    let impact = if entry == -1.0 {
+        0.0
+    } else if entry > 0.0 && entry <= exit && entry < 1.0 {
         entry
     } else {
-        1.0
+        -1.0
     };
-    Some((separation, impact))
+    Some(BoxResponse {
+        separation,
+        impact,
+        normal: normal.1.map(|n| n * signed_epsilon(normal.0)),
+        location,
+    })
 }
 
 /// Resolve the local player's body against payload collision boxes. The source
@@ -122,16 +158,29 @@ pub fn rotary_contact(
         let length = dot(axis, axis).sqrt();
         axis.map(|v| v / length)
     });
-    let center: [f64; 3] = std::array::from_fn(|i| (body.min[i] + body.max[i]) * 0.5);
-    let relative = std::array::from_fn(|i| center[i] - f64::from(anchor[i]) - 0.5);
-    let mut center = rows.map(|row| dot(row, relative) + 0.5);
-    let mut extent = std::array::from_fn(|i| (body.max[i] - body.min[i]) * 0.5 + BODY_INFLATION);
-    if body.max[Y] - body.min[Y] > 1.0 {
-        // Java locates the body using its full center, then contracts the
-        // local player's head by 2/16 before constructing the OBB.
-        center[Y] -= 1.0 / 16.0;
-        extent[Y] -= 1.0 / 16.0;
+    // Construct the source AABB in this order. Rounding after translation
+    // and inflation can decide which of two equal axes supplies the hit.
+    let half: [f64; 3] = std::array::from_fn(|i| (body.max[i] - body.min[i]) * 0.5);
+    let feet = [body.min[0] + half[0], body.min[Y], body.min[2] + half[2]];
+    let world_center = [feet[0], feet[Y] + half[Y], feet[2]];
+    let relative = std::array::from_fn(|i| world_center[i] - f64::from(anchor[i]) - 0.5);
+    let mut local_feet = rows.map(|row| dot(row, relative) + 0.5);
+    local_feet[Y] -= half[Y];
+    let mut contracted = body.max;
+    if half[Y] > 0.5 {
+        // Java locates the body using its full center before contracting
+        // the local player's head by 2/16.
+        contracted[Y] -= 2.0 / 16.0;
     }
+    let local_bounds: [[f64; 2]; 3] = std::array::from_fn(|i| {
+        let translation = local_feet[i] - feet[i];
+        [
+            body.min[i] + translation - BODY_INFLATION,
+            contracted[i] + translation + BODY_INFLATION,
+        ]
+    });
+    let extent = local_bounds.map(|[min, max]| (max - min) * 0.5);
+    let center: [f64; 3] = std::array::from_fn(|i| local_bounds[i][0] + extent[i]);
     let rotated_extent = rows.map(|axis| projected_extent(axis, extent));
     let broad_extent: [f64; 3] =
         std::array::from_fn(|i| projected_extent(rows[i], [extent[i]; 3]) + 0.5);
@@ -150,6 +199,8 @@ pub fn rotary_contact(
     let mut separation = [0.0; 3];
     let mut impact_fraction = 1.0f64;
     let mut surface = false;
+    let mut normal = [0.0; 3];
+    let mut location = [0.0; 3];
     for vertical_pass in [false, true] {
         if axis != Axis::Y && !vertical_pass {
             continue;
@@ -160,22 +211,32 @@ pub fn rotary_contact(
             let local_axes = (0..3).map(|i| AxisTest {
                 direction: AXES[i],
                 offset: delta[i],
-                combined_extent: radius[i] + rotated_extent[i],
+                block_extent: radius[i],
+                body_extent: rotated_extent[i],
                 velocity: motion[i],
+                block_axis: true,
             });
             let entity_axes = (0..3).map(|i| AxisTest {
                 direction: directions[i],
                 offset: delta_original[i],
-                combined_extent: projected_extent(columns[i], *radius) + extent[i],
+                block_extent: projected_extent(columns[i], *radius),
+                body_extent: extent[i],
                 velocity: original_motion[i],
+                block_axis: false,
             });
-            if let Some((response, impact)) =
+            if let Some(response) =
                 box_response(local_axes.chain(entity_axes), directions[Y], max_step)
             {
-                for i in 0..3 {
-                    separation[i] += response[i];
+                for (total, component) in separation.iter_mut().zip(response.separation) {
+                    *total += component;
                 }
-                impact_fraction = impact_fraction.min(impact);
+                if response.impact >= 0.0 && response.impact < impact_fraction {
+                    normal = response.normal;
+                    location = response.location;
+                    if response.impact > 0.0 {
+                        impact_fraction = response.impact;
+                    }
+                }
                 surface |= vertical_pass;
             }
         }
@@ -185,9 +246,17 @@ pub fn rotary_contact(
         separation[0] *= 129.0 / 128.0;
         separation[2] *= 129.0 / 128.0;
     }
+    let normal = columns.map(|axis| dot(axis, normal));
+    let length = dot(normal, normal).sqrt();
     RotaryContact {
         separation: columns.map(|axis| dot(axis, separation)),
         impact_fraction,
         surface,
+        normal: if length < 1.0e-5 {
+            [0.0; 3]
+        } else {
+            normal.map(|n| n / length)
+        },
+        location: columns.map(|axis| dot(axis, location)),
     }
 }

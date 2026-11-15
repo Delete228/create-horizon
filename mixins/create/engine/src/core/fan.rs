@@ -76,8 +76,33 @@ impl Medium {
         .find(|kind| self.accepts(*kind))
     }
 }
-pub fn max_distance(rpm: f32) -> f32 {
-    3.0 + (rpm.abs() / 256.0).min(1.0) * 17.0
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub push_distance: i32,
+    pub pull_distance: i32,
+    pub block_check_rate: i32,
+    pub rotation_argmax: i32,
+    pub processing_time: i32,
+}
+impl Config {
+    pub const DEFAULT: Self = Self {
+        push_distance: 20,
+        pull_distance: 20,
+        block_check_rate: 30,
+        rotation_argmax: 256,
+        processing_time: 150,
+    };
+
+    pub fn max_distance(self, rpm: f32) -> f32 {
+        // Java chooses the configured distance by the raw speed, independently
+        // of the facing adjustment which decides the direction of the current.
+        let limit = if rpm > 0.0 {
+            self.push_distance
+        } else {
+            self.pull_distance
+        };
+        3.0 + (rpm.abs() / self.rotation_argmax as f32).min(1.0) * (limit as f32 - 3.0)
+    }
 }
 pub fn pushing(rpm: f32, facing: Direction) -> bool {
     rpm * if facing.vector().iter().any(|v| *v < 0) {
@@ -102,10 +127,17 @@ pub struct Processing {
     pub time: i32,
 }
 impl Processing {
-    fn duration(count: u32) -> i32 {
-        150 * ((count.saturating_sub(1) / 16) + 1) as i32 + 1
+    fn duration(count: u32, processing_time: i32) -> i32 {
+        let batches = ((count.saturating_sub(1) / 16) + 1) as i32;
+        processing_time.wrapping_mul(batches).wrapping_add(1)
     }
-    pub fn dropped(&mut self, kind: ProcessingType, count: u32, can_process: bool) -> bool {
+    pub fn dropped(
+        &mut self,
+        kind: ProcessingType,
+        count: u32,
+        can_process: bool,
+        processing_time: i32,
+    ) -> bool {
         if self.kind == Some(kind) {
             if self.time == -1 || self.time < -1 && !can_process {
                 return false;
@@ -115,16 +147,22 @@ impl Processing {
                 return false;
             }
             self.kind = Some(kind);
-            self.time = Self::duration(count);
+            self.time = Self::duration(count, processing_time);
         }
-        self.time -= 1;
+        self.time = self.time.wrapping_sub(1);
         self.time == 0
     }
-    pub fn transported(&mut self, kind: ProcessingType, count: u32, can_process: bool) -> bool {
+    pub fn transported(
+        &mut self,
+        kind: ProcessingType,
+        count: u32,
+        can_process: bool,
+        processing_time: i32,
+    ) -> bool {
         if self.kind != Some(kind) {
             self.kind = Some(kind);
             self.time = if can_process {
-                Self::duration(count)
+                Self::duration(count, processing_time)
             } else {
                 -1
             };
@@ -134,13 +172,16 @@ impl Processing {
             return false;
         }
         let before = self.time;
-        self.time -= 1;
+        self.time = self.time.wrapping_sub(1);
         before <= 0
     }
 }
 /// FanProcessing.applyProcessing(TransportedItemStack): recipes and the private
 /// TransportedItemStack constructor random source belong to the adapter.
 pub trait TransportedContext<T> {
+    fn processing_time(&self) -> i32 {
+        Config::DEFAULT.processing_time
+    }
     fn can_process(&mut self, stack: &crate::transport::Stack<T>, kind: ProcessingType) -> bool;
     fn process(
         &mut self,
@@ -158,7 +199,12 @@ pub fn process_transported<T: Clone>(
 ) -> crate::transport::TransportedResult<T> {
     use crate::transport::TransportedResult;
     let can_process = item.fan.kind != Some(kind) && context.can_process(&item.stack, kind);
-    if !item.fan.transported(kind, item.stack.count, can_process) {
+    if !item.fan.transported(
+        kind,
+        item.stack.count,
+        can_process,
+        context.processing_time(),
+    ) {
         return TransportedResult::DoNothing;
     }
     let Some(stacks) = context.process(&item.stack, kind) else {
@@ -510,10 +556,24 @@ mod tests {
             let mut a = Processing::default();
             let mut b = Processing::default();
             let dropped = (1..1000)
-                .find(|_| a.dropped(ProcessingType::Splashing, count, true))
+                .find(|_| {
+                    a.dropped(
+                        ProcessingType::Splashing,
+                        count,
+                        true,
+                        Config::DEFAULT.processing_time,
+                    )
+                })
                 .unwrap();
             let held = (1..1000)
-                .find(|_| b.transported(ProcessingType::Splashing, count, true))
+                .find(|_| {
+                    b.transported(
+                        ProcessingType::Splashing,
+                        count,
+                        true,
+                        Config::DEFAULT.processing_time,
+                    )
+                })
                 .unwrap();
             assert_eq!(dropped, 150 * ((count - 1) / 16 + 1) + 1);
             assert_eq!(held, dropped + 2);

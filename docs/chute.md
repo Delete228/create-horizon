@@ -3,7 +3,7 @@
 The dry vertical Chute uses `ChuteBlockEntity`, `ChuteItemHandler` and
 `ItemHelper.extract` from Create 6.0.10. Its block and block entity both use
 `create:chute`. A stack in transit saves as `Item` and `ItemPosition`. The
-airflow fields retain their original names and are zero in dry operation.
+airflow fields retain their original names and are zero without driven airflow.
 
 Put a supported container above the Chute to pull items through its bottom
 face. It takes up to 16 from the first eligible stack and any later stacks
@@ -17,11 +17,10 @@ Vanilla hoppers also reach the Chute's ordinary single slot. Empty-hand use
 recovers the held stack. A wrench switches between normal and window for a
 vertical Chute. Use a Block of Industrial Iron on either shape to encase it
 without consuming the block. The wrench removes the casing. These transitions
-keep the item in transit and its position. The fallback models use vanilla
-textures, and the optional
-original JAR supplies Create's models and textures. The window shows the item
-at its current position. Original sub-tick interpolation and pickup particles
-remain open.
+keep the item in transit and its position. The bundled models have their
+own shell and window textures. The optional original JAR supplies Create's
+models and textures. The client interpolates cargo in the window or under
+an opaque Chute with suction. Pickup particles remain open.
 
 An Iron Ingot between two Iron Sheets makes four Chutes. One Chute and one
 Andesite Casing craft a Portable Storage Interface. Both recipes retain their
@@ -29,9 +28,12 @@ original IDs and ingredients.
 Manual crafting works in the vanilla crafting-table menu. The pinned Horizon
 recipe-book index currently omits mod namespaces.
 
-The current adapter handles one loaded chunk column and ordinary inventory
-routes. Smart Chutes, diagonal routing, waterlogging, fans, and the goggles
-readout are separate steps.
+Ordinary Chutes connect diagonally in four directions. Hopper input works
+in the tested dry and waterlogged vertical and angled placements. A single
+Encased Fan can drive a straight column or feed one straight and one angled
+branch from below, including through waterlogged ordinary Chutes. Smart
+Chutes have their own filter and amount settings. The detailed cases and
+remaining limits are in the [compatibility guide](compatibility.md).
 
 `tools/chute_reference_checks.py` captures 90 ticks from four original Java
 layouts. `tools/chute_native_checks.py` compares the same chest, two-chute,

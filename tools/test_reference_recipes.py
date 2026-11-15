@@ -2,7 +2,10 @@
 import copy
 import unittest
 
-from reference_recipes import dry_mixing, fluid_mixing, heated_mixing, burner_data_maps, compacting, loot_for_horizon
+from reference_recipes import (
+    burner_data_maps, closed_fluid_ingredient, closed_fluid_tags, compacting, dry_mixing, fluid_mixing,
+    heated_mixing, loot_for_horizon, recipe_for_horizon, stock_closed_fluid_recipe,
+)
 
 
 class LootDialect(unittest.TestCase):
@@ -137,6 +140,55 @@ class Compacting(unittest.TestCase):
                 self.assertFalse(compacting(recipe))
         self.assertFalse(compacting({'type': 'create:compacting', 'ingredients': ['minecraft:ice'],
                                     'results': [{'fluid': 'minecraft:water', 'amount': 1000}]}))
+
+
+class StockClosedFluids(unittest.TestCase):
+    def test_export_selects_five_pinned_ids_without_enabling_milk(self):
+        for path in ('mixing/honey', 'mixing/chocolate_melting', 'compacting/honey',
+                     'compacting/chocolate', 'emptying/honey_bottle'):
+            kind = path.split('/')[0]
+            with self.subTest(path=path):
+                full = f'create/recipe/{path}.json'
+                self.assertTrue(stock_closed_fluid_recipe(full, {'type': f'create:{kind}'}))
+                self.assertFalse(stock_closed_fluid_recipe(full, {'type': 'create:crushing'}))
+        self.assertFalse(stock_closed_fluid_recipe('create/recipe/mixing/chocolate.json',
+                                                  {'type': 'create:mixing'}))
+        self.assertFalse(stock_closed_fluid_recipe('create/recipe/emptying/builders_tea.json',
+                                                  {'type': 'create:emptying'}))
+        self.assertFalse(stock_closed_fluid_recipe('unknown.json', {'type': None}))
+
+    def test_only_supported_closed_fluid_ingredients_match(self):
+        self.assertTrue(closed_fluid_ingredient({'type': 'neoforge:tag', 'tag': 'c:honey', 'amount': 1000}))
+        self.assertTrue(closed_fluid_ingredient({'type': 'neoforge:single', 'fluid': 'create:chocolate', 'amount': 250}))
+        self.assertFalse(closed_fluid_ingredient({'type': 'neoforge:tag', 'tag': 'c:milk', 'amount': 250}))
+        self.assertFalse(closed_fluid_ingredient({'type': 'neoforge:single', 'fluid': 'create:flowing_honey', 'amount': 250}))
+        self.assertFalse(closed_fluid_ingredient({'type': 'neoforge:tag', 'tag': 'c:honey', 'amount': True}))
+        self.assertFalse(closed_fluid_ingredient({'type': 'neoforge:single', 'fluid': 'create:honey', 'amount': 250, 'components': {}}))
+
+    def test_tag_export_requires_pinned_source_but_omits_flowing_variants(self):
+        paths = {f'c/tags/fluid/{fluid}.json': fluid for fluid in ('honey', 'chocolate')}
+        source = {path: {'values': [f'create:flowing_{fluid}', f'create:{fluid}']}
+                  for path, fluid in paths.items()}
+        self.assertEqual(closed_fluid_tags(source.__getitem__), {
+            path: {'replace': False, 'values': [f'create:{fluid}']} for path, fluid in paths.items()
+        })
+        with self.assertRaisesRegex(ValueError, 'Missing source fluid'):
+            closed_fluid_tags(lambda path: {'values': ['create:flowing_honey']})
+
+
+class ConditionalCrushing(unittest.TestCase):
+    def test_only_exact_absent_ex_nihilo_branch_keeps_original_diorite(self):
+        recipe = {'type': 'create:crushing', 'ingredients': [{'item': 'minecraft:diorite'}],
+                  'processing_time': 350, 'results': [{'chance': .25, 'id': 'minecraft:quartz'}]}
+        conditions = [{'type': 'neoforge:not',
+                       'value': {'type': 'neoforge:mod_loaded', 'modid': 'exnihilosequentia'}}]
+        source = dict(recipe, **{'neoforge:conditions': conditions})
+        diorite = 'create/recipe/crushing/diorite.json'
+        self.assertEqual(recipe_for_horizon(diorite, source), recipe)
+        self.assertIn('neoforge:conditions', source)
+        self.assertIsNone(recipe_for_horizon('create/recipe/crushing/granite.json', source))
+        conditions[0]['value']['modid'] = 'unknown'
+        self.assertIsNone(recipe_for_horizon(diorite, source))
 
 
 class BurnerDataMaps(unittest.TestCase):

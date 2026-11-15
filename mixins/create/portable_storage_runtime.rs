@@ -1,23 +1,28 @@
 // Copyright (c) 2026 create-horizon contributors
 // SPDX-License-Identifier: MIT
 
+use super::create_port_block_entity_revision::EntityRevision as _;
 use super::{
     Game, GameLevel, create_port_contraption as contraption,
     create_port_contraption_storage as storage, native_block_entity_draw::BlockEntityDraw,
 };
 use crate::{
-    containers::{BlockEntity, ModBlockEntity},
+    containers::{BlockEntity, ModBlockEntity, ModRevision},
     items::ItemStack,
 };
 use create_engine::{
     contraption::portable_storage::{
-        Actor, DEFAULT_TIMEOUT, Endpoint, PowerUpdate, Probe, Station, TickUpdate,
+        Actor, DEFAULT_TIMEOUT, Endpoint, MovingHead, PowerUpdate, Probe, Station, TickUpdate,
+        stationary_extension,
     },
     kinetics::{Axis, Pos},
     placement::Direction,
+    transport::SessionCache,
 };
 use glam::DVec3;
-use horizon_client_render::create_contraption_scene::Record;
+use horizon_client_render::create_contraption_scene::{
+    MAX_BLOCKS, RECORDS, Record, StrokeKind, read,
+};
 use horizon_core::{geometry::Direction as Face, position::BlockPos};
 use horizon_world::{
     attachments::{AttachmentType, Holder},
@@ -25,9 +30,10 @@ use horizon_world::{
     nbt::{Compound, Tag},
     registry::BlockStateId,
 };
-use std::{collections::BTreeMap, ops::ControlFlow};
+use std::{cell::RefCell, collections::BTreeMap, ops::ControlFlow};
 
 pub(super) const BLOCK: &str = "create:portable_storage_interface";
+const STALLED_DOCK: &str = "create_horizon:StalledItemDock";
 
 #[derive(Clone, Default)]
 struct Runtime {
@@ -42,6 +48,7 @@ struct Moving {
     motion: [f64; 3],
     visited: bool,
     refresh: bool,
+    advanced_at: Option<i64>,
 }
 
 const LINKS: AttachmentType<Runtime> = AttachmentType {
@@ -137,6 +144,14 @@ pub(super) fn block_state(state: &BlockState) -> bool {
     state.name == BLOCK && state.properties.len() == 1 && local_facing(state).is_some()
 }
 
+pub(super) fn has_multiple(blocks: &[(Pos, BlockState)]) -> bool {
+    blocks
+        .iter()
+        .filter(|(_, state)| state.name == BLOCK)
+        .nth(1)
+        .is_some()
+}
+
 fn local_facing(state: &BlockState) -> Option<Direction> {
     let facing = state.properties.get("facing")?;
     Direction::ALL
@@ -223,11 +238,11 @@ fn probe(record: &Record, local: Pos, facing: Direction) -> Option<Probe> {
     Probe::new(point.to_array(), direction.to_array())
 }
 
-fn mover(record: &Record) -> Option<(Pos, Direction)> {
-    if record.axis != Axis::Y.index()
-        || record.stroke.is_some()
+pub(super) fn mover(record: &Record) -> Option<(Pos, Direction)> {
+    if (record.axis != Axis::Y.index() && record.stroke_kind() != Some(StrokeKind::Gantry))
         || record.clock_hand.is_some()
         || record.return_home
+        || record.blocks.len() > MAX_BLOCKS
     {
         return None;
     }
@@ -236,6 +251,25 @@ fn mover(record: &Record) -> Option<(Pos, Direction)> {
         .iter()
         .find(|(_, state)| state.name == BLOCK)?;
     Some((*local, local_facing(state)?))
+}
+
+pub(super) fn saved_dock(entity: &ModBlockEntity) -> Option<Pos> {
+    match entity.nbt.get(&STALLED_DOCK.into()) {
+        Some(Tag::IntArray(pos)) => Pos::try_from(pos.as_slice()).ok(),
+        _ => None,
+    }
+}
+
+pub(super) fn save_dock(entity: &mut ModBlockEntity, dock: Option<Pos>) {
+    if let Some(pos) = dock {
+        if saved_dock(entity) != dock {
+            entity
+                .nbt
+                .insert(STALLED_DOCK.into(), Tag::IntArray(pos.to_vec()));
+        }
+    } else {
+        entity.nbt.remove(&STALLED_DOCK.into());
+    }
 }
 
 fn publish(game: &mut Game<'_>, pos: Pos, station: Station, sync: bool, compare: bool) {
@@ -253,21 +287,76 @@ fn publish(game: &mut Game<'_>, pos: Pos, station: Station, sync: bool, compare:
     }
 }
 
-/// The contraption samples the bearing's previously published pose before
-/// the next angle is selected, as the separate original entity tick does.
-pub(super) fn advance(game: &mut Game<'_>, record: &Record) -> bool {
-    let Some((local, facing)) = mover(record) else {
-        return false;
-    };
+/// The original controlled entity visits its dock before the stationary
+/// block entity ticks, regardless of the order in which they were loaded.
+pub(super) fn tick_piston_docks(game: &mut Game<'_>) {
+    let ticking = game.block_ticking_area();
+    let mut active = Vec::new();
+    for chunk in game.world.chunks.values() {
+        let Ok(records) = read(chunk) else {
+            continue;
+        };
+        for record in records.iter() {
+            let [x, y, z] = record.controller;
+            if record.stroke_kind() != Some(StrokeKind::Piston)
+                || !ticking(x, z)
+                || !game.border.contains(f64::from(x), f64::from(z))
+                || mover(record).is_none()
+                || !contraption::controller_present(game, record)
+            {
+                continue;
+            }
+            if let Some(BlockEntity::Mod(entity)) = game.world.block_entities.get(&(x, y, z)) {
+                active.push((record.clone(), saved_dock(entity)));
+            }
+        }
+    }
+    active.sort_unstable_by_key(|(record, _)| record.controller);
+    for (record, saved) in active {
+        advance(game, &record, saved);
+    }
+}
+
+/// Sample the previously published pose before the controller moves it again,
+/// in the same order as the original contraption entity and controller ticks.
+pub(super) fn advance(
+    game: &mut Game<'_>,
+    record: &Record,
+    saved_dock: Option<Pos>,
+) -> Option<Pos> {
+    let (local, facing) = mover(record)?;
     let key = contraption::column(record.controller);
-    let Some(mut runtime) = load(game, key) else {
-        return false;
-    };
+    let mut runtime = load(game, key)?;
+    let time = game.world.game_time;
+    if let Some(moving) = runtime.movers.get(&record.controller)
+        && moving.advanced_at == Some(time)
+    {
+        return moving.actor.working().filter(|_| moving.actor.stalled());
+    }
+    let current = probe(record, local, facing);
     let mut moving = runtime
         .movers
         .remove(&record.controller)
-        .unwrap_or_default();
-    let current = probe(record, local, facing);
+        .unwrap_or_else(|| {
+            let Some((saved, current)) = saved_dock.zip(current).filter(|_| record.stalled) else {
+                return Moving::default();
+            };
+            let dock = current.find(|pos| {
+                if pos == saved {
+                    endpoint(game, key, pos)
+                } else {
+                    None
+                }
+            });
+            if dock.is_none() {
+                return Moving::default();
+            }
+            Moving {
+                actor: Actor::resume_stall(saved),
+                visited: true,
+                ..Moving::default()
+            }
+        });
     let visit = if let Some((old, current)) = moving.previous.zip(current)
         && !moving.actor.stalled()
     {
@@ -289,6 +378,7 @@ pub(super) fn advance(game: &mut Game<'_>, record: &Record) -> bool {
     moving.visited |= visit;
     moving.refresh = false;
     moving.previous = current;
+    moving.advanced_at = Some(time);
     if let Some((pos, end, mut station)) = moving.actor.working().and_then(|pos| {
         Some((
             pos,
@@ -309,7 +399,7 @@ pub(super) fn advance(game: &mut Game<'_>, record: &Record) -> bool {
     } else {
         moving.actor.reset();
     }
-    let stalled = moving.actor.stalled();
+    let stalled = moving.actor.working().filter(|_| moving.actor.stalled());
     runtime.movers.insert(record.controller, moving);
     save(game, key, runtime);
     stalled
@@ -327,6 +417,19 @@ pub(super) fn remove(game: &mut Game<'_>, owner: Pos) {
         }
     }
     save(game, key, runtime);
+}
+
+pub(super) fn stop_motion(game: &mut Game<'_>, owner: Pos) {
+    let key = contraption::column(owner);
+    let Some(mut runtime) = load(game, key) else {
+        return;
+    };
+    if let Some(moving) = runtime.movers.get_mut(&owner) {
+        // Contraption.stop clears pose and motion; the PSI keeps its dock.
+        moving.previous = None;
+        moving.motion = [0.0; 3];
+        save(game, key, runtime);
+    }
 }
 
 pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity) {
@@ -412,6 +515,138 @@ fn draw_parts(
     draw.pop();
 }
 
+struct StationFrame {
+    owner: ModRevision,
+    previous: f32,
+    progress: f32,
+    tick: i64,
+}
+
+struct MovingFrame {
+    anchor: Pos,
+    local: Pos,
+    facing: Direction,
+    head: MovingHead,
+    tick: i64,
+}
+
+#[derive(Default)]
+struct ClientVisuals {
+    tick: Option<i64>,
+    stations: BTreeMap<Pos, StationFrame>,
+    moving: BTreeMap<Pos, MovingFrame>,
+}
+
+thread_local! {
+    static VISUALS: RefCell<SessionCache<ClientVisuals>> = RefCell::new(SessionCache::default());
+}
+
+fn with_visuals<R>(game: &Game<'_>, f: impl FnOnce(&mut ClientVisuals) -> R) -> R {
+    VISUALS.with_borrow_mut(|cache| {
+        f(cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id()))
+    })
+}
+
+pub(super) fn client_tick(game: &Game<'_>) {
+    if game.remote.is_none() {
+        VISUALS.with_borrow_mut(SessionCache::clear);
+        return;
+    }
+    let tick = game.world.game_time;
+    with_visuals(game, |visuals| {
+        if visuals.tick == Some(tick) {
+            return;
+        }
+        if visuals.tick.is_some_and(|old| old > tick) {
+            *visuals = ClientVisuals::default();
+        }
+        visuals.tick = Some(tick);
+        for (&(x, y, z), block) in game.world.block_entities.iter() {
+            let BlockEntity::Mod(entity) = block else {
+                continue;
+            };
+            if entity.id != BLOCK {
+                continue;
+            }
+            let station = read_nbt(&entity.nbt);
+            let progress = station.animation_progress(DEFAULT_TIMEOUT);
+            let pos = [x, y, z];
+            let owner = entity.revision();
+            let previous = visuals
+                .stations
+                .get(&pos)
+                .filter(|frame| frame.owner.is_same_create_entity(owner))
+                .map_or(0.0, |frame| frame.progress);
+            if previous != 0.0 || progress != 0.0 {
+                visuals.stations.insert(
+                    pos,
+                    StationFrame {
+                        owner,
+                        previous,
+                        progress,
+                        tick,
+                    },
+                );
+            }
+        }
+        visuals.stations.retain(|_, frame| frame.tick == tick);
+        for chunk in game.world.chunks.values().filter(|chunk| {
+            chunk
+                .saved
+                .as_ref()
+                .is_some_and(|saved| saved.attachments.has(&RECORDS))
+        }) {
+            let Ok(records) = read(chunk) else { continue };
+            for record in records.iter() {
+                let Some((local, facing)) = mover(record) else {
+                    continue;
+                };
+                let mut frame = MovingFrame {
+                    anchor: record.anchor,
+                    local,
+                    facing,
+                    head: MovingHead::default(),
+                    tick,
+                };
+                if let Some(old) = visuals.moving.get(&record.controller)
+                    && old.anchor == frame.anchor
+                    && old.local == local
+                    && old.facing == facing
+                {
+                    frame.head = old.head;
+                }
+                let dock = probe(record, local, facing).and_then(|probe| {
+                    probe.find(|pos| {
+                        if contraption::column(pos) != contraption::column(record.controller) {
+                            return None;
+                        }
+                        let station = read_nbt(&station_entity(game, pos)?.nbt);
+                        Some(Endpoint {
+                            facing: contraption::facing(game, pos)?,
+                            powered: station.powered(),
+                        })
+                    })
+                });
+                let stationary = record.stalled
+                    || record
+                        .stroke
+                        .map_or(record.angle == record.previous_angle, |stroke| {
+                            stroke.offset == stroke.previous
+                        });
+                let target = match dock {
+                    Some(dock) if stationary => station_entity(game, dock.position)
+                        .map(|entity| read_nbt(&entity.nbt).distance() / 2.0),
+                    Some(_) => None,
+                    None => Some(0.0),
+                };
+                frame.head.tick(target);
+                visuals.moving.insert(record.controller, frame);
+            }
+        }
+        visuals.moving.retain(|_, frame| frame.tick == tick);
+    });
+}
+
 pub(super) fn draw_station(
     game: &Game<'_>,
     pos: Pos,
@@ -420,11 +655,29 @@ pub(super) fn draw_station(
 ) {
     if let Some(facing) = contraption::facing(game, pos) {
         let station = read_nbt(&entity.nbt);
+        let progress = with_visuals(game, |visuals| {
+            visuals
+                .stations
+                .get(&pos)
+                .filter(|frame| frame.owner.is_same_create_entity(entity.revision()))
+                .map_or(0.0, |frame| {
+                    frame.previous + (frame.progress - frame.previous) * draw.partial
+                })
+        });
+        let extension = stationary_extension(progress, station.distance());
+        trace_head(
+            game,
+            pos,
+            false,
+            extension,
+            station.connected(DEFAULT_TIMEOUT),
+            station.timer(),
+        );
         draw_parts(
             game,
             draw,
             facing,
-            station.extension(DEFAULT_TIMEOUT),
+            extension,
             station.connected(DEFAULT_TIMEOUT),
         );
     }
@@ -440,24 +693,31 @@ pub(super) fn draw_moving(
     let Some(facing) = local_facing(state) else {
         return;
     };
-    let paired = probe(record, local, facing).and_then(|probe| {
-        probe.find(|pos| {
-            if contraption::column(pos) != contraption::column(record.controller) {
-                return None;
-            }
-            let station = read_nbt(&station_entity(game, pos)?.nbt);
-            station.connected(DEFAULT_TIMEOUT).then_some(Endpoint {
-                facing: contraption::facing(game, pos)?,
-                powered: station.powered(),
+    let head = with_visuals(game, |visuals| {
+        visuals
+            .moving
+            .get(&record.controller)
+            .filter(|frame| {
+                frame.anchor == record.anchor && frame.local == local && frame.facing == facing
             })
-        })
+            .map_or_else(MovingHead::default, |frame| frame.head)
     });
-    let extension = paired
-        .and_then(|dock| station_entity(game, dock.position))
-        .map_or(0.0, |entity| {
-            read_nbt(&entity.nbt).extension(DEFAULT_TIMEOUT)
-        });
-    draw_parts(game, draw, facing, extension, paired.is_some());
+    let extension = head.extension(draw.partial);
+    trace_head(game, record.controller, true, extension, head.settled(), 0);
+    draw_parts(game, draw, facing, extension, head.settled());
+}
+
+fn trace_head(game: &Game<'_>, pos: Pos, moving: bool, extension: f32, lit: bool, timer: u32) {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("CREATE_HORIZON_TRACE_DOCK").is_some()) {
+        log::info!(
+            "Create dock head: {}",
+            serde_json::json!({
+                "pos": pos, "moving": moving, "extension": extension, "lit": lit,
+                "timer": timer, "tick": game.world.game_time,
+            })
+        );
+    }
 }
 
 fn connected_mount(game: &mut Game<'_>, pos: Pos) -> Option<(Runtime, Station, storage::Mount)> {
@@ -467,11 +727,24 @@ fn connected_mount(game: &mut Game<'_>, pos: Pos) -> Option<(Runtime, Station, s
     }
     let runtime = load(game, key)?;
     let station = station_at(game, &runtime, pos).filter(|s| s.can_transfer(DEFAULT_TIMEOUT))?;
-    let owner = station.owner().filter(|owner| {
-        contraption::column(*owner) == key && game.native_block(*owner) == contraption::BLOCK
-    })?;
+    let owner = station
+        .owner()
+        .filter(|owner| contraption::column(*owner) == key)?;
     let records = contraption::entries(game, key).ok()?;
     let record = records.iter().find(|record| record.controller == owner)?;
+    let controller = game.native_block(owner);
+    let drives_mover = match record.stroke_kind() {
+        None => controller == contraption::BLOCK,
+        Some(StrokeKind::RopePulley) => controller == super::create_port_pulley::BLOCK,
+        Some(StrokeKind::Piston) => {
+            super::create_port_piston::is_piston(&controller)
+                && game.native_block_property(owner, "state").as_deref() == Some("moving")
+        }
+        Some(StrokeKind::Gantry) => record.stroke.is_some_and(|stroke| !stroke.waiting),
+    };
+    if !drives_mover || mover(record).is_none() {
+        return None;
+    }
     Some((runtime, station, storage::mounted_chest(record)?))
 }
 

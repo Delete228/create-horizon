@@ -32,7 +32,7 @@ def fluid_pipes(write, model, axial_boxes):
         'template': 'minecraft:glass', 'item': True,
         'properties': {**physical, 'map_color': 15},
         'state_properties': {name: {'type': 'boolean'} for name in (*FACES, 'waterlogged')},
-        'default_state': dict.fromkeys((*FACES, 'waterlogged'), 'false'),
+        'default_state': {**dict.fromkeys(FACES, 'true'), 'waterlogged': 'false'},
         'shapes': pipe_shape, 'collision_shapes': pipe_shape,
     })
     pump_shape = {'property': 'facing', 'values': {face: axial_boxes(face, [(2, 0, 16)]) for face in FACES}}

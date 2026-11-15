@@ -21,11 +21,46 @@
         "window_ne",
         "window_se"
       ]
+    },
+    "create_light": {
+      "type": "enum",
+      "values": [
+        "0",
+        "1",
+        "12"
+      ]
+    },
+    "create_connections": {
+      "type": "enum",
+      "values": [
+        "0",
+        "5",
+        "6",
+        "7",
+        "9",
+        "10",
+        "11",
+        "13",
+        "14",
+        "15"
+      ]
+    }
+  },
+  "state_light": {
+    "properties": [
+      "create_light"
+    ],
+    "values": {
+      "0": 0,
+      "1": 1,
+      "12": 12
     }
   },
   "default_state": {
     "top": "true",
     "bottom": "true",
-    "shape": "window"
+    "shape": "window",
+    "create_light": "0",
+    "create_connections": "0"
   }
 }

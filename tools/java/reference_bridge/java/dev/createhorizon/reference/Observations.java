@@ -13,6 +13,7 @@ import com.simibubi.create.content.kinetics.fan.AirFlowParticle;
 import com.simibubi.create.content.kinetics.fan.IAirCurrentSource;
 import com.simibubi.create.content.kinetics.fan.processing.FanProcessingType;
 import com.simibubi.create.content.equipment.goggles.GoggleOverlayRenderer;
+import com.simibubi.create.content.logistics.chute.ChuteBlockEntity;
 import com.simibubi.create.content.equipment.goggles.GogglesItem;
 import com.simibubi.create.foundation.blockEntity.behaviour.ValueSettingsBehaviour.ValueSettings;
 import com.simibubi.create.foundation.blockEntity.behaviour.ValueSettingsBoard;
@@ -24,6 +25,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.*;
 import net.createmod.catnip.animation.AnimationTickHolder;
+import net.createmod.catnip.animation.LerpedFloat;
 import net.createmod.catnip.outliner.Outliner;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -200,6 +202,23 @@ final class Observations {
         result.add("source_tooltip_anchor",vector(Math.min(mc.getWindow().getGuiScaledWidth()/2+config.overlayOffsetX.get(),mc.getWindow().getGuiScaledWidth()-width-20),
             Math.min(mc.getWindow().getGuiScaledHeight()/2+config.overlayOffsetY.get(),mc.getWindow().getGuiScaledHeight()-height-20)));
         result.addProperty("tooltip_height",height);return result;
+    }
+
+    static JsonObject chuteMotion(BlockPos position) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.level == null || !(minecraft.level.getBlockEntity(position) instanceof ChuteBlockEntity chute)) {
+            throw new IllegalArgumentException("No client Chute at the requested position");
+        }
+        LerpedFloat cargo = (LerpedFloat) field(chute, ChuteBlockEntity.class, "itemPosition");
+        float partial = AnimationTickHolder.getPartialTicks(minecraft.level);
+        JsonObject result = new JsonObject();
+        result.addProperty("time", minecraft.level.getGameTime());
+        result.addProperty("count", chute.getItem().getCount());
+        result.addProperty("previous", cargo.getValue(0));
+        result.addProperty("current", cargo.getValue(1));
+        result.addProperty("partial", partial);
+        result.addProperty("offset", cargo.getValue(partial));
+        return result;
     }
 
     static JsonObject particles(JsonObject body) {

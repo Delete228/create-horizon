@@ -1,0 +1,10 @@
+{
+  "template": "minecraft:cookie",
+  "max_stack_size": 64,
+  "components": {
+    "minecraft:food": {
+      "nutrition": 6,
+      "saturation": 3.6000001430511475
+    }
+  }
+}

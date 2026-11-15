@@ -194,6 +194,26 @@ def default_pull(host):
     return {'pull': pulled, 'output': output(host, 39, 64)}
 
 
+def legacy_filter_amount(host):
+    cmd = host.command
+    cmd(f'data merge block {xyz(FUNNEL)} {{FilterAmount:0,UpTo:0b}}')
+    [loaded] = step(host, 1, FUNNEL)
+    assert number(loaded, 'FilterAmount') == 16 and number(loaded, 'UpTo') == 1, loaded
+
+    cmd(f'data merge block {xyz(FUNNEL)} {{Filter:{{id:"minecraft:stick",count:3}}}}')
+    replaced = block(host, FUNNEL)
+    assert items(replaced['nbt'], 'Filter') == {STICK: 3}, replaced
+    assert number(replaced, 'FilterAmount') == 16 and number(replaced, 'UpTo') == 1, replaced
+
+    cmd(f'kill {DROPS}')
+    cmd(f'item replace block {xyz(SOURCE)} container.4 with minecraft:air')
+    cmd(f'item replace block {xyz(SOURCE)} container.1 with {marked(57, 24)}')
+    put(cmd, SIGNAL, 'minecraft:air')
+    [pulled] = samples(host, 1)
+    assert pulled == {'powered': False, 'cooldown': 8, 'source': {STICK: 8}}, pulled
+    return {'amount': 16, 'up_to': True, 'pull': pulled, 'output': output(host, 57, 16)}
+
+
 def exercise(host, work, report, cold_restart=None):
     cmd = host.command
     cmd(f'fill {AREA} minecraft:air')
@@ -242,6 +262,7 @@ def exercise(host, work, report, cold_restart=None):
     report['replacement_ghost'] = tap_filter(host, work, item='minecraft:snowball 4',
                                              expected={'minecraft:snowball': 4}, case='snowball')
     report['snowball_board'] = board(host, work, 0, maximum=16, case='-snowball')
+    report['legacy_filter_amount'] = legacy_filter_amount(host)
 
 
 def smart_aim(host, work, name):
@@ -341,7 +362,8 @@ def run_native(session, reference, report):
         host.command('tick freeze')
         exercise(host, session.scratch, report, cold_restart)
         report['smart'] = smart_amounts(host, session.scratch)
-        for field in ('exact_board', 'up_to_board', 'cancel_board', 'snowball_board', 'exact', 'up_to', 'default', 'smart'):
+        for field in ('exact_board', 'up_to_board', 'cancel_board', 'snowball_board', 'exact', 'up_to',
+                      'default', 'legacy_filter_amount', 'smart'):
             assert report[field] == reference[field], (field, report[field], reference[field])
 
 

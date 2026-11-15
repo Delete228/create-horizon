@@ -15,11 +15,10 @@
 
 - The [block catalog check](tools/block_catalog_checks.py) loaded all 84
   public blocks in each client, compared placed properties and block entity
-  IDs, and checked the raw defaults separately. All identities and block
-  entity types matched. After correcting 21 defaults, 83 blocks also
-  matched all properties. Fluid Pipe remains the one difference. Its Java
-  default has six open sides and an isolated command placement normalizes
-  to east and west. The native standalone command state has no open sides.
+  IDs, and checked the raw defaults separately. All 84 match, including
+  the six raw Fluid Pipe sides and the two sides left open after an
+  isolated command placement. The standalone Fluid Tank's two internal
+  Horizon properties are checked separately and both default to zero.
 - The [crushing recipe check](tools/crusher_recipe_checks.py) feeds one
   item through a Chute into a working pair of wheels. It compares 1,320
   tick samples from 44 distinct inputs, checking intake, countdown,
@@ -50,6 +49,18 @@
   check](tools/engineering_checks.py) compares the submitted crank base
   and handle poses with live speed on all six facings.
 
+## Configuration after world reload
+
+- [Motor and Chassis boards](tools/chassis_value_settings_checks.py) apply
+  fresh edits after opening a saved world. The motor's signed RPM and the
+  Chassis range are still present after another restart. Escape keeps the
+  old value, and a Chassis edit still requires a Wrench at confirmation.
+- [Bearing and actuator boards](tools/bearing_value_settings_checks.py)
+  compare the displayed choices with Java and commit a different choice
+  after reopening the save. A second restart verifies the edit for
+  Mechanical, Windmill and Clockwork Bearings, regular and sticky
+  Mechanical Pistons, and Rope Pulleys.
+
 ## Vertical Funnel audit
 
 - [Brass Funnel](tools/brass_funnel_checks.py) checks real short and long
@@ -70,8 +81,228 @@
   [Item Drain comparator](tools/item_drain_comparator_checks.py) comparisons
   also pass against their pinned Java traces.
 
-## November 8 follow-up
+## November 8–9 parity audit
 
+- [Pipe bends](tools/fluid_pipe_bend_checks.py) compare 65 ticks of a dry
+  line that changes direction four times and crosses a chunk boundary.
+  Both clients start transferring on tick 47 at 16 mB per tick, with the
+  same pressure and fluid progress on each face. Ordinary placement and
+  removing and replacing a neighboring tank produce the same ports. The
+  waterlogged variant moves lava at the same rate while keeping its water.
+- [Pipe branches](tools/fluid_pipe_branch_checks.py) compare 84 ticks in
+  each of three closed single-source networks. Both clients share pressure
+  by depth, reach a short outlet before a long one, and redirect unaccepted
+  flow when a target has only 3 mB of room.
+- [Branched Fluid Valves](tools/fluid_valve_branch_checks.py) match all 178
+  ticks with one gated outlet and all 250 with two independently gated
+  outlets. The comparisons include pointer value, target and speed, valve
+  state, pressure rebuild pauses and fluid amounts in the ungated bypass.
+  A cold Horizon restart preserves both pointers, their open states and
+  all four tank amounts. Restoring the drive leaves the closed branch idle.
+- [Fluid Valve pointer frames](tools/fluid_valve_pose_checks.py) compare the
+  original JAR model at rest and at 45° of travel. East and west have the
+  same negative image slope, and north has the opposite slope, in both
+  clients. The native east pointer previously leaned the other way.
+- [Fluid Valve single steps](tools/fluid_valve_step_checks.py) freeze a
+  moving pointer at 0.3 and step four game ticks. Each client advances
+  0.1 per step while keeping the target at 1. The ordinary inline and
+  two-branch cold restart regressions pass after this change.
+- [Pump range](tools/fluid_pump_range_checks.py) compares five lines at
+  each of two configured ranges. All 720 lane snapshots match. The last
+  pipe inside the range carries pressure and advances its flow, and the
+  pipe beyond it stays idle. A short branch can still fill its tank while
+  the longer branch is out of range.
+- [Pumps in series](tools/fluid_pump_series_checks.py) match 636 lane
+  snapshots across adjacent pumps and three-pipe gaps. The intermediate
+  pipes combine the two pressure contributions. Delivery uses the source
+  face's pressure at both equal and unequal RPM. The fixture also compares
+  the pressure wipe and retained flow at shutdown and restart. Another
+  636 snapshots include a capped arm between the pumps. The arm stays
+  unpressurized while flow continues along the connecting path.
+- [Two inlets and two outlets](tools/fluid_pipe_cross_branch_checks.py)
+  match 464 snapshots in the same network. The fixture includes unequal
+  path lengths, an inlet with 3 mB, and an outlet with room for 3 mB.
+  Pressure, fluid fronts and all four amounts agree at every sampled tick.
+- [An active side tank between two pumps](tools/fluid_pump_overlap_checks.py)
+  matches all 1,240 lane snapshots. The cases cover pressure favoring
+  either direction, a tie, and an initially empty side tank. Check both
+  pressure components, all observed flow fronts and the three stored
+  amounts while running both pumps, either pump alone, and both again.
+  A native restart at tick 70 restores pressure and preserves every lane's
+  total. The side tank continues to fill or drain according to the pumps.
+- The same fixture with `--paired` matches another 1,240 lane snapshots with
+  two side tanks. It compares both branch pressures, flow direction and
+  progress, and all four amounts through the same four drive phases. The
+  two side tanks also preserve their volumes and resume the expected flow
+  directions after restarting the Horizon world.
+- [Water and lava between co-directed pumps](tools/fluid_pump_overlap_collision_checks.py)
+  match 168 snapshots across the two directions. The branch delivers 90 mB
+  before the junction becomes cobblestone, then drops one pipe. The test
+  compares the saved contents, retained flow and pressure recovery.
+- The `--split` variant matches another 168 snapshots when the break leaves
+  a second side tank connected. That branch regains pressure while the
+  blocked faces still retain their old flow. A native restart during
+  recovery preserves all four tank contents and resumes filling the
+  connected tank without another pipe drop.
+- [Opposing pumps with no middle storage](tools/fluid_pump_opposed_checks.py)
+  match 160 snapshots with both pump faces pushing inward or pulling
+  outward. The exterior pressure and inlet flows match at unequal RPM,
+  the middle stays idle and neither tank loses fluid. The `--toggle`
+  variant matches 180 more snapshots through shutdown and restart,
+  including the briefly cleared pressure on the still-powered pump.
+  Both fixtures use three pipes between the pumps.
+- [Two pump inlets](tools/fluid_pipe_inlet_branch_checks.py) match 504
+  pressure, flow and storage snapshots across six closed networks. Each
+  equal branch supplies 8 mB per tick at 32 RPM. An extra pipe raises its
+  own branch to 16 mB per tick. In both mixed water and lava cases the
+  junction becomes cobblestone and drops one pipe before drawing fluid.
+  The disconnected faces keep their prior flow during the same rebuild
+  ticks in both clients. Both broken junctions and their single pipe drops
+  remain after a cold Horizon restart without draining either source.
+- [Pipe rim particles](tools/fluid_pipe_rim_checks.py) detect water and lava
+  drips at both rims of the pump on activation. The Horizon fixture also
+  checks a 20-block cutoff and returns to range without creating a
+  new startup drip on an existing flow.
+- [Open pipe ends](tools/fluid_pipe_open_checks.py) compare six 90-tick
+  sequences. They cover finite water and lava, a regenerating source,
+  waterlogged input and both fluids going back into the world. A restart
+  with fluid in all six buffers conserves volume. Horizon keeps the buffer
+  visible in the save while Java briefly omits it during pressure rebuild.
+- [Pipe and cauldron checks](tools/fluid_pipe_cauldron_checks.py) compare four
+  90-tick sequences. Full water and lava cauldrons each yield 1,000 mB.
+  A partly filled water cauldron stays unchanged, and a pump cannot fill
+  an empty cauldron through an open end. Both clients pause transfer while
+  the change to an emptied cauldron rebuilds pressure.
+- [Paired open inlets](tools/fluid_pipe_open_inlet_pair_checks.py) match
+  332 snapshots of a junction drawing from two full water cauldrons or a
+  full hive and nest. Both buffers start on the same tick and drain into
+  one tank without the rebuild pause of a straight intake. The final tank
+  contains 2,000 mB of water or 500 mB of honey. An actual Horizon restart
+  with fluid in all four inlet buffers preserves both final totals.
+- [Tank height config](tools/fluid_tank_height_config_checks.py) compares
+  120 parts at configured heights 2 and 36. Single towers and 2×2 and
+  3×3 tanks assign the same controllers, including across a chunk boundary.
+- [Tank render bounds](tools/fluid_tank_render_bounds_checks.py) compare
+  filled and empty windows with the original assets. Water remains visible
+  at the top of a six-block tower after its controller exits the frame, and
+  in a four-layer 3×3 tank that crosses a chunk boundary.
+- [Tank capacity config](tools/fluid_tank_capacity_config_checks.py) changes
+  the active setting from 4 to 2 buckets. An existing single tank and 2×2
+  layer still accept 4,000 and 16,000 mB. A new single tank accepts 2,000 mB.
+  In both clients the original goggles overlay shows the current configured
+  capacity (2,000 and 8,000 mB) even on the existing tanks. A full restart of
+  each client preserves the saved amounts and the three overlay snapshots.
+  Refilling after the restart uses the new 2,000 and 8,000 mB limits.
+- [Over-capacity saved tanks](tools/fluid_tank_overflow_checks.py) retain
+  8,001 mB water, 19,000 mB lava and 64,250 mB honey on read, as in Java.
+  Each line then transfers 112 mB. The remaining lava and honey can still
+  exceed the fill limit without disabling their tank.
+- [Paired open outlets](tools/fluid_pipe_open_outlet_pair_checks.py) compare
+  516 snapshots of two outlets fed from one closed tank. Two empty branches
+  place water on the same tick. With one or two lava branches, obsidian forms
+  before the remaining flow resumes. Java briefly omits a 1 mB buffer from
+  NBT during one rebuild. Horizon keeps the same fluid visible throughout.
+  With `--world-source`, another 516 snapshots compare an open cauldron
+  inlet feeding two outlets. The tankless circuit retains 500 mB per empty
+  outlet, makes one water source if only one outlet is open, or leaves the
+  cauldron full when both outlets react with lava. Horizon retains buffers
+  in the save during the brief rebuild in both clients. A cold Horizon
+  restart at tick 60, with 774 mB at the inlet and 113 mB at each outlet,
+  ends with 500 mB in each of the two outlets.
+- [Pipe spill reactions](tools/fluid_pipe_spill_checks.py) compare five
+  50-tick traces with still and flowing water and lava, plus a waterlogged
+  slab. Both clients form obsidian, stone or cobblestone on the same tick,
+  with the original 2,000 mB still in the supplying tank.
+- [An open inlet on a branched pipe](tools/fluid_pipe_branch_source_checks.py)
+  supplies two tanks in four 130-tick traces. Finite water and a lava
+  cauldron split into 500 mB per tank. A waterlogged block sends 997 mB to
+  the second tank when the first has only 3 mB of room. A regenerating
+  water source stays in place and feeds both tanks equally.
+- [An open outlet on a branched pipe](tools/fluid_pipe_branch_outlet_checks.py)
+  matches four 185-tick traces with a second outlet feeding a tank. It
+  covers a nearly full tank, an already blocked pipe and an obsidian
+  reaction that pauses the remaining outlet for four ticks. Fluid stays
+  accounted for in tanks, the open-end buffer and the resulting source.
+- The [open pipe check](tools/fluid_pipe_open_checks.py) also compares
+  155 ticks in the Nether. Both clients evaporate two buckets of water,
+  leaving the outlet empty, and place one lava source before stopping.
+  The evaporation code uses Create's sound event, position, volume and
+  pitch range. The fixture measures fluid volumes and block states.
+  With `pipesPlaceFluidSourceBlocks` disabled, a further 155-tick run
+  confirms both outlets discard full buffers without creating blocks.
+- The [open source fixture](tools/fluid_pipe_cauldron_checks.py) also
+  compares a full bee nest, a full beehive, a partially filled hive and
+  refused filling. Each full block yields 250 mB, with the same pressure
+  pause as Java. A cold restart at 80 mB transferred preserves the other
+  170 mB in both inlet buffers.
+- [Honey and Chocolate pump routes](tools/custom_fluid_storage_checks.py)
+  compare 280 ticks across four cases, including the last 3 mB of space
+  and refusal to mix the two fluids. The native routes continue after a
+  cold restart. Separate frames verify both fluids are visible with
+  imported and bundled resources. In the imported tank scene, Horizon
+  uses the original still sprites and renders them slightly brighter.
+- [Open pipe particles](tools/fluid_pipe_jet_checks.py) compare water intake
+  and lava output with the original client. The sprites, tint and lava's
+  block light match. The samples check the original spawn ranges and
+  direction-dependent velocities.
+- [Open pipe entity effects](tools/fluid_pipe_effect_checks.py) check eight
+  mobs across 26 ticks without placing a fluid source. A successful water
+  fill extinguishes burning sheep without hurting a Blaze. Lava ignites for
+  60 ticks on a fifth world tick. Ordinary fire damage begins the next tick
+  and fire resistance prevents it. The downward outlet reaches farther
+  below, and a blocked outlet leaves both the source and the mob unchanged.
+- [Open pipe dousing](tools/fluid_pipe_douse_checks.py) compares a fire,
+  candle, campfire and outside control on the first eligible water fill.
+  Both clients extinguish the first three and leave the control burning.
+  An integrated player catches fire under the lava outlet and is
+  extinguished under the water outlet with both exposed blocks still air.
+- [Open pipe items and arrows](tools/fluid_pipe_portable_checks.py) compare
+  seven entities over 27 ticks. Lava ignites an ordinary dropped item and
+  regular and spectral arrows for 60 ticks. The item takes ordinary fire
+  damage the following tick. Default netherite and a stack with an explicit
+  fire-resistance component stay intact, and water clears burning items and
+  arrows. This fixture measures server state. Dropped-item flame rendering
+  and prototype resistance removals remain outside its scope.
+- [Pump endpoints](tools/fluid_pump_basin_checks.py) compare eight
+  70-tick traces with Basins and Item Drains. Check Basin output priority,
+  full targets, side and bottom extraction, blocked top access, and a
+  final 12 mB transfer that empties the Drain.
+- [Multiblock tank schematics](tools/schematic_tank_checks.py) use an actual
+  Java export with 37 tank parts. Horizon restores all 12 horizontal
+  transforms and checks a cold restart, including across a chunk border.
+  Java loses windows or controller links in nine transforms. A partial
+  source, an existing touching tank and an obstruction refuse the whole
+  Horizon paste. Both clients clear the exported liquid on creative paste.
+- [Moving tanks](tools/bearing_tank_checks.py) compare capture of a whole
+  2×2×2 Tank from a single attached member. Empty, water and lava cases
+  match the Java bearing angles and rotated controller location. The
+  native fixture carries 19,000 mB through a blocked landing, clean
+  restart and repeated capture. A touching independent tank stays in
+  place. The original JAR shows fluid in motion after restart. Virtual
+  light propagation inside the moving structure is still open.
+- The [rotating rider check](tools/contraption_rider_checks.py) records the
+  angle and position together on the Java client. Across 13 descending blade
+  samples between −95° and −125°, the maximum height difference dropped
+  from 0.073 to 0.0041 blocks after moving active full-cube rotor contact
+  to the end of the local player tick. The full sweep still has a maximum
+  difference of about 0.101 blocks. The horizontal camera checks pass with
+  bundled and locally imported assets. An original-JAR run with additional
+  diagnostic logging exposed intermittent missed carry during uneven pose
+  delivery. Its worst observed position difference was 0.692 blocks.
+- The same fixture now holds the server for three local ticks, then stalls
+  the client window while the server advances the rotor by 9.6°. The player
+  keeps the same horizontal position during the hold, and the later descent
+  matches Java within 0.0019 blocks. A separate diagnostic-load replay
+  matches the descent within 0.0041 blocks. Unit cases check duplicate poses,
+  ticks with no update, a contiguous burst and discontinuous or replaced
+  geometry.
+- [Moving Slime Block contact](tools/rotary_slime_item_checks.py) compares
+  four airborne rebound ticks and the first impact on stone and on slime
+  below the bounce threshold. The largest measured Java/Horizon position
+  or velocity component difference is `5.32e-8`. The old Horizon client
+  treated the hard slime impact like stone. The [rotary contact oracle](tools/rotary_contact_oracle.py)
+  compares separation, time of impact, surface contact, normal and hit
+  location in 103,680 player and item cases on all three axes.
 - [Belt surface phase](tools/belt_render_oracle.py) compares 1,600 configurations
   against the pinned Flywheel visual and shader. The [native mesh check](tools/belt_render_game_checks.py)
   verifies 60 submitted meshes across four facings and five slopes. The east-facing live lane
@@ -88,6 +319,98 @@
   a neighbor update, an unblocked outlet and a motor restart. All observations
   match after separating the obstruction and entity search schedules. The old
   adapter applied force early in 11 observations.
+- [Hot and wet fan effects](tools/fan_hazard_checks.py) match 40 mob samples
+  for health, burning time and hurt time. Lava ignites a sheep for 200 ticks
+  and smoke for 40. A Blaze resists the lava jet and takes drowning damage
+  in the water current. Both clients give the player a first 4-point lava
+  hit and extinguish the fire on the first wet tick. The player countdown
+  continues between native control queries, so exact timer comparison covers
+  mobs only.
+- [Fan airflow particles](tools/fan_particle_java_checks.py) compare the four
+  processing media with the original JAR in both clients. The smoke push and
+  haunting pull follow the observed 4.84375-block outlet. A full obstruction
+  and a 1/32-block opening retire the particles on their first update. The
+  comparison checks direction, bounds, lifetime, sprite frames, and color
+  ranges across separately seeded runs.
+- [Upward fan ground contact](tools/fan_player_ground_checks.py) matches all
+  20 position, velocity, and ground-contact observations. A 1 RPM upward
+  current changes vertical velocity while the player stays on the grate.
+  The previous Horizon adapter cleared ground contact in all ten powered
+  observations.
+- [Fan server settings](tools/fan_config_checks.py) match four client current
+  ranges and 59 processing observations. Signed RPM selects the 29- or 7-block
+  maximum before scaling on either facing. The fan detects a distant obstruction
+  on the configured check. A running server picks up a valid four-to-zero-tick
+  processing edit on the next new stack.
+- [Fan-powered vertical Chutes](tools/chute_fan_checks.py) match all 165
+  cargo, position and airflow observations with the original JAR. Hopper
+  input arrives in the top Barrel on tick 29. A full Barrel holds the stack
+  halfway, including across an actual Horizon process restart. After one slot
+  is freed, the seven-item stack arrives on tick 45. Reversing the motor
+  publishes the new airflow on the same tick as Java and leaves the cargo
+  safely parked in the lower Chute.
+- [Suction from an upper Fan](tools/chute_suction_checks.py) matches 30
+  full observations in uninterrupted and cold Horizon runs. The open Chute
+  reaches three blocks. A trapdoor shortens the reach to 1.84375 blocks,
+  so the nearby stack is captured and the farther stack stays in the world.
+  A two-Chute column pulls seven component-bearing items from its lower
+  Barrel and returns the stack intact when the Fan stops. The same Java
+  fixture also records a 128 RPM split yielding 64 RPM in each branch.
+- [A lower Fan feeding a dry Chute fork](tools/chute_split_checks.py)
+  matches 124 observations each with uninterrupted and restarted Java
+  references. A 128 RPM source splits into two 64 RPM branches. The straight
+  branch wins a tie. An occupied straight branch diverts the marked cargo
+  through the angled branch across a chunk boundary without moving the
+  parked stack. Both clients resume from the same saved offset and reach the
+  upper Barrel one tick later after restart, when the upper Chute ticks first.
+- [Chute suction from horizontal Belts](tools/chute_belt_suction_checks.py)
+  matches 30 observations in uninterrupted and cold runs. Seven marked items
+  enter at offsets 0.1 from the Belt directly below or -1.9 from three blocks
+  below. Cargo exactly half a block from segment center remains on the Belt,
+  and a full-block obstruction prevents extraction.
+- [Chute suction from a Depot](tools/chute_depot_suction_checks.py) matches
+  48 lane ticks with the original JAR. All 23 marked items enter the Chute on
+  the first tick, both from the Depot directly underneath and across one air
+  block. The four output items stay in the Depot. A bare dry Fan and a solid
+  obstruction both leave the held stack in place. Additional Horizon checks
+  cover an occupied Chute, an output-only Depot and an unsupported buffer size.
+- [Chute air particles](tools/chute_air_particle_checks.py) compare actual
+  rendered particles in five lanes. The checks cover upward exhaust, suction
+  below a Chute, a solid obstruction, reversed motion and an idle Chute.
+  The original-JAR and fallback clients agree on sprite progression, size,
+  opacity, lifetime and bounded motion at the default particle setting.
+- [Chute cargo rendering](tools/chute_cargo_render_checks.py) checks three
+  original-JAR screenshots with the Chute outside the frame. A stack 2.875
+  blocks below the Chute is visible with suction or a window. An opaque Chute
+  without suction hides the same stack.
+- [Chute cargo motion](tools/chute_cargo_motion_checks.py) observes live
+  render fractions while an upper Fan lifts a dropped item. Java and Horizon
+  draw intermediate poses and hold the parked cargo at offset 0.5. The
+  server retains the original `ItemPosition` field in its saved data.
+- [Waterlogged Chutes](tools/wet_chute_checks.py) match 70 transfer observations
+  in each of the uninterrupted and cold runs. A Barrel feeds a marked 23-item
+  stack through two wet Chutes in the original batches. A side Hopper feeds
+  its own marked item through a second wet column. Both clients preserve the
+  in-flight stacks and waterlogged states during restart. The lanes use
+  separate columns and distinct block-entity hash slots to keep reload order
+  repeatable. Real placement clicks agree on the facing, shape and waterlogged
+  state in air and in a water source.
+- The `--wet` [lower-Fan](tools/chute_fan_checks.py) and
+  [upper-Fan](tools/chute_suction_checks.py) runs match 165 lane ticks and 30
+  complete snapshots with a native restart. Waterlogged Chutes retain the
+  original reversal and blocked-receiver behavior. Upper suction reaches 3
+  blocks in open space and 1.84375 blocks at the trapdoor. Seven marked items
+  return to the lower Barrel after power stops. The wet
+  [fork](tools/chute_split_checks.py) matches 124 observations in each of the
+  uninterrupted and cold runs, including diversion across a loaded chunk
+  boundary. Java and Horizon reopen the same in-flight stack at tick 13.
+  The straight and angled branches deliver at ticks 30 and 50, measured from
+  startup. Use `--java --cold --wet --java-root .local/PREPARED_ROOT`
+  to run the original test in a separate prepared Java directory.
+- [Hopper input to angled Chutes](tools/angled_chute_hopper_checks.py) matches
+  84 observations in dry and waterlogged lanes. The Hopper waits while the
+  angled Chute is occupied and inserts on tick 15 once the lower Barrel has
+  room. All three marked stacks keep their quantities and components.
 - [Dry Chutes](tools/chute_native_checks.py) hold a marked stack over a
   powered, downward-facing Andesite Funnel and resume at the same tick as
   Java when the funnel is replaced by a Chest. The [Smart Chute comparison](tools/smart_chute_checks.py)
@@ -114,6 +437,57 @@
   input stacks. The four existing Press/Basin traces and native restart
   controls still pass, as do 16 physical item-contact scenes and the
   existing Fluid Valve and Crafter comparisons.
+- [Basin item spout](tools/basin_spout_checks.py) compares eight states against
+  Java Create. A full Basin leaves two brass ingots buffered while another
+  recipe waits for output space. The native world reloads with both ingots
+  intact. Both clients move one ingot on the first available tick each time
+  space opens. Wrench choices, obstruction and route restoration also agree.
+- [Basin fluid spout](tools/basin_fluid_spout_checks.py) uses the same private
+  fluid-only mixing recipes in Java Create and Horizon. Water and lava each
+  wait in `FluidOverflow` when only 100 mB is free and transfer the entire
+  250 mB batch on the first tick with sufficient room. A cold Horizon reload
+  retains the queue, and the next recipe waits while the queue is occupied.
+  Closing the only route clears the queue when the spout faces down. Reopening
+  the route moves fluid from the local output tanks into the queue and then
+  into the receiver. Horizon also retains an unported fluid payload opaquely.
+- [Stock honey and chocolate recipes](tools/basin_melt_checks.py) compare a
+  cold mixer, a heated melt, fluid in the receiving Basin after a cold Horizon
+  restart and compaction back into the original item. Both clients transfer
+  1,000 mB of honey or 250 mB of chocolate through the side spout.
+- [Smart Chute Hopper input](tools/smart_chute_hopper_checks.py) matches top
+  and side Hopper transfers with plain filters. Both clients skip an earlier
+  mismatched Hopper slot, park one marked item and leave later matching items
+  upstream until the outlet opens. The first six cargo ticks agree, and a
+  cold Horizon restart retains the parked item and its components.
+- [Honey Bottle Item Drain](tools/item_drain_checks.py) matches 65 samples
+  across three Belt lanes and a cold restart. The drain empties 250 mB on
+  the original exchange tick, waits when capacity is insufficient, and
+  sends a glass bottle to the Depot after the outlet opens. The
+  [hand fixture](tools/item_drain_hand_checks.py) covers Survival, Creative,
+  incompatible fluid, insufficient capacity and cargo retrieval. With the
+  original JAR, the honey jet and fill surface render in both clients, with
+  visible differences in where the jet overlaps the bottle.
+- [Direct Honey Bottle use](tools/basin_tank_bottle_hand_checks.py) compares
+  five real clicks with the original JAR in both clients. Survival consumes
+  the filled bottle and returns glass when used on a Basin. A normal Fluid
+  Tank accepts 250 mB in Creative and keeps the marked held bottle. It
+  refuses in Survival, and neither container fills an empty Glass Bottle.
+- [Direct Water Bottle use](tools/basin_tank_bottle_hand_checks.py) compares
+  ten clicks with the original JAR. The Basin returns a 250 mB Water Bottle
+  with the original potion component and retains the other marked Glass
+  Bottle from a stack. Creative keeps the held bottle. A normal Fluid Tank
+  refuses Survival use and exchanges 250 mB in Creative. Both containers
+  reject insufficient volume or space.
+- [Water Bottle Item Drain](tools/item_drain_checks.py) matches 195
+  observations across three Belt lanes, including a cold restart with a
+  blocked outlet and a nearly full drain. The held Water Bottle retains its
+  potion component until the original 250 mB exchange tick. The
+  [hand fixture](tools/item_drain_hand_checks.py) matches five more cases.
+- [Crushing Wheel recipe components](tools/crusher_component_recipe_checks.py)
+  compare a recipe with two different component patches on the same output
+  item. Both clients keep two separate stacks while a Depot is blocked and
+  deliver them in the same order. Horizon retains them through a cold restart
+  and leaves input for a malformed recipe upstream.
 
 ## November 8 development checkpoint
 
@@ -226,6 +600,15 @@ developer source build. The three changes are applied in a separate checkout.
   client. Cutting and export match. Five of 103 samples show a one-tick
   difference in Belt refills or Chute deliveries after the reload.
   The same fixture with `--chute-inlet` matches all 103 samples exactly.
+- [Saw server options](tools/saw_config_checks.py) compare twelve-item
+  inputs from a Belt, a dry Chute and a landed stack. With bulk cutting
+  enabled, a stopped Saw buffers the marked stack and its original
+  100-unit timer through a cold Horizon restart. When Stonecutting is
+  disabled, both clients return the original marked Stone and still strip
+  the oak logs.
+  With `--hot-toggle`, both clients keep a loaded Saw's old bulk limit and
+  use the new limit for a freshly placed Saw. The previously cached recipe
+  list changes after `/reload`.
 - [Chute-to-Depot input](tools/chute_depot_checks.py) matches 48 lane-tick
   observations. A held item or occupied output buffer blocks delivery.
   The marked stack enters with the original vertical pose after release.
@@ -240,6 +623,18 @@ developer source build. The three changes are applied in a separate checkout.
   items and components. The Saw-to-Millstone test also passed again.
   With `--chute` the four dry inlet cases match Java as well, including
   partial insertion into a nearly full slot and retention through a restart.
+- [Hopper-fed Millstone recipe](tools/millstone_recipe_codec_checks.py)
+  compares a datapack with modern and legacy component-bearing results. A
+  99-item output slot pauses both clients while the Hopper feeds two marked
+  bottles. Horizon retains them through a cold restart. With 64 items left
+  in that slot, both clients mill one bottle per cycle, keep distinct paper
+  stacks with the same item ID, and return two glass bottles. Each cycle
+  follows the original 8, 4, 0 timer sequence at 64 RPM.
+- [Millstone item particles](tools/millstone_particle_checks.py) compare
+  fresh diamond particles at ±256 RPM, the quiet retry-arm tick, the
+  99-item pause, and motor removal and replacement. Java samples the live
+  particle engine. Horizon traces accepted spawns with the original JAR.
+  An engine test compares the Catnip position and velocity bits separately.
 - [Belt-to-Chute-to-Belt](tools/belt_chute_checks.py) matches 120 warm,
   cold, release and running samples across plain and Smart Chute lanes.
   Two Java restarts produced different ticker orders, advancing the first
@@ -247,18 +642,28 @@ developer source build. The three changes are applied in a separate checkout.
   complete match to either measured Java trace via repeated `--reference`.
   An incomplete native receiver retains the marked cargo in the Chute until
   it is replaced by a complete Belt.
-- [Chute-fed Crushing Wheels](tools/crushing_wheel_checks.py) match 357
+- [Chute-fed Crushing Wheels](tools/crushing_wheel_checks.py) match 476
   active lane observations for downward wheel pairs, including unequal RPM,
   both ticker orders, stop/resume, Milling fallback and Crushing recipe
   priority. Both clients preserve the inventory and timer before and after
   recipe application through real restarts. The downward output position,
-  initial velocity, pickup delay and bypass tag match. Unported inputs stay
-  in the Horizon Chute, and independent random results are checked by range.
+  initial velocity, pickup delay and bypass tag match. A diamond without a
+  recipe is consumed on tick six. The completed flag resets on an empty load
+  and Netherrack remains in the Chute. Independent random results are checked
+  by range.
 - [Free-falling ore](tools/crusher_drop_checks.py) matches 400 per-tick
   observations across two downward Crushing Wheel pairs. Both clients catch
   the items on tick 8 and store each stack and its custom data on tick 32.
   The wheels eject the diamond ore results on tick 51 and the four raw iron
   results on tick 183.
+- [Loose items without a recipe](tools/crusher_no_recipe_checks.py) matches
+  110 ticks per lane for paper and four sticks, including capture, the
+  marked input stack and a 100-duration cycle. Both runs end without an
+  output drop. The native check preserves Netherrack for its unported recipe.
+- [Standalone Diorite crushing](tools/crusher_recipe_checks.py) matches 30
+  tick samples, from Chute intake through the 350-duration cycle. The recipe
+  gives Quartz with a 25% chance. The native package carries its original ID
+  alongside the recipe for decorative Diorite.
   Independent chance outputs are checked against their recipe bounds.
 - Mixed colored cargo restores the same cells on a Mechanical Bearing after
   a real Horizon restart. The [separate swept-volume check](tools/bearing_chunk_sweep_checks.py)
@@ -309,6 +714,24 @@ developer source build. The three changes are applied in a separate checkout.
   clients capture 2,048 blocks and reach 91.20001 degrees on the sampled tick.
   Horizon lands the payload after a cold restart. Both leave the sampled
   source blocks in place when a 2,049th block is added.
+- [Rope Pulley capacity](tools/pulley_capacity_checks.py) checks the same
+  limit on a vertical lift. Both implementations reach offset 5.5 after 12
+  ticks and land all 2,048 blocks. Horizon saves the packed payload and
+  completes the lift after a cold restart. Both leave all 2,049 blocks in
+  place when capture exceeds the limit.
+- [Rope Pulley Tank cargo](tools/pulley_tank_checks.py) checks a complete
+  2×2×2 tank. Empty, Water and Honey loads lift to the pulley. A Chocolate
+  load descends and lands after power is removed. The Horizon fixtures
+  restart during each move and verify every landed member and fluid amount.
+- [Vertical piston capacity](tools/piston_capacity_checks.py) checks both
+  directions with 2,043 cargo blocks and five moving head and pole blocks.
+  Both reach offset 2.5 at tick 12 and refuse a 2,049th block. Horizon
+  cold-loads and lands both assemblies. The regular Piston leaves all cargo
+  at full extension and the Sticky Piston retracts it to the original cells.
+- [Gantry capacity](tools/gantry_capacity_checks.py) compares 2,047 cargo
+  blocks plus the carriage. Both reach offset 0.5 after six ticks. Horizon
+  cold-loads the assembly, parks it at the powered middle rail and resumes
+  when power is removed. Both land all the cargo and refuse a 2,049th block.
 - [Adjustable Chain Gearshift transitions](tools/adjustable_chain_transition_checks.py)
   match all 66 lane observations, including analog changes, an instantaneous
   redstone pulse and a native reload. The model state changes at the
@@ -379,6 +802,20 @@ developer source build. The three changes are applied in a separate checkout.
 - [Crafter-to-Belt output](tools/crafter_java_checks.py) matches 88 warm ticks
   while the Belt is stopped and 10 release ticks after a native restart.
   The exact Belt entry side, segment, position and previous position match.
+- [Directional Crafter output](tools/crafter_outlet_checks.py) compares
+  side Chest stacking, upward Barrel output, front ejection at a solid wall,
+  and side insertion into segment 2 of a stopped then powered Belt. The
+  matched entry records the original side and previous lateral offset.
+- [Crafter Chute output](tools/crafter_chute_checks.py) compares blocked
+  results and the release tick for open, stacked and powered Smart Chutes.
+  The final stack and position agree in each lane.
+- [Linked Crafter Hopper input](tools/crafter_hopper_checks.py) compares the
+  eight-tick cooldown, slot priority, blocked slots and automatic crafting
+  with Java. The native fixture reloads the group before completing the run.
+- [Linked Crafter machine input](tools/crafter_machine_input_checks.py) compares
+  Chute output, a collecting Funnel's held remainder and a differently facing
+  Crafter's finished product. The test checks item components and retries when
+  another slot becomes available.
 - [Deployer schematic paste](tools/schematic_deployer_checks.py) matches all
   144 Java orientation and transform cases. Unsafe source data, occupied
   destinations and active destinations are refused before the first write.
@@ -390,6 +827,18 @@ developer source build. The three changes are applied in a separate checkout.
   input. A native restart preserves the in-flight hand and transport state.
   [Filter changes during a stroke](tools/deployer_filter_transport_checks.py)
   match all 16 samples, including both results and the marked hand remainder.
+- [Stopped Deployer hand exchange](tools/deployer_hand_exchange_checks.py)
+  compares nine cases across real cold restarts in Java and Horizon with the
+  original JAR. The front click swaps a marked iron stack and damaged
+  pickaxe, keeps the ghost filter and item data, and works in Adventure.
+  The wrench switches modes without replacing the stored pickaxe. Front-view
+  captures show the iron's glint in Use and the upright pickaxe in Attack.
+- [Marked stationary Deployer stock](tools/deployer_stationary_components_checks.py)
+  compares oak planting and stage-six wheat fertilizing with original Java.
+  Both operations consume one marked, glinting item per use. Two cold
+  Horizon restarts preserve the remaining stack with the original JAR loaded.
+  The running check also replays a front click during expansion at 32 RPM
+  with an oak filter, then verifies the planted sapling and marked remainder.
 - [Deployer modes](tools/deployer_mode_checks.py) match 168 samples over two
   stationary lanes at 32 RPM. The Use hand switches a vanilla lever on ticks
   19 and 62. The Attack hand has the same stroke timer and leaves its lever
@@ -606,10 +1055,45 @@ records and all 101 Press lifecycle samples matched Java without aligning
 the clocks. The two cycles began at ticks 9 and 28 and produced two sheets.
 This fixture uses a single copper-ingot stack at the edge of the Depot.
 
+The [loose-item Press fixture](tools/press_world_checks.py) compares the
+smaller trigger box and larger strike box at 64 RPM. A grounded stone takes
+priority over four marked copper ingots. Removing it permits one sheet and leaves
+three marked ingots. An edge ingot stays idle until a centered stack starts
+a stroke, then the strike converts the edge ingot and leaves the centered
+stack intact. A split result has a ten-tick pickup delay and bounded random
+motion on all three axes. Horizon sent one 15-particle burst for each of the
+two successful strikes.
+
+The [bulk Press fixture](tools/press_bulk_checks.py) loads the original
+`bulkPressing` option. A World strike processes stacks of four copper ingots
+and six iron ingots while leaving a stone. The Depot and Belt process seven
+and nine copper ingots in one stroke. A live config reload switches an
+already placed Press back to single-item operation. In that mode the stone
+takes priority and the four marked copper ingots stay intact.
+
+The [Press scan fixture](tools/press_scan_checks.py) matches 799 per-tick
+RPM and Press state observations across Java and Horizon. A newly created
+or loaded Press starts with a ten-tick countdown. In the independent
+first-hit fixtures, a grounded item waits 72 unpowered ticks while the rig
+uses a new Motor, an established Clutch or a real restart with the Clutch
+disconnected. The first cycles begin at rows 83, 82 and 82. After a prior
+stroke completes, the next stroke starts at tick 11 when an ingot arrives
+between scans, and at tick 22 when it arrives while the Clutch is
+disconnected. The countdown pauses while the drive is stopped. Repeated
+starts are 33 ticks apart after a grounded strike and 42 after an empty
+strike in the two startup rigs.
+
 The Basin/Mixer retained its 83-tick first cycle and 62-tick repeat cycle.
 Eight Mixer HUD scenes passed their text, style and layout comparisons.
 The source sound-method oracle passed 2,776 cases. The latter measures
 parameters and lifecycle rather than audio output.
+
+The [Mixer particles fixture](tools/mixer_particle_checks.py) observed 63
+consecutive emission ticks in each client. The dry lane emitted two item
+particles per tick. The wet lane emitted one each of flour, water and honey.
+The original JAR replay matched sprites, water and honey colors, and signed
+launch geometry. The idle lane stayed quiet. Horizon paused emissions during
+a mid-stir freeze, resumed on unfreeze, and saved one recipe output per lane.
 
 [Review world and remaining limits](docs/reviews/belt-motion.md)
 

@@ -115,6 +115,26 @@ impl Resolver for Registry {
                 );
                 be = Some(schema);
             }
+            tank::BLOCK => {
+                defaults.extend([("top", "true"), ("bottom", "true"), ("shape", "window")]);
+                let mut schema = BlockEntitySchema::new(tank::BLOCK);
+                schema.safe_fields.extend([
+                    ("Window".into(), TagKind::Byte),
+                    ("Size".into(), TagKind::Int),
+                    ("Height".into(), TagKind::Int),
+                ]);
+                schema.discarded_fields.extend(
+                    [
+                        "Controller",
+                        "LastKnownPos",
+                        "TankContent",
+                        "Boiler",
+                        "Luminosity",
+                    ]
+                    .map(str::to_owned),
+                );
+                be = Some(schema);
+            }
             "minecraft:piston" => {
                 defaults.insert("extended", "false");
             }
@@ -133,6 +153,7 @@ impl Resolver for Registry {
                 "pointing" => ["up", "left", "down", "right"].contains(&value.as_str()),
                 "slope" => value == "horizontal",
                 "part" => ["start", "middle", "pulley", "end"].contains(&value.as_str()),
+                "shape" if state.name == tank::BLOCK => tank::validate_state(&state).is_ok(),
                 "shape" => {
                     ["normal", "window", "intersection", "encased"].contains(&value.as_str())
                 }
@@ -1156,4 +1177,135 @@ fn bounded_decompression_depth_nodes_and_collection_lengths_fail_before_large_al
         nested = Tag::Compound(Compound::from([("n".into(), nested)]));
     }
     assert!(nbt::encode_gzip(&Compound::from([("n".into(), nested)]), &limits).is_err());
+}
+
+fn tank_fixture() -> Schematic {
+    let mut schematic = Schematic {
+        data_version: SOURCE_DATA_VERSION,
+        size: [2; 3],
+        palettes: vec![Vec::new()],
+        blocks: Vec::new(),
+        entities: Vec::new(),
+    };
+    for y in 0..=1 {
+        for (x, z, shape) in [
+            (0, 0, "window_nw"),
+            (1, 0, "window_ne"),
+            (0, 1, "window_sw"),
+            (1, 1, "window_se"),
+        ] {
+            let mut state = BlockState::new(tank::BLOCK);
+            state.properties.extend([
+                ("top".into(), (y == 1).to_string()),
+                ("bottom".into(), (y == 0).to_string()),
+                ("shape".into(), shape.into()),
+            ]);
+            let mut data = Compound::from([
+                ("id".into(), Tag::String(tank::BLOCK.into())),
+                (
+                    "LastKnownPos".into(),
+                    Tag::IntArray(vec![900 + x, 80 + y, -500 + z]),
+                ),
+                ("Luminosity".into(), Tag::Int(0)),
+            ]);
+            if [x, y, z] == [0; 3] {
+                data.extend([
+                    ("Window".into(), Tag::Byte(1)),
+                    ("Size".into(), Tag::Int(2)),
+                    ("Height".into(), Tag::Int(2)),
+                    (
+                        "TankContent".into(),
+                        Tag::Compound(Compound::from([(
+                            "Fluid".into(),
+                            Tag::Compound(Compound::from([
+                                ("id".into(), Tag::String("minecraft:water".into())),
+                                ("amount".into(), Tag::Int(19000)),
+                            ])),
+                        )])),
+                    ),
+                ]);
+            } else {
+                data.insert("Controller".into(), Tag::IntArray(vec![900, 80, -500]));
+            }
+            schematic.blocks.push(Block {
+                relative_pos: [x, y, z],
+                state_index: schematic.palettes[0].len(),
+                block_entity: Some(data),
+            });
+            schematic.palettes[0].push(state);
+        }
+    }
+    schematic
+}
+
+#[test]
+fn complete_tank_uses_transformed_controller_corner_and_discards_fluids() {
+    let schematic = tank_fixture();
+    for (mirror, roots) in [
+        (Mirror::None, [[0, 0], [-1, 0], [-1, -1], [0, -1]]),
+        (Mirror::LeftRight, [[0, -1], [0, 0], [-1, 0], [-1, -1]]),
+        (Mirror::FrontBack, [[-1, 0], [-1, -1], [0, -1], [0, 0]]),
+    ] {
+        for (turn, [x, z]) in roots.into_iter().enumerate() {
+            let options = Options {
+                mirror,
+                quarter_turns: turn as u8,
+                ..Options::default()
+            };
+            let plan = preflight(&schematic, &Registry, &options).unwrap();
+            assert_eq!(plan.fluid_tanks.len(), 8);
+            assert!(plan.notes.iter().any(|note| note.field == "TankContent"));
+            for block in plan.blocks {
+                let [bx, by, bz] = block.relative_pos;
+                let tank = plan.fluid_tanks[&block.relative_pos];
+                assert_eq!((tank.root, tank.width, tank.height), ([x, 0, z], 2, 2));
+                let corner = if bx == x { "w" } else { "e" };
+                let side = if bz == z { "n" } else { "s" };
+                assert_eq!(
+                    block.state.properties["shape"],
+                    format!("window_{side}{corner}")
+                );
+                let data = block.block_entity.unwrap().data;
+                if [bx, by, bz] == tank.root {
+                    assert_eq!(
+                        data,
+                        Compound::from([
+                            ("Window".into(), Tag::Byte(1)),
+                            ("Size".into(), Tag::Int(2)),
+                            ("Height".into(), Tag::Int(2)),
+                        ])
+                    );
+                } else {
+                    assert!(data.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn partial_or_inconsistent_tanks_refuse_the_entire_plan() {
+    let complete = tank_fixture();
+    let mut partial = complete.clone();
+    partial.blocks.pop();
+    assert!(plan(&partial).is_err());
+    let mut wrong_link = complete.clone();
+    wrong_link.blocks[1]
+        .block_entity
+        .as_mut()
+        .unwrap()
+        .insert("Controller".into(), Tag::IntArray(vec![901, 80, -500]));
+    assert!(plan(&wrong_link).is_err());
+    let mut wrong_corner = complete.clone();
+    wrong_corner.palettes[0][1]
+        .properties
+        .insert("shape".into(), "window_nw".into());
+    assert!(plan(&wrong_corner).is_err());
+    let mut wrong_content = complete;
+    wrong_content.blocks[0]
+        .block_entity
+        .as_mut()
+        .unwrap()
+        .insert("TankContent".into(), Tag::Int(1000));
+    assert!(plan(&wrong_content).is_err());
 }

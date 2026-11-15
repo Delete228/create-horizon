@@ -324,13 +324,24 @@ impl Resolver for Registry<'_, '_> {
                         .map(str::to_owned),
                     );
                 }
-                super::create_port_basin::tank::BLOCK => {
+                super::create_port_fluid_tank::BLOCK => {
                     schema.safe_fields.extend([
                         ("Window".into(), TagKind::Byte),
                         ("Size".into(), TagKind::Int),
                         ("Height".into(), TagKind::Int),
                     ]);
-                    schema.discarded_fields.insert("TankContent".into());
+                    schema.discarded_fields.extend(
+                        [
+                            "Controller",
+                            "LastKnownPos",
+                            "TankContent",
+                            "Boiler",
+                            "Luminosity",
+                            "Uninitialized",
+                            "components",
+                        ]
+                        .map(str::to_owned),
+                    );
                 }
                 "create:mechanical_drill" => {
                     schema
@@ -616,6 +627,10 @@ fn destination(game: &Game<'_>, plan: &Plan, origin: [i32; 3]) -> Result<Vec<Wri
         .iter()
         .any(|block| block.state.name == "create:belt");
     for block in &plan.blocks {
+        let tank = plan.fluid_tanks.get(&block.relative_pos).map(|tank| {
+            create_engine::fluid_tank::Tank::new(tank.root, tank.width, tank.height)
+                .expect("schematic preflight validated the tank footprint")
+        });
         let mut pos = [0; 3];
         let mut overflow = false;
         for i in 0..3 {
@@ -648,6 +663,11 @@ fn destination(game: &Game<'_>, plan: &Plan, origin: [i32; 3]) -> Result<Vec<Wri
             Some("source creative placement cannot replace an unbreakable destination")
         } else if contains_belt && game.native_block(pos) == "create:belt" {
             Some("a Belt schematic cannot overwrite an existing Belt chain")
+        } else if !plan.fluid_tanks.is_empty()
+            && tank.is_none()
+            && game.native_block(pos) == super::create_port_fluid_tank::BLOCK
+        {
+            Some("a Fluid Tank schematic cannot overwrite existing tank parts")
         } else {
             belt_destination(game, &block.state, pos)
         };
@@ -655,7 +675,17 @@ fn destination(game: &Game<'_>, plan: &Plan, origin: [i32; 3]) -> Result<Vec<Wri
             issues.push(json!({"path":"destination","pos":pos,"message":reason}));
             continue;
         }
-        let state = match registry.id(&block.state) {
+        let mut block_state = block.state.clone();
+        if let Some(tank) = tank {
+            block_state.properties.insert(
+                "create_connections".into(),
+                tank.horizontal_mask(block.relative_pos).to_string(),
+            );
+            block_state
+                .properties
+                .insert("create_light".into(), "0".into());
+        }
+        let state = match registry.id(&block_state) {
             Ok(id) => id,
             Err(e) => {
                 issues.push(json!({"path":"destination","pos":pos,"message":e}));
@@ -672,7 +702,7 @@ fn destination(game: &Game<'_>, plan: &Plan, origin: [i32; 3]) -> Result<Vec<Wri
                 "message":"cannot replace an occupied or active Deployer"}));
             continue;
         }
-        if block.state.name == super::create_port_basin::tank::BLOCK {
+        if let Some(tank) = tank {
             let blocked = horizon_core::geometry::Direction::ALL
                 .into_iter()
                 .any(|side| {
@@ -680,9 +710,12 @@ fn destination(game: &Game<'_>, plan: &Plan, origin: [i32; 3]) -> Result<Vec<Wri
                     let [x, y, z] = std::array::from_fn(|axis| pos[axis] + delta[axis]);
                     !game.world.loaded(x, z) || game.native_block([x, y, z]) == block.state.name
                 });
-            if blocked || (old != state && game.native_block(pos) == block.state.name) {
+            if blocked
+                || ((tank.volume() > 1 || old != state)
+                    && game.native_block(pos) == block.state.name)
+            {
                 issues.push(json!({"path":"destination","pos":pos,
-                    "message":"a schematic Fluid Tank requires loaded neighbors and space apart from other tanks"}));
+                    "message":"a schematic Fluid Tank requires loaded neighbors and space apart from existing tanks"}));
                 continue;
             }
         }
@@ -709,12 +742,20 @@ fn destination(game: &Game<'_>, plan: &Plan, origin: [i32; 3]) -> Result<Vec<Wri
                     data
                 }
                 super::create_port_chute::BLOCK => super::create_port_chute::default_nbt(),
-                super::create_port_basin::tank::BLOCK => {
-                    let mut data = super::create_port_basin::tank::default_nbt();
-                    data.insert(
-                        "Window".into(),
-                        WorldTag::Byte(i8::from(block.state.properties["shape"] == "window")),
-                    );
+                super::create_port_fluid_tank::BLOCK => {
+                    let mut data = super::create_port_fluid_tank::default_nbt();
+                    let tank = tank.expect("validated tank placement");
+                    if tank.root != block.relative_pos {
+                        for key in ["Size", "Height", "Window", "TankContent"] {
+                            data.remove(&key.into());
+                        }
+                        // The complete footprint is already included in the
+                        // destination preflight. Its root must also fit.
+                        let root = (0..3)
+                            .map(|axis| origin[axis].saturating_add(tank.root[axis]))
+                            .collect();
+                        data.insert("Controller".into(), WorldTag::IntArray(root));
+                    }
                     data
                 }
                 _ => WorldCompound::new(),

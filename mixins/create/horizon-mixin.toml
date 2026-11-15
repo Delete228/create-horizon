@@ -24,6 +24,44 @@ name = "create_port"
 source = "runtime.rs"
 
 [[module]]
+id = "server-config"
+file = "crates/horizon-client/src/game.rs"
+name = "create_port_server_config"
+source = "server_config.rs"
+
+[[injection]]
+id = "create-register-configs"
+hook = "register_configs"
+hook_version = 1
+kind = "HEAD"
+helper = "server_config_register.rs"
+bindings = [{ name = "configs", ty = "&mut Vec<crate::game::NativeConfig>", value = "&mut *configs" }]
+
+[[injection]]
+id = "create-load-config"
+hook = "config_loading"
+hook_version = 1
+kind = "HEAD"
+helper = "server_config_read.rs"
+bindings = [{ name = "config", ty = "&crate::game::NativeConfigFile", value = "config" }]
+
+[[injection]]
+id = "create-reload-config"
+hook = "config_reloading"
+hook_version = 1
+kind = "HEAD"
+helper = "server_config_read.rs"
+bindings = [{ name = "config", ty = "&crate::game::NativeConfigFile", value = "config" }]
+
+[[injection]]
+id = "create-unload-config"
+hook = "config_unloading"
+hook_version = 1
+kind = "HEAD"
+helper = "server_config_unload.rs"
+bindings = [{ name = "config", ty = "&crate::game::NativeConfigFile", value = "config" }]
+
+[[module]]
 id = "sandpaper-runtime"
 file = "crates/horizon-client/src/game.rs"
 name = "create_port_sandpaper"
@@ -323,6 +361,30 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "stack", ty = "&crate::items::ItemStack", value = "stack" },
   { name = "pos", ty = "[i32; 3]", value = "pos" },
+]
+
+[[injection]]
+id = "fluid-tank-place-layer"
+hook = "place_block"
+hook_version = 1
+kind = "HEAD"
+helper = "fluid_tank_place_layer.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "stack", ty = "&crate::items::ItemStack", value = "stack" },
+]
+
+[[injection]]
+id = "fluid-tank-layer-click"
+hook = "right_click_block"
+hook_version = 1
+kind = "HEAD"
+helper = "fluid_tank_layer_click.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "face", ty = "[i32; 3]", value = "face" },
 ]
 
 [[injection]]
@@ -725,10 +787,41 @@ name = "create_port_millstone"
 source = "millstone.rs"
 
 [[module]]
+id = "fluid-tank"
+file = "crates/horizon-client/src/game.rs"
+name = "create_port_fluid_tank"
+source = "fluid_tank.rs"
+
+[[module]]
 id = "basin"
 file = "crates/horizon-client/src/game.rs"
 name = "create_port_basin"
 source = "basin.rs"
+
+[[module]]
+id = "fluid-open-end"
+file = "crates/horizon-client/src/game.rs"
+name = "create_port_fluid_open_end"
+source = "fluid_open_end.rs"
+
+[[module]]
+id = "fluid-open-effects"
+file = "crates/horizon-client/src/game.rs"
+name = "create_port_fluid_open_effects"
+source = "fluid_open_effects.rs"
+
+[[module]]
+id = "fluid-render"
+file = "crates/horizon-client/src/game.rs"
+name = "create_port_fluid_render"
+source = "fluid_render.rs"
+
+[[module]]
+id = "fluid-jet-particle"
+file = "crates/horizon-client-render/src/particles.rs"
+name = "create_fluid_jet"
+source = "fluid_jet_render.rs"
+visibility = "pub"
 
 [[module]]
 id = "basin-filter"
@@ -809,6 +902,26 @@ bindings = [
  {name="old",ty="horizon_world::registry::BlockStateId",value="old"},
  {name="new",ty="horizon_world::registry::BlockStateId",value="new"},
 ]
+
+# The pinned command path removes the previous entity before block_changed.
+[[injection]]
+id = "fluid-tank-command-replacement"
+target = "horizon_client::game::commands::Game<'_>::place_state"
+kind = "HEAD"
+helper = "fluid_tank_command_replacement.rs"
+bindings = [
+ {name="game",ty="&crate::game::Game<'_>",value="&*self"},
+ {name="pos",ty="[i32;3]",value="pos"},
+ {name="state",ty="horizon_world::registry::BlockStateId",value="state"},
+]
+
+# Include tank edits from this tick in the normal level attachment save.
+[[injection]]
+id = "fluid-tank-before-save"
+target = "horizon_client::game::Game<'_>::save_level"
+kind = "HEAD"
+helper = "fluid_tank_before_save.rs"
+bindings = [{name="game",ty="&mut crate::game::Game<'_>",value="&mut *self"}]
 
 [[injection]]
 id = "depot-transported-identity"
@@ -972,6 +1085,21 @@ bindings = [
 ]
 
 [[injection]]
+id = "fluid-pipe-shape"
+hook = "update_shape"
+hook_version = 1
+kind = "HEAD"
+helper = "fluid_pipe_shape.rs"
+bindings = [
+ {name="level",ty="&crate::game::GameLevel<'_>",value="self"},
+ {name="ticks",ty="&mut horizon_world::level::Ticks",value="&mut *ticks"},
+ {name="pos",ty="horizon_core::position::BlockPos",value="pos"},
+ {name="state",ty="horizon_world::registry::BlockStateId",value="state"},
+ {name="direction",ty="horizon_core::geometry::Direction",value="direction"},
+ {name="new",ty="&mut Option<horizon_world::registry::BlockStateId>",value="&mut *new"},
+]
+
+[[injection]]
 id = "crank-shape"
 hook = "update_shape"
 hook_version = 1
@@ -1012,13 +1140,6 @@ bindings = [
  {name="entity",ty="&crate::containers::ModBlockEntity",value="entity"},
  {name="bounds",ty="&mut [f32;6]",value="&mut *bounds"},
 ]
-
-# Pinned access to native_as_player; no replacement player or reach model.
-[[module]]
-id = "motor-configuration-reach"
-file = "crates/horizon-client/src/game/native_server.rs"
-name = "create_port_motor_reach"
-source = "motor_reach.rs"
 
 [[module]]
 id = "native-audio"
@@ -1441,6 +1562,19 @@ file = "crates/horizon-client/src/game.rs"
 name = "create_port_portable_storage"
 source = "portable_storage_runtime.rs"
 
+# Connected Crafter inputs choose one physical slot before vanilla ejectItems.
+[[injection]]
+id = "crafter-linked-hopper"
+target = "horizon_client::game::machines::Game<'_>::hopper_eject"
+kind = "HEAD"
+cancellable = true
+helper = "crafter_linked_hopper.rs"
+bindings = [
+ {name="game",ty="&mut crate::game::Game<'_>",value="&mut *self"},
+ {name="pos",ty="(i32,i32,i32)",value="pos"},
+ {name="hopper",ty="&crate::game::machines::View",value="hopper"},
+]
+
 # A dynamic item interface is not a fixed block entity slot container.
 [[injection]]
 id = "portable-storage-hopper"
@@ -1500,6 +1634,12 @@ id = "contraption-storage-runtime"
 file = "crates/horizon-client/src/game.rs"
 name = "create_port_contraption_storage"
 source = "contraption_storage_runtime.rs"
+
+[[module]]
+id = "contraption-tank-runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "create_port_contraption_tank"
+source = "contraption_tank_runtime.rs"
 
 [[module]]
 id = "contraption-menu-runtime"

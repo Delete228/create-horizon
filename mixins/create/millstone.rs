@@ -5,19 +5,20 @@
 // empty-hand collection and original NBT. No vanilla container screen is used.
 use super::{Game, native_block_entity_draw::BlockEntityDraw};
 use crate::{
-    containers::{BlockEntity, ModBlockEntity, ModContainer},
+    containers::{BlockEntity, ModBlockEntity, ModContainer, ModRevision},
     items::ItemStack,
 };
 use create_engine::{
     kinetics::Axis,
     milling::{self, Action, MillCycle},
+    transport::SessionCache,
 };
 use horizon_core::random::RandomSource;
 use horizon_world::nbt::{Compound, Tag};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 pub(super) const ID: &str = "create:millstone";
@@ -128,17 +129,7 @@ fn compile_recipe(game: &Game<'_>, json: &serde_json::Value) -> Option<CompiledR
     let outputs: Option<Vec<_>> = json["results"]
         .as_array()?
         .iter()
-        .map(|output| {
-            let mut output = output.clone();
-            // Read both ProcessingOutput codecs supported by Create 6.
-            if output.get("id").is_none() {
-                output["id"] = output["item"].clone();
-            }
-            Some((
-                game.native_recipe_result(&output)?,
-                output["chance"].as_f64().unwrap_or(1.0) as f32,
-            ))
-        })
+        .map(|output| compile_output(game, output))
         .collect();
     Some(CompiledRecipe {
         input,
@@ -150,6 +141,40 @@ fn compile_recipe(game: &Game<'_>, json: &serde_json::Value) -> Option<CompiledR
             outputs: outputs?,
         },
     })
+}
+
+fn compile_output(game: &Game<'_>, output: &serde_json::Value) -> Option<(ItemStack, f32)> {
+    use serde_json::Value;
+
+    let mut legacy;
+    let stack = if output.get("id").is_some() {
+        output
+    } else {
+        // ProcessingOutput.CODEC_OLD: `item` is an ItemStack.SINGLE_ITEM_CODEC
+        // value; `count` and `chance` belong to the outer result.
+        legacy = match output.get("item")? {
+            Value::Object(item) => Value::Object(item.clone()),
+            // Accept the prior native shorthand for legacy item IDs.
+            Value::String(id) => serde_json::json!({ "id": id }),
+            _ => return None,
+        };
+        legacy["count"] = output.get("count").cloned().unwrap_or(Value::from(1));
+        &legacy
+    };
+    if stack
+        .get("components")
+        .is_some_and(|value| !value.is_object())
+    {
+        return None;
+    }
+    let chance = match output.get("chance") {
+        Some(chance) => chance.as_f64()? as f32,
+        None => 1.0,
+    };
+    if !chance.is_finite() || chance < 0.0 {
+        return None;
+    }
+    Some((game.native_recipe_result(stack)?, chance))
 }
 
 pub(super) fn forget(pos: [i32; 3]) {
@@ -262,7 +287,9 @@ pub(super) fn insert_from_transport(
             Some(current) => current.count,
             None => 0,
         };
-        return stack.count.min(max_stack(game, stack).saturating_sub(present));
+        return stack
+            .count
+            .min(max_stack(game, stack).saturating_sub(present));
     }
     let remaining = game
         .native_insert_item(pos, horizon_core::geometry::Direction::Up, stack.clone())
@@ -428,61 +455,115 @@ pub(super) fn draw(
     true
 }
 
-/// Client-only counterpart of spawnParticles. Run once per client game tick,
-/// rather than per rendered frame, so frame rate never changes particle rate.
+struct ClientMillstone {
+    revision: ModRevision,
+    cycle: MillCycle,
+    rpm: f32,
+    full: bool,
+    input: Option<ItemStack>,
+}
+
+impl ClientMillstone {
+    fn read(entity: &ModBlockEntity) -> Self {
+        let items = |key: &str| match entity.nbt.get(&key.into()).and_then(|v| v.get("Items")) {
+            Some(Tag::List(items)) => items.as_slice(),
+            _ => &[],
+        };
+        let read = horizon_items::item_nbt::item_from_nbt;
+        Self {
+            revision: entity.revision(),
+            cycle: MillCycle {
+                timer: super::create_port::integer(&entity.nbt, "Timer"),
+            },
+            rpm: super::create_port::number(&entity.nbt, "Speed"),
+            full: items("OutputInventory")
+                .iter()
+                .filter_map(read)
+                .any(|stack| stack.count == milling::SLOT_LIMIT),
+            input: items("InputInventory")
+                .first()
+                .and_then(read)
+                .filter(|stack| stack.count > 0),
+        }
+    }
+}
+
+type ClientMillstones = BTreeMap<(i32, i32, i32), ClientMillstone>;
+thread_local! {
+    static CLIENT: RefCell<SessionCache<ClientMillstones>> = RefCell::new(SessionCache::default());
+}
+
+/// Mirrors the client branch of MillstoneBlockEntity.tick. Packet updates
+/// load the authoritative timer. Between updates, the local timer counts
+/// down, emits on the final decrement, and stays quiet on the next arm.
 pub(super) fn client_tick(game: &mut Game<'_>) {
-    if !game.native_window() || !game.native_on("create") {
+    if !game.native_window() || !game.native_on("create") || !game.clock.runs_normally() {
         return;
     }
-    let entries: Vec<_> = game
-        .world
-        .block_entities
-        .iter()
-        .filter_map(|(&(x, y, z), e)| {
-            let crate::containers::BlockEntity::Mod(e) = e else {
-                return None;
-            };
-            if e.id != ID {
-                return None;
-            }
-            let rpm = crate::game::create_port::number(&e.nbt, "Speed");
-            let timer = crate::game::create_port::integer(&e.nbt, "Timer");
-            let outputs_full = e
-                .nbt
-                .get(&"OutputInventory".into())
-                .and_then(|v| v.get("Items"))
-                .is_some_and(|v| match v {
-                    Tag::List(items) => items
-                        .iter()
-                        .filter_map(horizon_items::item_nbt::item_from_nbt)
-                        .any(|s| s.count == milling::SLOT_LIMIT),
-                    _ => false,
-                });
-            if rpm == 0.0 || timer <= 0 || outputs_full {
-                return None;
-            }
-            let input = e
-                .nbt
-                .get(&"InputInventory".into())
-                .and_then(|v| v.get("Items"))
-                .and_then(|v| match v {
-                    Tag::List(items) => items.first(),
-                    _ => None,
-                })
-                .and_then(horizon_items::item_nbt::item_from_nbt)?;
-            Some(([x, y, z], rpm, input))
-        })
-        .collect();
-    for (pos, rpm, input) in entries {
-        let angle = f64::from(game.world.random.next_float() * 360.0).to_radians();
-        let next = angle + (if rpm > 0.0 { 25.0f64 } else { -25.0f64 }).to_radians();
-        let offset = [angle.sin() * 0.5, 0.0, angle.cos() * 0.5];
-        let target = [next.sin() * 0.5, 0.0, next.cos() * 0.5];
-        let velocity = std::array::from_fn(|i| {
-            target[i] - offset[i] + (game.world.random.next_double() - 0.5) / 64.0
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var_os("CREATE_HORIZON_PARTICLE_TRACE").is_some());
+    let mut particles = Vec::new();
+    CLIENT.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let states = cache.dimension(std::ptr::from_ref(&game.world) as usize, game.dim.id());
+        states.retain(|pos, _| {
+            matches!(game.world.block_entities.get(pos), Some(BlockEntity::Mod(entity)) if entity.id == ID)
         });
-        let center = std::array::from_fn(|i| f64::from(pos[i]) + 0.5 + offset[i]);
+        for (&pos, entity) in &game.world.block_entities {
+            let BlockEntity::Mod(entity) = entity else {
+                continue;
+            };
+            if entity.id != ID {
+                continue;
+            }
+            let state = states.entry(pos).or_insert_with(|| ClientMillstone::read(entity));
+            if state.revision != entity.revision() {
+                *state = ClientMillstone::read(entity);
+            }
+            let pos = [pos.0, pos.1, pos.2];
+            let Some(input) = state.input.as_ref() else {
+                continue;
+            };
+            if state.rpm == 0.0 || state.full {
+                continue;
+            }
+            let duration = if state.cycle.timer <= 0 {
+                refresh_recipes(game);
+                recipe(game, pos, input).map(|recipe| recipe.duration)
+            } else {
+                None
+            };
+            let before = state.cycle.timer;
+            let action = state.cycle.tick(state.rpm, [], true, duration);
+            if matches!(action, Action::Processing | Action::Process) {
+                particles.push((pos, state.rpm, before, input.clone()));
+            } else if trace && action == Action::Armed {
+                log::info!("Create millstone particle: {}", serde_json::json!({
+                    "event": "armed", "pos": pos, "tick": game.world.game_time,
+                    "timer": state.cycle.timer,
+                }));
+            }
+        }
+    });
+    for (pos, rpm, before, input) in particles {
+        let angle = game.world.random.next_float();
+        let jitter = std::array::from_fn(|_| game.world.random.next_float());
+        let (offset, velocity) = milling::particle_vectors(angle, rpm, jitter);
+        let position = std::array::from_fn(|i| f64::from(pos[i]) + 0.5 + offset[i]);
         let options = game.item_particle(&input);
-        game.particles.add(&options, center, velocity);
+        let kind = options.ty.name();
+        let previous = trace.then(|| game.particles.made().get(kind).copied().unwrap_or(0));
+        game.particles.add(&options, position, velocity);
+        if let Some(previous) = previous {
+            let accepted = game.particles.made().get(kind).copied().unwrap_or(0) - previous;
+            log::info!(
+                "Create millstone particle: {}",
+                serde_json::json!({
+                    "event": "spawn", "pos": pos, "tick": game.world.game_time, "rpm": rpm,
+                    "timer": before, "item": input.item.as_ref(), "position": position,
+                    "velocity": velocity, "accepted": accepted,
+                })
+            );
+        }
     }
 }

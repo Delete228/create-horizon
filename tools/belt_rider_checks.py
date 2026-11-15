@@ -105,7 +105,7 @@ def verify_motion(rows, axis, signed_rpm, centered):
     return sum(seen) / len(seen)
 
 
-def exercise(command, read, read_block, aim, key, cased):
+def exercise(command, read, read_block, aim, key, wait_client_ticks, cased):
     setup(command, cased)
     trace = {}
 
@@ -143,6 +143,27 @@ def exercise(command, read, read_block, aim, key, cased):
     forward = verify_motion(trace['forward'], 0, -32, True)
     if cased:
         verify_casing(read_block)
+    command('tick freeze')
+    try:
+        wait_client_ticks(4)
+        freeze = read()
+        wait_client_ticks(4)
+        held = read()
+        command('tick step 3')
+        wait_client_ticks(7)
+        stepped = read()
+        wait_client_ticks(4)
+        held_after_step = read()
+    finally:
+        command('tick unfreeze')
+    trace['freeze'] = [freeze, held, stepped, held_after_step]
+    # In Java the local rider stays still during server-only steps. Ordinary
+    # local carry resumes when the world unfreezes.
+    for row in trace['freeze']:
+        height(row)
+        assert all(near(x, y) for x, y in zip(freeze['position'], row['position'], strict=True)), trace['freeze']
+    trace['resumed'] = wait_for(read, lambda row: row['position'][0] < held_after_step['position'][0] - .04)
+    verify_motion([held_after_step, trace['resumed']], 0, -32, True)
     key('shift', True)
     trace['crouch'] = settled(trace['forward'][-1])
     key('shift', False)
@@ -211,6 +232,13 @@ def java(work, cased):
     def key(name, down):
         host.call('input', {'key': name, 'down': down})
 
+    def wait_client_ticks(count):
+        def client_tick():
+            return host.call('rider_pose', {'pos': ROOT_X})
+
+        until = client_tick()['player_tick'] + count
+        wait_for(client_tick, lambda row: row['player_tick'] >= until)
+
     try:
         host.command('gamemode creative')
         host.command('tp @s ' + xyz((X + 7.5, Y + 4, Z + .5)))
@@ -218,7 +246,7 @@ def java(work, cased):
         host.snapshot([ROOT_X, ROOT_Z], 18)
         host.command('tick rate 8')
         host.call('tick', {'frozen': False})
-        return exercise(host.command, read, read_block, aim, key, cased)
+        return exercise(host.command, read, read_block, aim, key, wait_client_ticks, cased)
     finally:
         for name in ('shift', 'forward'):
             key(name, False)
@@ -258,7 +286,7 @@ def native(session, cased):
         wait_loaded(call, [ROOT_X, ROOT_Z])
         command('tick rate 8')
         command('tick unfreeze')
-        return exercise(command, read, read_block, aim, key, cased)
+        return exercise(command, read, read_block, aim, key, lambda ticks: call('wait', ticks), cased)
 
 
 def main():

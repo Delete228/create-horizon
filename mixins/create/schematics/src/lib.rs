@@ -15,10 +15,12 @@
 //! Minecraft 1.21.1 client JAR's version.json (`world_version`: 3955).
 pub mod nbt;
 pub use nbt::{Compound, Tag, TagKind};
+mod tank;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
+pub use tank::Tank;
 
 pub const SOURCE_DATA_VERSION: i32 = 3955;
 
@@ -470,6 +472,7 @@ pub struct Plan {
     pub blocks: Vec<PlannedBlock>,
     pub notes: Vec<Note>,
     pub skipped_air: usize,
+    pub fluid_tanks: BTreeMap<[i32; 3], Tank>,
 }
 
 fn valid_id(id: &str) -> bool {
@@ -516,16 +519,8 @@ fn resolve(resolver: &impl Resolver, state: &BlockState) -> Result<BlockSchema, 
             return Err("a Chute requires explicit dry facing and a supported shape".into());
         }
     }
-    if state.name == "create:fluid_tank" {
-        let property = |key| state.properties.get(key).map(String::as_str);
-        if property("top") != Some("true")
-            || property("bottom") != Some("true")
-            || !matches!(property("shape"), Some("plain" | "window"))
-        {
-            return Err(
-                "a schematic Fluid Tank must be a standalone plain or windowed tank".into(),
-            );
-        }
+    if state.name == tank::BLOCK {
+        tank::validate_state(state)?;
     }
     if state.name == "create:deployer"
         && ["facing", "axis_along_first"]
@@ -615,7 +610,16 @@ fn transform_state(
             Some("facing"),
         ),
         "create:chute" => (&["facing", "shape", "waterlogged"], Some("facing")),
-        "create:fluid_tank" => (&["top", "bottom", "shape"], None),
+        tank::BLOCK => (
+            &[
+                "top",
+                "bottom",
+                "shape",
+                "create_connections",
+                "create_light",
+            ],
+            None,
+        ),
         "create:depot" => (&["waterlogged"], None),
         "minecraft:air"
         | "minecraft:cave_air"
@@ -652,6 +656,10 @@ fn transform_state(
             "{operation} requires the explicit pointing property for {}",
             state.name
         ));
+    }
+    if state.name == tank::BLOCK {
+        let shape = tank::transform_shape(&requested.properties["shape"], options);
+        state.properties.insert("shape".into(), shape.into());
     }
     if let Some(key) = orientation {
         // A Java export supplies these properties. Do not transform a default
@@ -852,23 +860,6 @@ fn validate_chute_source(raw: &Compound) -> Result<(), String> {
     );
     if !empty || !still || !position {
         return Err("only empty Chute data without airflow is supported".into());
-    }
-    Ok(())
-}
-
-fn validate_tank_source(state: &BlockState, raw: &Compound) -> Result<(), String> {
-    let window = i8::from(state.properties["shape"] == "window");
-    if raw.get("Window") != Some(&Tag::Byte(window))
-        || raw.get("Size") != Some(&Tag::Int(1))
-        || raw.get("Height") != Some(&Tag::Int(1))
-        || raw.contains_key("Controller")
-        || raw
-            .get("TankContent")
-            .is_some_and(|tag| !matches!(tag, Tag::Compound(values) if values.is_empty()))
-    {
-        return Err(
-            "only empty standalone Fluid Tank data matching its window state is supported".into(),
-        );
     }
     Ok(())
 }
@@ -1223,8 +1214,8 @@ pub fn preflight(
                 fail(format!("{path}.nbt"), Some(pos), message);
                 continue;
             }
-            if prepared.state.name == "create:fluid_tank"
-                && let Err(message) = validate_tank_source(&prepared.state, raw)
+            if prepared.state.name == tank::BLOCK
+                && let Err(message) = tank::validate_data(raw)
             {
                 fail(format!("{path}.nbt"), Some(pos), message);
                 continue;
@@ -1338,26 +1329,10 @@ pub fn preflight(
             "a diagonal Chute requires its downhill Chute in the schematic".into(),
         );
     }
-    let tanks: BTreeSet<_> = blocks
-        .iter()
-        .filter(|(_, block)| block.state.name == "create:fluid_tank")
-        .map(|(_, block)| block.relative_pos)
-        .collect();
-    for &[x, y, z] in &tanks {
-        if [[x + 1, y, z], [x, y + 1, z], [x, y, z + 1]]
-            .into_iter()
-            .any(|neighbor| tanks.contains(&neighbor))
-        {
-            fail(
-                "blocks".into(),
-                Some([x, y, z]),
-                "schematic Fluid Tanks must not touch".into(),
-            );
-        }
-    }
     if !issues.is_empty() {
         return Err(issues);
     }
+    let fluid_tanks = tank::prepare(schematic, &mut blocks, options)?;
     // Source creative printer visits X first, then Z, then Y, and does a
     // separate deferred pass. Source BE/shape behavior still belongs to adapter.
     blocks.sort_by_key(|(deferred, b)| {
@@ -1378,6 +1353,7 @@ pub fn preflight(
         blocks: blocks.into_iter().map(|(_, b)| b).collect(),
         notes,
         skipped_air,
+        fluid_tanks,
     })
 }
 

@@ -7,7 +7,7 @@
 // across a data-pack reload, while every subsequent lookup sees the new generation.
 use super::{Game, create_port_basin as basin, create_port_fluid_codec as fluids};
 use crate::items::ItemStack;
-use create_engine::{basin as rules, transport::SessionCache};
+use create_engine::{basin as rules, fluid_transport::Fluid, transport::SessionCache};
 use horizon_client::crafting::{Ingredient, Recipe as Crafting};
 use horizon_core::random::RandomSource;
 use std::{
@@ -17,18 +17,114 @@ use std::{
 };
 type Pos = [i32; 3];
 
+pub(super) mod emptying {
+    use super::{Fluid, Game, ItemStack};
+    use horizon_world::nbt::Tag;
+
+    const HONEY_BOTTLE: &str = "minecraft:honey_bottle";
+    pub(in crate::game) const GLASS_BOTTLE: &str = "minecraft:glass_bottle";
+    pub(in crate::game) const BOTTLE_AMOUNT: i32 = 250;
+
+    fn bucket_fluid(item: &str) -> Option<&'static str> {
+        match item {
+            "minecraft:water_bucket" => Some("minecraft:water"),
+            "minecraft:lava_bucket" => Some("minecraft:lava"),
+            _ => None,
+        }
+    }
+
+    // PotionFluidHandler maps plain, regular Water Bottles to vanilla water.
+    // Other bottle types or custom effects need Create's potion fluid codec.
+    fn is_water_bottle(game: &Game<'_>, stack: &ItemStack) -> bool {
+        stack.item.as_ref() == "minecraft:potion"
+            && stack.potion() == Some(Fluid::Water.id())
+            && stack.data().is_some_and(|data| {
+                data.potion_extra.iter().all(|(key, value)| {
+                    key != "custom_effects"
+                        || matches!(value, Tag::List(effects) if effects.is_empty())
+                })
+            })
+            && !game.items().item_in_tag("create:not_potion", &stack.item)
+    }
+
+    pub(in crate::game) fn can_empty(game: &Game<'_>, stack: &ItemStack) -> bool {
+        stack.item.as_ref() == HONEY_BOTTLE
+            || bucket_fluid(&stack.item).is_some()
+            || is_water_bottle(game, stack)
+    }
+
+    pub(in crate::game) fn empty(
+        game: &Game<'_>,
+        stack: &ItemStack,
+    ) -> Option<(&'static str, i32, ItemStack)> {
+        if let Some(expected) = bucket_fluid(&stack.item) {
+            let (fluid, amount, container) = game.native_item_fluid_drain(stack, 1000)?;
+            return (fluid == expected && amount == 1000).then_some((expected, amount, container));
+        }
+        if is_water_bottle(game, stack) {
+            return Some((
+                Fluid::Water.id(),
+                BOTTLE_AMOUNT,
+                ItemStack::new(GLASS_BOTTLE, 1),
+            ));
+        }
+        if stack.item.as_ref() != HONEY_BOTTLE {
+            return None;
+        }
+        // GenericItemEmptying uses the stock recipe for bottles before the
+        // item's fluid capability. Do not consume an unmodeled override.
+        let recipe = game
+            .native_recipes_of_type("create:emptying")
+            .iter()
+            .find(|recipe| recipe.id == "create:emptying/honey_bottle")?;
+        let [ingredient] = recipe.json["ingredients"].as_array()?.as_slice() else {
+            return None;
+        };
+        if ingredient.as_str() != Some(HONEY_BOTTLE)
+            && !(ingredient
+                .as_object()
+                .is_some_and(|object| object.len() == 1)
+                && ingredient["item"] == HONEY_BOTTLE)
+        {
+            return None;
+        }
+        let [item, fluid] = recipe.json["results"].as_array()?.as_slice() else {
+            return None;
+        };
+        if fluid.as_object()?.len() != 2
+            || fluid["id"] != Fluid::Honey.id()
+            || fluid["amount"].as_i64() != Some(i64::from(BOTTLE_AMOUNT))
+            || item.as_object()?.len() != 1
+            || item["id"] != GLASS_BOTTLE
+        {
+            return None;
+        }
+        Some((
+            Fluid::Honey.id(),
+            BOTTLE_AMOUNT,
+            ItemStack::new(GLASS_BOTTLE, 1),
+        ))
+    }
+}
+
 pub(super) mod item_drain {
-    use super::{Game, ItemStack, Pos};
+    use super::{Fluid, Game, ItemStack, Pos, emptying, fluids};
     use crate::{
         containers::ModBlockEntity,
-        game::{create_port_belt as belt, native_block_entity_draw::BlockEntityDraw},
+        game::{
+            create_port_belt as belt, create_port_fluid_render as fluid_render,
+            native_block_entity_draw::BlockEntityDraw,
+        },
     };
     use create_engine::{
         basin::FluidLevel, kinetics::Axis, placement::Direction, source_trig,
         transport::Transported,
     };
     use horizon_assets::item_model::DisplayContext;
-    use horizon_client::mod_api::{NativeFluidRenderOptions, NativeFluidStack};
+    use horizon_client::mod_api::{
+        NativeFluidAction, NativeFluidDrain, NativeFluidRenderOptions, NativeFluidStack,
+        NativeFluidTankView,
+    };
     use horizon_core::geometry::trig;
     use horizon_world::nbt::{Compound, Tag};
 
@@ -42,20 +138,6 @@ pub(super) mod item_drain {
 
     fn float(value: f32) -> Tag {
         Tag::Float(value.to_bits())
-    }
-
-    fn bucket_fluid(item: &str) -> Option<&'static str> {
-        match item {
-            "minecraft:water_bucket" => Some("minecraft:water"),
-            "minecraft:lava_bucket" => Some("minecraft:lava"),
-            _ => None,
-        }
-    }
-
-    fn drain_bucket(game: &Game<'_>, stack: &ItemStack) -> Option<(&'static str, i32, ItemStack)> {
-        let expected = bucket_fluid(&stack.item)?;
-        let (fluid, amount, container) = game.native_item_fluid_drain(stack, 1000)?;
-        (fluid == expected && amount == 1000).then_some((expected, amount, container))
     }
 
     pub(in crate::game) fn default_nbt() -> Compound {
@@ -76,9 +158,9 @@ pub(super) mod item_drain {
         ])
     }
 
-    struct Tank {
-        fluid: &'static str,
-        amount: i32,
+    pub(in crate::game) struct Tank {
+        pub(in crate::game) fluid: &'static str,
+        pub(in crate::game) amount: i32,
         level: FluidLevel,
     }
 
@@ -89,9 +171,21 @@ pub(super) mod item_drain {
 
         fn fill(&mut self, fluid: &'static str, amount: i32) {
             self.fluid = fluid;
-            self.amount += amount;
+            self.set_amount(self.amount + amount);
+        }
+
+        pub(in crate::game) fn set_amount(&mut self, amount: i32) {
+            self.amount = amount;
             self.level.target = self.amount as f32 / CAPACITY as f32;
             self.level.speed = 0.25;
+        }
+
+        fn content(&self, amount: i32) -> NativeFluidStack {
+            NativeFluidStack {
+                fluid: self.fluid.into(),
+                amount,
+                components: Compound::new(),
+            }
         }
     }
 
@@ -102,32 +196,15 @@ pub(super) mod item_drain {
         let [segment] = tanks.as_slice() else {
             return None;
         };
-        let Tag::Compound(content) = segment.get("TankContent")? else {
-            return None;
-        };
-        let (fluid, amount) = if content.is_empty() {
-            ("minecraft:water", 0)
-        } else {
-            let stored = segment.get("TankContent")?.get("Fluid")?;
-            let Tag::String(id) = stored.get("id")? else {
-                return None;
-            };
-            let Tag::Int(amount) = stored.get("amount")? else {
-                return None;
-            };
-            let fluid = match id.to_string_lossy().as_str() {
-                "minecraft:water" => "minecraft:water",
-                "minecraft:lava" => "minecraft:lava",
-                _ => return None,
-            };
-            if !(1..=CAPACITY).contains(amount)
-                || stored
-                    .get("components")
-                    .is_some_and(|c| !matches!(c, Tag::Compound(fields) if fields.is_empty()))
-            {
+        let content = fluids::read_content(segment.get("TankContent"), CAPACITY as u32).ok()?;
+        let (fluid, amount) = if let Some(stored) = content {
+            if !stored.key.components.is_empty() {
                 return None;
             }
-            (fluid, *amount)
+            let fluid = Fluid::from_id(&stored.key.id)?.id();
+            (fluid, stored.amount as i32)
+        } else {
+            ("minecraft:water", 0)
         };
         let level = segment.get("Level")?;
         let scalar = |key| match level.get(key)? {
@@ -156,6 +233,22 @@ pub(super) mod item_drain {
         })
     }
 
+    pub(in crate::game) fn tooltip(
+        game: &Game<'_>,
+        [x, y, z]: Pos,
+    ) -> Vec<horizon_client::text::Text> {
+        let Some(crate::containers::BlockEntity::Mod(entity)) =
+            game.world.block_entities.get(&(x, y, z))
+        else {
+            return Vec::new();
+        };
+        let Some(tank) = read_tank(entity) else {
+            return Vec::new();
+        };
+        let fluid = (tank.amount > 0).then_some((tank.fluid, tank.amount as u32));
+        crate::game::create_port_goggles::fluid_container(game, CAPACITY as u32, fluid)
+    }
+
     fn save_tank(entity: &mut ModBlockEntity, tank: &Tank, exchanged: bool) {
         let Some(Tag::List(segments)) = entity.nbt.get_mut(&"Tanks".into()) else {
             return;
@@ -169,15 +262,81 @@ pub(super) mod item_drain {
             level.insert("Speed".into(), float(tank.level.speed));
         }
         if exchanged {
-            let fluid = Tag::Compound(Compound::from([
-                ("id".into(), Tag::String(tank.fluid.into())),
-                ("amount".into(), Tag::Int(tank.amount)),
-            ]));
-            segment.insert(
-                "TankContent".into(),
-                Tag::Compound(Compound::from([("Fluid".into(), fluid)])),
-            );
+            let mut content = Compound::new();
+            if tank.amount > 0 {
+                let fluid = Tag::Compound(Compound::from([
+                    ("id".into(), Tag::String(tank.fluid.into())),
+                    ("amount".into(), Tag::Int(tank.amount)),
+                ]));
+                content.insert("Fluid".into(), fluid);
+            }
+            segment.insert("TankContent".into(), Tag::Compound(content));
         }
+    }
+
+    pub(in crate::game) fn fluid_tank(game: &Game<'_>, [x, y, z]: Pos) -> Option<Tank> {
+        let crate::containers::BlockEntity::Mod(entity) =
+            game.world.block_entities.get(&(x, y, z))?
+        else {
+            return None;
+        };
+        (entity.id == BLOCK).then(|| read_tank(entity)).flatten()
+    }
+
+    pub(in crate::game) fn fluid_view(
+        game: &Game<'_>,
+        pos: Pos,
+    ) -> Option<Vec<NativeFluidTankView>> {
+        let tank = fluid_tank(game, pos)?;
+        Some(vec![NativeFluidTankView {
+            tank: 0,
+            content: (tank.amount > 0).then(|| tank.content(tank.amount)),
+            capacity: CAPACITY,
+            can_fill: false,
+            can_drain: true,
+        }])
+    }
+
+    pub(in crate::game) fn fluid_drain(
+        game: &mut Game<'_>,
+        pos: Pos,
+        request: &NativeFluidDrain,
+        action: NativeFluidAction,
+    ) -> Option<NativeFluidStack> {
+        let mut tank = fluid_tank(game, pos)?;
+        let maximum = match request {
+            NativeFluidDrain::Any(maximum) => *maximum,
+            NativeFluidDrain::Exact(stack)
+                if stack.fluid == tank.fluid && stack.components.is_empty() =>
+            {
+                stack.amount
+            }
+            _ => return None,
+        };
+        let amount = maximum.min(tank.amount);
+        if amount <= 0 {
+            return None;
+        }
+        #[allow(unreachable_patterns)]
+        match action {
+            NativeFluidAction::Simulate => {}
+            NativeFluidAction::Execute => {
+                tank.set_amount(tank.amount - amount);
+                set_fluid(game, pos, &tank);
+                notify_fluid(game, pos);
+            }
+            _ => return None,
+        }
+        Some(tank.content(amount))
+    }
+
+    pub(in crate::game) fn set_fluid(game: &mut Game<'_>, pos: Pos, tank: &Tank) {
+        game.native_with_mod_block_entity(pos, |entity| save_tank(entity, tank, true));
+    }
+
+    pub(in crate::game) fn notify_fluid(game: &mut Game<'_>, pos: Pos) {
+        game.native_block_entity_sync(pos);
+        game.native_update_output_neighbors(game.dim.id(), pos);
     }
 
     fn save_cargo(entity: &mut ModBlockEntity, cargo: Option<&Cargo>, ticks: i32) -> bool {
@@ -209,7 +368,7 @@ pub(super) mod item_drain {
             && !secondary_with_item
             && game
                 .held()
-                .is_none_or(|stack| stack.count == 0 || bucket_fluid(&stack.item).is_some())
+                .is_none_or(|stack| stack.count == 0 || emptying::can_empty(game, stack))
     }
 
     pub(in crate::game) fn right_click(game: &mut Game<'_>, pos: Pos) -> bool {
@@ -218,7 +377,7 @@ pub(super) mod item_drain {
         }
         if let Some(held) = game.held().filter(|stack| stack.count > 0) {
             let count = held.count;
-            let Some((fluid, amount, bucket)) = drain_bucket(game, held) else {
+            let Some((fluid, amount, container)) = emptying::empty(game, held) else {
                 return true;
             };
             let poured = game.native_with_mod_block_entity(pos, |entity| {
@@ -236,14 +395,13 @@ pub(super) mod item_drain {
             if poured {
                 if !game.creative {
                     if count == 1 {
-                        *game.held_mut() = Some(bucket);
+                        *game.held_mut() = Some(container);
                     } else {
                         game.consume_held();
-                        crate::game::create_port_basin::give_container(game, pos, bucket);
+                        crate::game::create_port_basin::give_container(game, pos, container);
                     }
                 }
-                game.native_block_entity_sync(pos);
-                game.native_update_output_neighbors(game.dim.id(), pos);
+                notify_fluid(game, pos);
             }
         } else {
             let cargo = game
@@ -273,7 +431,7 @@ pub(super) mod item_drain {
     ) -> u32 {
         if from.axis() == Axis::Y
             || incoming.stack.count == 0
-            || bucket_fluid(&incoming.stack.payload.item).is_none()
+            || !emptying::can_empty(game, &incoming.stack.payload)
         {
             return 0;
         }
@@ -366,11 +524,11 @@ pub(super) mod item_drain {
             ticks -= 1;
             if ticks >= EXCHANGE {
                 let stack = belt::game_stack(&cargo.stack);
-                if let Some((fluid, amount, bucket)) = drain_bucket(game, &stack) {
+                if let Some((fluid, amount, container)) = emptying::empty(game, &stack) {
                     if !tank.accepts(fluid, amount) {
                         ticks = FILLING_TIME;
                     } else if ticks == EXCHANGE {
-                        cargo.stack = belt::core_stack(game, bucket);
+                        cargo.stack = belt::core_stack(game, container);
                         tank.fill(fluid, amount);
                         save_tank(entity, &tank, true);
                     }
@@ -387,7 +545,7 @@ pub(super) mod item_drain {
                 cargo.stack.count -= output(game, pos, &cargo);
             } else if cargo.previous_position < 0.5
                 && cargo.position >= 0.5
-                && bucket_fluid(&cargo.stack.payload.item).is_some()
+                && emptying::can_empty(game, &cargo.stack.payload)
             {
                 cargo.position = 0.5;
                 ticks = FILLING_TIME;
@@ -417,7 +575,8 @@ pub(super) mod item_drain {
             components: Compound::new(),
         };
         if let Some(tank) = tank.as_ref().filter(|tank| tank.level.value > 0.0) {
-            game.native_draw_fluid_box(
+            fluid_render::draw(
+                game,
                 draw,
                 &render_fluid(tank.fluid, tank.amount),
                 [
@@ -445,9 +604,8 @@ pub(super) mod item_drain {
         let ticks = crate::game::create_port::integer(&entity.nbt, "ProcessingTicks");
         let progress = (1.0 - (ticks as f32 - draw.partial - 5.0) / 10.0).clamp(0.0, 1.0);
         if 0.0 < progress && progress < 1.0 {
-            let fluid = game
-                .native_item_fluid(&stack)
-                .and_then(|item| Some(render_fluid(item.fluid.as_deref()?, item.amount)))
+            let fluid = emptying::empty(game, &stack)
+                .map(|(fluid, amount, _)| render_fluid(fluid, amount))
                 .or_else(|| {
                     tank.as_ref()
                         .map(|tank| render_fluid(tank.fluid, tank.amount))
@@ -456,7 +614,8 @@ pub(super) mod item_drain {
                 // ItemDrainRenderer inflates a zero-width AABB by a negative value.
                 // AABB orders the resulting X/Z coordinates and shortens the Y range.
                 let width = ((1.0 - f64::from(2.0 * progress - 1.0).powi(2)) as f32) / 32.0;
-                game.native_draw_fluid_box(
+                fluid_render::draw(
+                    game,
                     draw,
                     &fluid,
                     [
@@ -567,30 +726,29 @@ fn compile(game: &Game<'_>, id: &str, json: &serde_json::Value) -> Option<Recipe
             _ => return None,
         },
     };
-    if json["results"]
-        .as_array()?
-        .iter()
-        .any(|i| i.get("fluid").is_some() || i.get("amount").is_some())
-    {
-        return None;
-    }
     let mut inputs = Vec::new();
     let mut fluids = Vec::new();
     let mut fluid_amounts = Vec::new();
     for i in json["ingredients"].as_array()? {
         match i.get("type").and_then(serde_json::Value::as_str) {
-            Some("neoforge:single") => {
+            Some(kind @ ("neoforge:single" | "neoforge:tag")) => {
                 if i.as_object()?.len() != 3 {
                     return None;
                 }
-                let fluid = i["fluid"].as_str()?;
+                let fluid = match kind {
+                    "neoforge:single" => Fluid::from_id(i["fluid"].as_str()?)?,
+                    // The stock Create tag has one member in the currently
+                    // supported fluid set. Custom fluid tag resolution is open.
+                    "neoforge:tag" if id == "create:compacting/honey" && i["tag"] == "c:honey" => {
+                        Fluid::Honey
+                    }
+                    _ => return None,
+                };
                 let amount = i["amount"].as_u64()?;
-                if !matches!(fluid, "minecraft:water" | "minecraft:lava")
-                    || !(1..=i32::MAX as u64).contains(&amount)
-                {
+                if !(1..=i32::MAX as u64).contains(&amount) {
                     return None;
                 }
-                fluids.push(fluid.to_owned());
+                fluids.push(fluid.id().to_owned());
                 fluid_amounts.push(amount as u32);
             }
             Some("neoforge:block_tag") => {
@@ -605,10 +763,36 @@ fn compile(game: &Game<'_>, id: &str, json: &serde_json::Value) -> Option<Recipe
             )),
         }
     }
-    let outputs: Option<Vec<_>> = json["results"]
-        .as_array()?
-        .iter()
-        .map(|r| {
+    let results = json["results"].as_array()?;
+    if inputs.len() + fluids.len() == 0
+        || inputs.len() > 64
+        || fluids.len() > 2
+        || results.is_empty()
+        || results.len() > 4
+    {
+        return None;
+    }
+    let (mut outputs, mut fluid_outputs) = (Vec::new(), Vec::new());
+    if results.iter().any(|row| row.get("amount").is_some()) {
+        for row in results {
+            let id = row["id"].as_str()?;
+            let amount = u32::try_from(row["amount"].as_u64()?).ok()?;
+            if row.as_object()?.len() != 2
+                || Fluid::from_id(id).is_none()
+                || !(1..=i32::MAX as u32).contains(&amount)
+            {
+                return None;
+            }
+            fluid_outputs.push(rules::Fluid {
+                key: fluids::Key {
+                    id: id.to_owned(),
+                    components: Default::default(),
+                },
+                amount,
+            });
+        }
+    } else {
+        for r in results {
             let fields = r.as_object()?;
             if fields.keys().any(|k| {
                 !matches!(
@@ -629,20 +813,14 @@ fn compile(game: &Game<'_>, id: &str, json: &serde_json::Value) -> Option<Recipe
             }
             let stack = game.native_recipe_result(&r)?;
             let chance = r["chance"].as_f64().unwrap_or(1.0) as f32;
-            (chance.is_finite() && (0.0..=1.0).contains(&chance)).then(|| rules::Roll {
+            if !chance.is_finite() || !(0.0..=1.0).contains(&chance) {
+                return None;
+            }
+            outputs.push(rules::Roll {
                 stack: basin::core_stack(game, &stack),
                 chance,
-            })
-        })
-        .collect();
-    let outputs = outputs?;
-    if inputs.len() + fluids.len() == 0
-        || inputs.len() > 64
-        || fluids.len() > 2
-        || outputs.is_empty()
-        || outputs.len() > 4
-    {
-        return None;
+            });
+        }
     }
     Some(Recipe {
         id: id.to_owned(),
@@ -651,7 +829,7 @@ fn compile(game: &Game<'_>, id: &str, json: &serde_json::Value) -> Option<Recipe
             item_ingredients: inputs.len(),
             fluid_amounts,
             outputs,
-            fluid_outputs: Vec::new(),
+            fluid_outputs,
             heat,
             duration: match json
                 .get("processing_time")
@@ -855,7 +1033,8 @@ pub(super) fn matching(
             filter.item == result.stack.key.0.item
         } else if let Some(result) = recipe.core.fluid_outputs.first() {
             result.key.components.is_empty()
-                && game.native_item_fluid_drain(&filter, 1000)
+                && game
+                    .native_item_fluid_drain(&filter, 1000)
                     .is_some_and(|(fluid, _, _)| fluid == result.key.id)
         } else {
             false

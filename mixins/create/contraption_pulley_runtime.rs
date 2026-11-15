@@ -4,11 +4,13 @@
 use super::{
     Game,
     create_port_contraption::{
-        Capture, MountedCapture, column, commit_linear_capture, commit_linear_landing, entries,
-        movement_sound, resident, set_records, state,
+        Capture, MountedCapture, column, commit_linear_capture, commit_linear_landing,
+        drop_replaced_block, entries, movement_sound, replaceable_stone, resident, set_records, state,
     },
     create_port_contraption_actors as actors,
+    create_port_contraption_tank as tanks,
     create_port_piston::collides_at,
+    create_port_portable_storage as psi,
     create_port_super_glue as glue,
     native_block_entity_draw::BlockEntityDraw,
     native_world_draw::NativeWorldDraw,
@@ -16,7 +18,7 @@ use super::{
 use crate::containers::{BlockEntity, ModBlockEntity};
 use create_engine::{
     contraption::{
-        CaptureView, Cell as PayloadCell,
+        CaptureView, Cell as PayloadCell, QuarterTurn,
         linear::{Action, LinearActuator, Mode},
         pulley::{self, Cell, Drive, LandingCell, Layout, Part, Probe, RopeEdit, Segment},
     },
@@ -25,7 +27,7 @@ use create_engine::{
 };
 use glam::DVec3;
 use horizon_client_render::create_contraption_scene::{
-    MAX_BLOCKS, MAX_RECORDS, Record, Stroke, StrokeKind, read,
+    MAX_BLOCKS, MAX_PACKED_BLOCKS, MAX_RECORDS, Record, Stroke, StrokeKind, plain_packed_state, read,
 };
 use horizon_world::{chunk::BlockState, nbt::Tag, registry::BlockStateId};
 use std::collections::BTreeSet;
@@ -99,9 +101,14 @@ fn assemble(game: &mut Game<'_>, controller: Pos, rpm: f32) -> Option<u32> {
     let origin = cargo_cell(controller, [0; 3], layout.initial_offset)?;
     let volumes = glue::read(game, key).ok()?;
     let assembly = layout
-        .capture(&MountedCapture::for_linear(game, &volumes), MAX_BLOCKS)
+        .capture(&MountedCapture::for_rope_pulley(game, &volumes), MAX_PACKED_BLOCKS)
         .ok()?;
     let blocks = assembly.blocks().to_vec();
+    if (blocks.len() > MAX_BLOCKS && blocks.iter().any(|(_, state)| !plain_packed_state(state)))
+        || psi::has_multiple(&blocks)
+    {
+        return None;
+    }
     let registry = game.pack.assets.registry;
     let mut edits = Vec::new();
     for &(position, rope) in &layout.remove {
@@ -145,7 +152,10 @@ fn assemble(game: &mut Game<'_>, controller: Pos, rpm: f32) -> Option<u32> {
     }
     layout.start(rpm, true, !record.blocks.is_empty())?;
     let has_payload = !record.blocks.is_empty();
-    if !commit_linear_capture(game, key, records, record, origin, &edits) {
+    let tanks = tanks::capture(game, origin, &record.blocks).ok()?;
+    if !tanks::commit_capture(game, key, controller, tanks, |game| {
+        commit_linear_capture(game, key, records, record, origin, &edits)
+    }) {
         return None;
     }
     if has_payload {
@@ -176,8 +186,11 @@ fn land(game: &mut Game<'_>, controller: Pos, offset: u32, rehang: bool) -> Opti
         r.controller == controller && r.stroke_kind() == Some(StrokeKind::RopePulley)
     })?;
     let record = records.remove(index);
+    let origin = cargo_cell(controller, [0; 3], offset)?;
+    let tank_landing = tanks::prepare_landing(game, key, &record, origin, QuarterTurn::IDENTITY).ok()?;
     let registry = game.pack.assets.registry;
     let mut edits = Vec::new();
+    let mut replaced = Vec::new();
     let mut positions = BTreeSet::new();
     let rope = pulley::plan_rope_landing(controller, offset, !rehang, |position| {
         // Preserve any world block that appeared while the rope was animated.
@@ -203,15 +216,40 @@ fn land(game: &mut Game<'_>, controller: Pos, offset: u32, rehang: bool) -> Opti
     }
     for (local, block) in record.blocks.iter() {
         let position = cargo_cell(controller, *local, offset)?;
-        if !positions.insert(position) || !dry_air(game, position) {
+        if !positions.insert(position) || !resident(game, position) {
             return None;
         }
-        edits.push((position, state(game, position), registry.id(block)?));
+        let before = state(game, position);
+        let after = tank_landing
+            .as_ref()
+            .and_then(|landing| landing.state(position))
+            .or_else(|| registry.id(block))?;
+        if !game.res.facts().is_air(before) {
+            if !replaceable_stone(game, position, before, after) {
+                return None;
+            }
+            replaced.push((position, before));
+        }
+        edits.push((position, before, after));
     }
-    let origin = cargo_cell(controller, [0; 3], offset)?;
-    if !commit_linear_landing(game, key, records, &record, origin, &edits) {
+    if !replaced.is_empty()
+        && super::create_port_glue_transfer::blocked(
+            game,
+            key,
+            replaced.iter().map(|&(position, _)| position),
+        )
+    {
         return None;
     }
+    if !tanks::commit_landing(game, key, tank_landing, |game| {
+        commit_linear_landing(game, key, records, &record, origin, &edits)
+    }) {
+        return None;
+    }
+    for (position, before) in replaced {
+        drop_replaced_block(game, position, before);
+    }
+    psi::remove(game, controller);
     if !record.blocks.is_empty() {
         movement_sound(game, controller, false);
     }
@@ -312,6 +350,9 @@ pub(super) fn break_line(game: &mut Game<'_>, position: Pos) {
 }
 
 fn write(entity: &mut ModBlockEntity, running: bool, initial: u32, offset: f32, waiting: bool) {
+    if !running {
+        psi::save_dock(entity, None);
+    }
     entity
         .nbt
         .insert(RUNNING.into(), Tag::Byte(i8::from(running)));
@@ -372,11 +413,14 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity, r
     if mode_changed {
         drive.actuator.mode_changed();
     }
-    let mut stalled = actors::stalled(game, pos);
+    let dock = psi::advance(game, record, psi::saved_dock(entity));
+    let docked = dock.is_some();
+    let mut stalled = actors::stalled(game, pos) || docked;
     if rpm != record.rpm {
         if drive.actuator.speed_changed(record.rpm, rpm, stalled, None) {
             actors::remove(game, pos);
-            stalled = false;
+            psi::stop_motion(game, pos);
+            stalled = docked;
         }
     }
     if !drive.actuator.waiting() && entity.nbt.remove(&REQUEST.into()).is_some() {
@@ -417,6 +461,7 @@ pub(super) fn tick(game: &mut Game<'_>, pos: Pos, entity: &mut ModBlockEntity, r
     record.stalled = stalled;
     let current = record.clone();
     if set_records(game, key, records).is_ok() {
+        psi::save_dock(entity, dock);
         write(
             entity,
             true,
@@ -499,6 +544,14 @@ pub(super) fn draw_line(
     let Some(stroke) = record.stroke.filter(|s| s.kind == StrokeKind::RopePulley) else {
         return;
     };
+    let centre = record.controller.map(|coordinate| f64::from(coordinate) + 0.5);
+    let distance_sq = (0..3)
+        .map(|i| (centre[i] - draw.camera[i]).powi(2))
+        .sum::<f64>();
+    let range = f64::from(pulley::DEFAULT_MAX_ROPE_LENGTH);
+    if distance_sq >= range * range {
+        return;
+    }
     let offset = if record.blocks.is_empty() {
         (stroke.offset + (draw.partial - 0.5) * pulley::directional_speed(record.rpm))
             .clamp(0.0, stroke.limit as f32)

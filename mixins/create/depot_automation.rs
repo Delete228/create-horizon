@@ -17,13 +17,22 @@ fn create_depot_can_place(
         if !crate::game::create_port::inventory_supported(entity) {
             return std::ops::ControlFlow::Break(false);
         }
-        if entity.id == crate::game::create_port_chute::BLOCK {
+        if entity.id == crate::game::create_port_chute::SMART {
             let state = containers.world.block(pos.0, pos.1, pos.2);
             return std::ops::ControlFlow::Break(
-                local == 0
-                    && entity.items.iter().all(Option::is_none)
-                    && containers.prop(state, "facing") == Some("down")
-                    && containers.prop(state, "waterlogged") == Some("false"),
+                containers.prop(state, "powered") == Some("false")
+                    && crate::game::create_port_chute::automation_accepts(
+                        containers.items,
+                        entity,
+                        local,
+                        stack,
+                    ),
+            );
+        }
+        if entity.id == crate::game::create_port_chute::BLOCK {
+            // ChuteItemHandler exposes the empty slot from every side.
+            return std::ops::ControlFlow::Break(
+                local == 0 && entity.items.iter().all(Option::is_none),
             );
         }
         if entity.id == "create:millstone" {
