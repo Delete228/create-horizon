@@ -34,6 +34,9 @@ def main():
         item = json.loads(actual[model_prefix + f'item/{block}.json'])
         rotation = item['display']['gui']['rotation']
         assert rotation[0] % 90 and rotation[1] % 90, (block, rotation)
+        ground = item['display']['ground']
+        expected_scale = .1 if block == 'large_water_wheel' else .25
+        assert ground['scale'] == [expected_scale] * 3, (block, ground)
     textures = set()
     for name, text in actual.items():
         if name.startswith(model_prefix) and name.endswith(".json"):

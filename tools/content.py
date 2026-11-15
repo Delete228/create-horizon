@@ -40,9 +40,13 @@ STONE_APPEARANCE = {
 def write(path, value):
     retarget(path, value)
     if path.startswith("assets/create/models/item/") and value.get("parent", "").startswith("create:block/"):
-        value.setdefault("display", {}).setdefault("gui", {
+        display = value.setdefault("display", {})
+        display.setdefault("gui", {
             "rotation": [30, 225, 0], "scale": [.625, .625, .625],
         })
+        # Create's block items inherit the ground transform from minecraft:block/block.
+        # The independent models can end their parent chain before that template.
+        display.setdefault("ground", {"translation": [0, 3, 0], "scale": [.25, .25, .25]})
     target = CONTENT / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
