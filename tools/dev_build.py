@@ -151,6 +151,8 @@ def main():
     parser.add_argument('--stage-dir',type=Path,help='Reuse an owned transformed source cache; inputs and copied binaries remain separate snapshots')
     parser.add_argument('--profile',choices=['dev','performance'],default='dev')
     parser.add_argument('--check-only',action='store_true')
+    parser.add_argument('--online', action='store_true',
+                        help='Allow Cargo to download dependencies on a clean CI runner')
     parser.add_argument('--jobs',type=int,default=2)
     args=parser.parse_args()
     if not 1<=args.jobs<=32: parser.error('--jobs must be1..32')
@@ -247,7 +249,9 @@ def main():
         save()
         if clean_revision(source)!=revision: raise ValueError('Horizon source changed during staging')
         cargo=ROOT/'.tools/rust/bin/cargo'
-        command=[cargo,'check' if args.check_only else 'build','--locked','--offline','-p','horizon-client']
+        command=[cargo,'check' if args.check_only else 'build','--locked']
+        if not args.online: command+=['--offline']
+        command+=['-p','horizon-client']
         if args.check_only: command+=['--lib','--bins']
         else:
             command+=['--profile','fast']
