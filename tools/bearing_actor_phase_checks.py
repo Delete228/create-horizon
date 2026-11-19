@@ -24,6 +24,9 @@ SCENES = {
     'saw': ('create:mechanical_saw[facing=north,axis_along_first=false,flipped=false]', 'minecraft:oak_log[axis=y]'),
     'drill': ('create:mechanical_drill[facing=north]', 'minecraft:oak_planks'),
 }
+SUPPORT = (1448, 149, 150)
+ATTACHED = (1449, 149, 150)
+ATTACHED_TOOLS = ('create:mechanical_harvester', 'create:mechanical_plough')
 
 
 def motor():
@@ -42,6 +45,11 @@ def setup(command, block, target):
     put(command, TARGET, target)
 
 
+def attached_tool_rig(command, tool):
+    setup(command, f'{tool}[facing=east,waterlogged=false]', AIR)
+    put(command, SUPPORT, 'minecraft:stone')
+
+
 def check(cases):
     for rows in cases.values():
         angles = [round(row['angle'], 3) for row in rows]
@@ -54,7 +62,7 @@ def check(cases):
 def original():
     host = Original()
     scratch = Path(tempfile.mkdtemp(prefix='bearing-actor-phase-java-', dir=ROOT / '.local'))
-    report = dict(create=PINS['create_revision'], cases={})
+    report = dict(create=PINS['create_revision'], cases={}, attached_tools=[])
 
     try:
         assert host.call('state', {})['data_version'] == 3955
@@ -74,6 +82,16 @@ def original():
             ]
             put(host.command, MOTOR, AIR)
             host.snapshot([PIVOT], 10)
+        for tool in ATTACHED_TOOLS:
+            attached_tool_rig(host.command, tool)
+            host.snapshot([PIVOT], 3)
+            put(host.command, MOTOR, motor())
+            cells = host.snapshot([SUPPORT, ATTACHED], 4)
+            assert [cell['block'] for cell in cells] == [AIR, AIR], (tool, cells)
+            put(host.command, MOTOR, AIR)
+            cells = host.snapshot([SUPPORT, ATTACHED], 10)
+            assert [cell['block'] for cell in cells] == ['minecraft:stone', tool], (tool, cells)
+            report['attached_tools'].append(tool)
     finally:
         put(host.command, MOTOR, AIR)
         host.command('forceload remove 1440 144 1455 159')
@@ -86,7 +104,7 @@ def native(args):
     session = NativeCheckSession(args.game, args.resources, args.ctl, args.create_jar,
                                  name='bearing-actor-phase-native', graphics=False,
                                  world='CreateBearingActorPhase')
-    report = dict(create=PINS['create_revision'], cases={})
+    report = dict(create=PINS['create_revision'], cases={}, attached_tools=[])
     try:
         for tool, (block, target) in SCENES.items():
             batch = Batch()
@@ -107,6 +125,22 @@ def native(args):
                      target=AIR if matched(rows[2 * tick + 1]) else target.partition('[')[0])
                 for tick in range(TICKS)
             ]
+        for tool in ATTACHED_TOOLS:
+            batch = Batch()
+            batch.load(PIVOT)
+            attached_tool_rig(batch.command, tool)
+            batch.tick(3)
+            batch.put(MOTOR, motor())
+            batch.tick(4)
+            batch.expect(SUPPORT, AIR)
+            batch.expect(ATTACHED, AIR)
+            batch.put(MOTOR, AIR)
+            batch.tick(10)
+            batch.expect(SUPPORT, 'minecraft:stone')
+            batch.expect(ATTACHED, tool)
+            rows = batch.run(session, tool.split(':')[1])
+            assert len(rows) == 4 and all(matched(row) for row in rows), (tool, rows)
+            report['attached_tools'].append(tool)
         # An empty ordinary inventory is recreated on landing. A configured
         # filter still requires a saved actor payload and must stay in place.
         batch = Batch()
@@ -148,6 +182,8 @@ def main():
         if args.reference:
             reference = json.loads(args.reference.read_text())
             assert reference['create'] == PINS['create_revision'], reference
+            if 'attached_tools' in reference:
+                assert report['attached_tools'] == reference['attached_tools'], reference
             for tool, rows in report['cases'].items():
                 for actual, expected in zip(rows, reference['cases'][tool], strict=True):
                     assert (actual['tick'], actual['target']) == (expected['tick'], expected['target']), (tool, actual, expected)

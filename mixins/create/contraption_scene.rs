@@ -28,6 +28,11 @@ pub const ACTOR_VISUAL_KEY: &str = "actor_visuals";
 // Keep the original key so parked empty tanks from older builds remain loadable.
 pub const TANK_STORAGE_KEY: &str = "mounted_empty_tanks";
 
+/// An upright rotor never sweeps its axial extent into a neighboring column.
+pub const fn rotary_local_limits(axis: usize) -> [u32; 3] {
+    [15, if axis == 1 { MAX_PACKED_BLOCKS as u32 } else { 15 }, 15]
+}
+
 #[derive(Clone, Debug)]
 pub struct Record {
     pub controller: Pos,
@@ -503,7 +508,12 @@ fn decode_geometry(encoded: &Compound) -> Result<SceneGeometry, AttachmentError>
             } else {
                 None
             };
-            let blocks = decode_blocks(entry, packed, if stroke.is_some() { 81 } else { 15 })?;
+            let limits = if stroke.is_some() {
+                [81; 3]
+            } else {
+                rotary_local_limits(axis)
+            };
+            let blocks = decode_blocks(entry, packed, limits)?;
             if !right_distance
                 || (blocks.is_empty() && !pulley)
                 || (blocks.len() > MAX_BLOCKS
@@ -568,12 +578,18 @@ fn decode_geometry(encoded: &Compound) -> Result<SceneGeometry, AttachmentError>
 }
 
 pub fn plain_packed_state(state: &BlockState) -> bool {
-    if !state.properties.is_empty() {
-        return false;
+    if solid_create_payload(state) {
+        return true;
     }
     let Some(name) = state.name.strip_prefix("minecraft:") else {
         return false;
     };
+    if wood_cube(name, state) {
+        return true;
+    }
+    if !state.properties.is_empty() {
+        return false;
+    }
     matches!(
         name,
         "slime_block"
@@ -596,6 +612,28 @@ pub fn plain_packed_state(state: &BlockState) -> bool {
                     .iter()
                     .any(|&(dye, _)| dye == color)
             })
+        })
+}
+
+fn wood_cube(name: &str, state: &BlockState) -> bool {
+    // The 1.21.1 families already supported by the ordinary scene also fill a
+    // cube and carry no block entity. The only packed pillar data is its axis.
+    const WOODS: &[&str] = &[
+        "oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "bamboo",
+        "crimson", "warped",
+    ];
+    if state.properties.is_empty() {
+        return name.strip_suffix("_planks").is_some_and(|wood| WOODS.contains(&wood));
+    }
+    if state.properties.len() != 1
+        || !state.properties.get("axis").is_some_and(|axis| matches!(axis.as_str(), "x" | "y" | "z"))
+    {
+        return false;
+    }
+    let name = name.strip_prefix("stripped_").unwrap_or(name);
+    name == "bamboo_block"
+        || ["_log", "_wood", "_stem", "_hyphae"].into_iter().any(|suffix| {
+            name.strip_suffix(suffix).is_some_and(|wood| WOODS.contains(&wood))
         })
 }
 
@@ -721,12 +759,14 @@ fn fits_packed_gantry(anchor: Pos, limit: u32, axis: usize, blocks: &[(Pos, Bloc
 fn decode_blocks(
     entry: &Tag,
     packed: Option<PackedLayout>,
-    max_offset: u32,
+    limits: [u32; 3],
 ) -> Result<Arc<[(Pos, BlockState)]>, AttachmentError> {
     let invalid = AttachmentError::Decode;
     let mut locals = std::collections::BTreeSet::new();
     let mut validate = |local: Pos| {
-        if local.iter().any(|v| v.unsigned_abs() > max_offset) || !locals.insert(local) {
+        if local.iter().zip(limits).any(|(v, limit)| v.unsigned_abs() > limit)
+            || !locals.insert(local)
+        {
             return Err(invalid);
         }
         Ok(local)
@@ -1826,6 +1866,36 @@ mod scene_attachment_tests {
         rotor.blocks = rotors[0].blocks.clone();
         rotor.stroke = carrier().stroke;
         assert!(encode_records(&[rotor], Some(1)).is_err());
+    }
+
+    #[test]
+    fn upright_rotors_save_tall_payloads_without_widening_horizontal_reach() {
+        let mut rotor = carrier();
+        rotor.stroke = None;
+        rotor.controller = [7, 64, 7];
+        rotor.anchor = [7, 65, 7];
+        rotor.axis = 1;
+        let block = &rotor.blocks[0].1;
+        let log = BlockState {
+            name: "minecraft:stripped_oak_log".into(),
+            properties: [("axis".into(), "x".into())].into(),
+        };
+        let casing = BlockState {
+            name: "create:andesite_casing".into(),
+            properties: Default::default(),
+        };
+        for height in [24, 128] {
+            let mut tall = rotor.clone();
+            tall.blocks = (0..height).map(|y| {
+                let state = match y % 3 { 0 => block, 1 => &log, _ => &casing };
+                ([0, y, 0], state.clone())
+            }).collect();
+            let decoded = decode_geometry(&encode_records(&[tall.clone()], Some(1)).unwrap()).unwrap();
+            assert!(decoded.records[0].same_geometry(&tall));
+        }
+
+        rotor.blocks = vec![([16, 24, 0], block.clone())].into();
+        assert!(decode_geometry(&encode_records(&[rotor], Some(1)).unwrap()).is_err());
     }
 
     #[test]

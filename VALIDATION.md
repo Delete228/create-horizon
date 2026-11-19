@@ -713,7 +713,8 @@ developer source build. The three changes are applied in a separate checkout.
   Create limit with a Mechanical Bearing and a plain slime payload. Both
   clients capture 2,048 blocks and reach 91.20001 degrees on the sampled tick.
   Horizon lands the payload after a cold restart. Both leave the sampled
-  source blocks in place when a 2,049th block is added.
+  source blocks in place when a 2,049th block is added. `--tall` repeats the
+  comparison with a 64-block-tall payload in one chunk column.
 - [Rope Pulley capacity](tools/pulley_capacity_checks.py) checks the same
   limit on a vertical lift. Both implementations reach offset 5.5 after 12
   ticks and land all 2,048 blocks. Horizon saves the packed payload and
@@ -1571,3 +1572,10 @@ At this point, the next stage still needed two-client checks, large networks and
 chunk unloading, full depot/hopper interactions, and further Java animation/render
 comparisons. Remaining Create machinery had not yet been ported. A working chain
 does not establish that the entire mod is ready or fully compatible with Java.
+
+## 2026-11-19 source checkpoint
+
+The latest local Super Glue and contraption changes are preserved on `main`.
+All 275 `create-engine` library tests pass. The five changed Python checks parse
+successfully, and `git diff --check` is clean. The full native game build and
+Java/Horizon gameplay comparisons were not rerun for this checkpoint.

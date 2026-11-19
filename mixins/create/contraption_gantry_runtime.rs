@@ -10,7 +10,6 @@ use super::{
     create_port_contraption_actors as actors,
     create_port_piston::collides_at,
     create_port_portable_storage as psi,
-    create_port_super_glue as glue,
 };
 use crate::containers::{BlockEntity, ModBlockEntity};
 use create_engine::{
@@ -306,13 +305,10 @@ fn capture(
     let end = step(rail[rail.len() - 1], carriage);
     let initial = pos[axis].abs_diff(anchor[axis]);
     let limit = end[axis].abs_diff(anchor[axis]);
-    let Ok(stationary_glue) = glue::read(game, key) else {
-        return false;
-    };
     // GantryContraption.assemble leaves the force direction unset even when
     // the rail provides a direction for the terrain collision check below.
     let Ok(payload) = Assembly::capture_from(
-        &MountedCapture::for_linear(game, &stationary_glue, true),
+        &MountedCapture::for_linear(game, true),
         pos,
         [step(pos, carriage)],
         |p| p == pos || rail.contains(&p),

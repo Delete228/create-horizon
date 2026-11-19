@@ -8,7 +8,6 @@ use super::{
         drop_replaced_block, facing, movement_sound, replaceable_stone, resident, set_records, state,
     },
     create_port_contraption_actors as actors, create_port_portable_storage as psi,
-    create_port_super_glue as glue,
 };
 use crate::containers::ModBlockEntity;
 use create_engine::{
@@ -141,7 +140,6 @@ fn capture(game: &mut Game<'_>, pos: Pos, facing: Direction, rpm: f32) -> Option
     } else {
         facing.opposite()
     };
-    let volumes = glue::read(game, key).ok()?;
     // Java inserts the moving head and pole train before checking cargo size.
     let vertical = facing.axis() == Axis::Y;
     let capacity = if vertical {
@@ -150,7 +148,7 @@ fn capture(game: &mut Game<'_>, pos: Pos, facing: Direction, rpm: f32) -> Option
         MAX_BLOCKS
     };
     let payload = Assembly::capture_from(
-        &MountedCapture::for_linear(game, &volumes, vertical),
+        &MountedCapture::for_linear(game, vertical),
         origin,
         seeds,
         |p| {

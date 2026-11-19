@@ -12,7 +12,10 @@ use super::{
 use create_engine::{
     contraption::{
         CaptureView, Cell,
-        glue::{OffhandPlacement, Search, SelectionError, Volume, offhand_placement, selection},
+        glue::{
+            MAX_CORNER_DELTA, OffhandPlacement, Search, SelectionError, Volume, offhand_placement,
+            selection,
+        },
     },
     kinetics::Pos,
     particles::{glue_edges, glue_face},
@@ -24,6 +27,7 @@ use horizon_client::{
     mod_api::Holder,
     particles::{ParticleOptions, ParticleType},
     text::Text,
+    world_primitives::WorldPrimitives,
 };
 use horizon_core::{
     geometry::{Aabb, Direction as Face, Vec3, traverse_blocks},
@@ -144,7 +148,7 @@ fn read_map(map: &Attachments, key: [i32; 2]) -> Result<Cow<'_, [Volume]>, Attac
         let volumes = decode(value)?;
         if volumes
             .iter()
-            .any(|volume| volume.corners().into_iter().any(|p| column(p) != key))
+            .any(|volume| column(volume.corners()[0]) != key)
         {
             return Err(AttachmentError::Decode);
         }
@@ -154,6 +158,29 @@ fn read_map(map: &Attachments, key: [i32; 2]) -> Result<Cow<'_, [Volume]>, Attac
         return Err(AttachmentError::Decode);
     }
     Ok(Cow::Borrowed(&[]))
+}
+
+/// Each volume is saved once, in the column of its lower corner. The accepted
+/// corner distance bounds the owners of a volume that can contain this cell.
+pub(super) fn possible_owners(pos: Pos) -> impl Iterator<Item = [i32; 2]> {
+    let first = |value: i32| value.saturating_sub(MAX_CORNER_DELTA) >> 4;
+    let [x, _, z] = pos;
+    (first(x)..=x >> 4).flat_map(move |cx| (first(z)..=z >> 4).map(move |cz| [cx, cz]))
+}
+
+pub(super) fn resident(game: &Game<'_>, volume: Volume) -> bool {
+    let [min, max] = volume.corners();
+    let [min_x, min_z] = column(min);
+    let [max_x, max_z] = column(max);
+    (min_x..=max_x).all(|x| {
+        (min_z..=max_z).all(|z| {
+            game.world.chunks.get(&(x, z)).is_some_and(|chunk| {
+                [min[1], max[1]]
+                    .into_iter()
+                    .all(|y| chunk.section_index(y).is_some())
+            })
+        })
+    })
 }
 
 struct GlueView<'g, 'a>(Capture<'g, 'a>);
@@ -236,8 +263,34 @@ impl CaptureView for GlueView<'_, '_> {
     }
 }
 
-fn glued(game: &Game<'_>, pos: Pos, face: Direction) -> bool {
-    read(game, column(pos)).is_ok_and(|volumes| volumes.iter().any(|v| v.glues(pos, face)))
+pub(super) fn glued(game: &Game<'_>, pos: Pos, face: Direction) -> bool {
+    check_glued(game, pos, face).unwrap_or(false)
+}
+
+fn check_glued(game: &Game<'_>, pos: Pos, face: Direction) -> Result<bool, AttachmentError> {
+    let mut attached = false;
+    for owner in possible_owners(pos) {
+        match read(game, owner) {
+            Ok(volumes) => attached |= volumes.iter().any(|v| v.glues(pos, face)),
+            Err(AttachmentError::MissingHolder) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(attached)
+}
+
+fn insert(game: &mut Game<'_>, volume: Volume) -> Result<(), AttachmentError> {
+    if !resident(game, volume) {
+        return Err(AttachmentError::MissingHolder);
+    }
+    let key = column(volume.corners()[0]);
+    let mut volumes = read(game, key)?.into_owned();
+    if volumes.len() >= MAX_VOLUMES {
+        return Err(AttachmentError::Encode);
+    }
+    volumes.push(volume);
+    game.native_attachments(Holder::Chunk(key))?
+        .set(&VOLUMES, volumes)
 }
 
 fn sticky(game: &Game<'_>, pos: Pos, side: Direction) -> bool {
@@ -456,7 +509,7 @@ pub(super) fn cancels_placement(game: &mut Game<'_>, stack: &ItemStack) -> bool 
         inside: false,
         yaw: game.yaw,
         pitch: game.pitch,
-        sneaking: game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft),
+        sneaking: game.native_sneaking(),
         item: stack.item.to_string(),
         can_use_game_master_blocks: game.can_use_game_master_blocks(),
     };
@@ -471,19 +524,13 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: Pos) {
         return;
     }
     // Java replays existing glued faces when a player replaces a block in a volume.
-    if let Ok(volumes) = read(game, column(pos))
-        && !volumes.is_empty()
-    {
-        let replay = Direction::ALL.map(|direction| {
-            let delta = direction.vector();
-            let neighbor = std::array::from_fn(|axis| pos[axis] + delta[axis]);
-            volumes.iter().any(|volume| volume.glues(pos, direction))
-                && matches!(PlacementView(game).inspect(neighbor), Cell::Block(_))
-        });
-        for (direction, replay) in Direction::ALL.into_iter().zip(replay) {
-            if replay {
-                send_face(game, pos, direction.vector());
-            }
+    for direction in Direction::ALL {
+        let delta = direction.vector();
+        let neighbor = std::array::from_fn(|axis| pos[axis] + delta[axis]);
+        if glued(game, pos, direction)
+            && matches!(PlacementView(game).inspect(neighbor), Cell::Block(_))
+        {
+            send_face(game, pos, delta);
         }
     }
 
@@ -498,10 +545,6 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: Pos) {
     else {
         return;
     };
-    let key = column(against);
-    if column(pos) != key {
-        return;
-    }
     let max = stack_max_damage(
         &glue,
         game.items().get(ITEM).map_or(0, |item| item.max_damage),
@@ -509,16 +552,7 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: Pos) {
     if !game.creative && glue.damage >= max {
         return;
     }
-    let Ok(volumes) = read(game, key) else { return };
-    let mut volumes = volumes.into_owned();
-    if volumes.len() == MAX_VOLUMES {
-        return;
-    }
-    volumes.push(volume);
-    let Ok(map) = game.native_attachments(Holder::Chunk(key)) else {
-        return;
-    };
-    if map.set(&VOLUMES, volumes).is_err() {
+    if insert(game, volume).is_err() {
         return;
     }
     if !game.creative {
@@ -536,15 +570,25 @@ pub(super) fn placed(game: &mut Game<'_>, stack: &ItemStack, pos: Pos) {
     send_face(game, against, face.vector());
 }
 
-fn nearest_volume(game: &Game<'_>) -> Option<([i32; 2], usize, [f64; 3])> {
-    let (origin, direction) = game.aim()?;
-    let eye = vector(origin);
-    let end = eye.add_vector(vector(direction).scale(game.reach() + 1.0));
-    let x = origin[0].floor() as i32;
-    let z = origin[2].floor() as i32;
-    let columns = |axis: i32| (axis - 32).div_euclid(16)..=(axis + 32).div_euclid(16);
-    let mut nearest = None;
-    let mut distance = f64::INFINITY;
+fn bounds(volume: Volume) -> Aabb {
+    let [min, max] = volume.corners();
+    Aabb::new(
+        vector(min.map(f64::from)),
+        vector(max.map(|v| f64::from(v) + 1.0)),
+    )
+}
+
+fn scan_volumes(game: &Game<'_>, center: [f64; 3], mut visit: impl FnMut([i32; 2], usize, Aabb)) {
+    let radius = [32.0, 16.0, 32.0];
+    let scan = Aabb::new(
+        vector(std::array::from_fn(|i| center[i] - radius[i])),
+        vector(std::array::from_fn(|i| center[i] + radius[i])),
+    );
+    let columns = |axis: f64| {
+        let center = axis.floor() as i32;
+        ((center - 32 - MAX_CORNER_DELTA) >> 4)..=((center + 32) >> 4)
+    };
+    let [x, _, z] = center;
     for x in columns(x) {
         for z in columns(z) {
             let column = [x, z];
@@ -560,21 +604,57 @@ fn nearest_volume(game: &Game<'_>) -> Option<([i32; 2], usize, [f64; 3])> {
                 continue;
             };
             for (index, volume) in volumes.iter().enumerate() {
-                let [min, max] = volume.corners();
-                let lower = vector(min.map(f64::from));
-                let upper = vector(max.map(|value| f64::from(value) + 1.0));
-                let Some(hit) = Aabb::new(lower, upper).clip(eye, end) else {
-                    continue;
-                };
-                let distance_to_hit = eye.distance_squared(hit);
-                if distance_to_hit <= distance {
-                    nearest = Some((column, index, hit.components()));
-                    distance = distance_to_hit;
+                let bounds = bounds(*volume);
+                if scan.intersects(bounds) {
+                    visit(column, index, bounds);
                 }
             }
         }
     }
+}
+
+fn nearest_volume(game: &Game<'_>) -> Option<([i32; 2], usize, [f64; 3])> {
+    let (origin, direction) = game.aim()?;
+    let eye = vector(origin);
+    let end = eye.add_vector(vector(direction).scale(game.reach() + 1.0));
+    let mut nearest = None;
+    let mut distance = f64::INFINITY;
+    scan_volumes(game, origin, |column, index, bounds| {
+        if let Some(hit) = bounds.clip(eye, end) {
+            let distance_to_hit = eye.distance_squared(hit);
+            if distance_to_hit <= distance {
+                nearest = Some((column, index, hit.components()));
+                distance = distance_to_hit;
+            }
+        }
+    });
     nearest
+}
+
+/// Draw the passive and targeted edges of Create's AABB outliner using the
+/// stock world primitive hook. The textured face layers need a separate API.
+pub(super) fn outlines(game: &Game<'_>, out: &mut WorldPrimitives) {
+    if !game.native_on("create") || !holds_glue(game) {
+        return;
+    }
+    let Some(origin) = game.eye_position() else {
+        return;
+    };
+    let nearest = nearest_volume(game);
+    scan_volumes(game, origin, |column, index, bounds| {
+        let selected = nearest.is_some_and(|(owner, i, _)| owner == column && i == index);
+        let (color, width) = if selected {
+            (0xff68_c586, 3.0)
+        } else {
+            (0xff4d_9162, 1.0)
+        };
+        out.box_outline(
+            bounds.min_position().components(),
+            bounds.max_position().components(),
+            color,
+            width,
+        );
+    });
 }
 
 /// An empty request names no world object. The server raycasts independently.
@@ -664,7 +744,7 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: Pos, face: [i32; 3]) -> bool
         .flatten()
         .flatten()
         .filter(|(dimension, _)| dimension == game.dim.id());
-    if game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft) {
+    if game.native_sneaking() {
         if first.is_some() {
             let _ = game.player_attachments.remove(&FIRST);
             status(game, "create.super_glue.abort");
@@ -716,32 +796,15 @@ pub(super) fn right_click(game: &mut Game<'_>, pos: Pos, face: [i32; 3]) -> bool
         MAX_SELECTION_BLOCKS,
         |pos, side| sticky(game, pos, side),
     );
-    let _ = game.player_attachments.remove(&FIRST);
     let Ok(cluster) = planned else { return true };
     if !cluster.can_commit() {
         return true;
     }
     let volume = cluster.volume;
-    let [min, max] = volume.corners();
-    let key = column(min);
-    if column(max) != key {
-        status(game, "create.super_glue.too_far");
+    if insert(game, volume).is_err() {
         return true;
     }
-    let Ok(volumes) = read(game, key) else {
-        return true;
-    };
-    let mut volumes = volumes.into_owned();
-    if volumes.len() == MAX_VOLUMES {
-        return true;
-    }
-    volumes.push(volume);
-    let Ok(map) = game.native_attachments(Holder::Chunk(key)) else {
-        return true;
-    };
-    if map.set(&VOLUMES, volumes).is_err() {
-        return true;
-    }
+    let _ = game.player_attachments.remove(&FIRST);
     // 6.0.10's `collectGlueFromInventory` uses its durability path for both
     // calls. The first can break the selected glue. The second then selects
     // the next glue in ordinary inventory order, if one remains.

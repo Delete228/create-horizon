@@ -11,6 +11,9 @@ use crate::{kinetics::Pos, placement::Direction};
 
 use super::{Adhesion, BlockRules, CaptureView, Cell, QuarterTurn};
 
+/// The server accepts corner distances strictly below 25 blocks.
+pub const MAX_CORNER_DELTA: i32 = 24;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Volume {
     min: Pos,
@@ -112,12 +115,12 @@ impl Search {
     fn reaches(self, from: Pos, to: Pos) -> bool {
         let limit = match self {
             Self::Preview => 24,
-            Self::Commit => 25,
+            Self::Commit => MAX_CORNER_DELTA + 1,
         };
         let distance = (0..3)
             .map(|axis| (i128::from(from[axis]) - i128::from(to[axis])).pow(2))
             .sum::<i128>();
-        distance < limit * limit
+        distance < i128::from(limit).pow(2)
     }
 }
 

@@ -113,6 +113,30 @@ fn forced_push_and_snapshot_limits_report_the_block_that_prevents_capture() {
 }
 
 #[test]
+fn default_capacity_counts_payload_across_chunk_boundaries() {
+    let mut scene = Scene::default();
+    let anchor = [-16, 64, -2];
+    for x in -16..16 {
+        for y in 64..72 {
+            for z in -2..6 {
+                scene.insert([x, y, z], Block::Slime);
+            }
+        }
+    }
+    let capture = |scene: &Scene| Assembly::capture(scene, anchor, None, None, DEFAULT_MAX_BLOCKS);
+    let assembly = capture(&scene).unwrap();
+    assert_eq!(assembly.blocks().len(), 2048);
+    let destination = [32, 64, 32];
+    let turn = Rotation::new(destination, Axis::Y, 90.0).unwrap().snapped();
+    let landing = assembly.landing(destination, turn, |block, _| Some(*block), |_, _| true).unwrap();
+    let columns = landing.iter().map(|([x, _, z], _)| (x >> 4, z >> 4)).collect::<std::collections::HashSet<_>>();
+    assert!(columns.len() > 1);
+
+    scene.insert([16, 64, -2], Block::Plain);
+    assert_eq!(capture(&scene), Err(CaptureError::TooLarge { limit: 2048 }));
+}
+
+#[test]
 fn obstructed_or_unsupported_landing_keeps_the_complete_snapshot_for_retry() {
     let mut scene = Scene::default();
     scene.insert(ROOT, Block::Slime);

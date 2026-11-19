@@ -11,7 +11,6 @@ use super::{
     create_port_contraption_tank as tanks,
     create_port_piston::collides_at,
     create_port_portable_storage as psi,
-    create_port_super_glue as glue,
     native_block_entity_draw::BlockEntityDraw,
     native_world_draw::NativeWorldDraw,
 };
@@ -99,9 +98,8 @@ fn assemble(game: &mut Game<'_>, controller: Pos, rpm: f32) -> Option<u32> {
     })
     .ok()?;
     let origin = cargo_cell(controller, [0; 3], layout.initial_offset)?;
-    let volumes = glue::read(game, key).ok()?;
     let assembly = layout
-        .capture(&MountedCapture::for_rope_pulley(game, &volumes), MAX_PACKED_BLOCKS)
+        .capture(&MountedCapture::for_rope_pulley(game), MAX_PACKED_BLOCKS)
         .ok()?;
     let blocks = assembly.blocks().to_vec();
     if (blocks.len() > MAX_BLOCKS && blocks.iter().any(|(_, state)| !plain_packed_state(state)))

@@ -536,9 +536,10 @@ with the systems they depend on.
   capture and bounds restored after a cold native restart.
 - [x] Super Glue first-corner face particles and confirmed or removed volume
   edge particles.
-- [x] Offhand Super Glue for ordinary placements in one column.
-- [ ] Original Glue outlines, offhand particles for other players, and
-  transfer on other drivers.
+- [x] Stationary Super Glue across loaded columns with two-click selection,
+  ordinary offhand placement, removal and saved volume edges.
+- [ ] Original Glue selection preview and textured faces, offhand particles
+  for other players, and transfer across columns or on other drivers.
 - [x] Sticker redstone latch and bearing capture through its extended head.
 - [x] Sticker head interpolation and stationary attachment feedback.
 - [ ] Sticker bounce, wrench and computer interaction.

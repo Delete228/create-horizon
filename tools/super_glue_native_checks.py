@@ -51,9 +51,9 @@ def run(session, transfer=False):
         call('mouse', button, 'click')
         call('wait', 8)
 
-    def saved(keys=KEYS):
+    def saved(keys=KEYS, pos=A):
         call('save')
-        return read_saved_chunk_tag(session.scratch, A, keys, session.world)['nbt']
+        return read_saved_chunk_tag(session.scratch, pos, keys, session.world)['nbt']
 
     def block(pos):
         return call('block', *pos)['block']
@@ -209,16 +209,21 @@ def run(session, transfer=False):
             split_pivot = (1005, 99, 59)
             split_payload = (1005, 100, 59)
             split_motor = (1005, 98, 59)
+            split_corner = (1006, 100, 59)
             put(split_pivot, 'create:mechanical_bearing[facing=up]')
             put(split_payload, 'minecraft:stone')
+            # A bearing's output face rejects glue. Route this selection
+            # around that face while still enclosing the stationary bearing.
+            put((1006, 99, 59), 'minecraft:stone')
+            put(split_corner, 'minecraft:stone')
             command(f'item replace entity @s weapon.mainhand with {ITEM} 1')
             click(split_pivot)
             assert saved() == restored, saved()
-            click(split_payload, vantage=(1002.5, 99, 59.5))
+            click(split_corner)
             before = saved()
             volumes = before['value']['Volumes']['value']
             assert len(volumes) == 2 and volumes[-1] == {
-                'type': 'int-array', 'value': [*split_pivot, *split_payload]}, before
+                'type': 'int-array', 'value': [*split_pivot, *split_corner]}, before
             command('clear @s')
             put(split_motor, 'create:creative_motor[facing=up]{ScrollValue:32}')
             step(10)
@@ -269,6 +274,29 @@ def run(session, transfer=False):
             assert block(single) == block(sticky) == 'minecraft:air'
             assert saved()['value']['Volumes']['value'] == stationary
             report['cases']['single_cell_survives_restart'] = True
+
+        # The minimum corner can be two columns from the far end. The volume
+        # must stay in one save record and remain removable from either end.
+        start, end = (1007, 100, 66), (1025, 100, 66)
+        command('tick unfreeze')
+        command('gamemode survival')
+        command(f'item replace entity @s weapon.mainhand with {ITEM} 1')
+        command('tp @s 1016.5 99 63.5')
+        wait_loaded(call, [start, end])
+        command('fill 1005 98 63 1027 98 67 minecraft:smooth_stone')
+        command('fill 1005 99 63 1027 103 67 minecraft:air')
+        command(f'fill {xyz(start)} {xyz(end)} minecraft:stone')
+        click(end)
+        click(start)
+        assert selected_damage() == 2
+        stored = saved(pos=start)
+        assert stored['value']['Volumes']['value'] == [{'type': 'int-array', 'value': [*start, *end]}], stored
+        assert saved(pos=end) is None
+        session.restart()
+        assert saved(pos=start) == stored and saved(pos=end) is None
+        click(end, 'left')
+        assert saved(pos=start) is None and block(end) == 'minecraft:stone'
+        report['cases']['three_columns'] = {'damage': 2, 'volume': [*start, *end], 'removed': True}
 
         report['passed'] = True
     finally:

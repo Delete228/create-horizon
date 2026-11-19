@@ -22,6 +22,7 @@ def run():
     last_corner = (1003, 100, 55)
     support = (1002, 100, 58)
     placement = (1003, 100, 58)
+    boundary_start, boundary_end = (1007, 100, 66), (1025, 100, 66)
 
     def call(method, **body):
         return host.call(method, body)
@@ -39,8 +40,8 @@ def run():
         call('capture', name=f'{work.name}/{name}.png', frames=16)
         call('input', key=key, down=False)
 
-    def glue():
-        entities = call('entities', center=first_corner, radius=10)['entities']
+    def glue(center=first_corner):
+        entities = call('entities', center=center, radius=10)['entities']
         return [entity for entity in entities if entity['type'] == 'create:super_glue']
 
     def held():
@@ -50,8 +51,8 @@ def run():
         call('tick', frozen=True)
         cmd('gamemode creative')
         cmd('tp @s 1002.5 99 52.5')
-        cmd('forceload add 992 48 1023 63')
-        call('observe_ticks', ticks=20, positions=[first_corner])
+        cmd('forceload add 992 48 1039 79')
+        call('observe_ticks', ticks=20, positions=[first_corner, boundary_start, boundary_end])
         cmd('kill @e[type=create:super_glue,distance=..10]')
         cmd('fill 1000 98 51 1007 98 62 minecraft:smooth_stone')
         cmd('fill 1000 99 51 1007 106 62 minecraft:air')
@@ -95,8 +96,34 @@ def run():
         result['offhand_inventory'] = cmd('data get entity @s Inventory')['messages']
         assert len(result['offhand_added']) == 1, result
         assert '"minecraft:damage": 1' in result['offhand_inventory'][0], result
+
+        cmd('kill @e[type=create:super_glue,x=1016,y=100,z=66,distance=..10]')
+        cmd('fill 1005 98 63 1027 98 67 minecraft:smooth_stone')
+        cmd('fill 1005 99 63 1027 103 67 minecraft:air')
+        cmd(f'fill {xyz(boundary_start)} {xyz(boundary_end)} minecraft:stone')
+        cmd('clear @s')
+        cmd('item replace entity @s weapon.mainhand with create:super_glue 1')
+        center = (1016, 100, 66)
+        for corner, name in ((boundary_end, 'boundary-first'), (boundary_start, 'boundary-second')):
+            x, y, z = corner
+            hit = aim((x+.5, y-1, z-2.5), (x+.5, y+.5, z+.5))
+            assert tuple(hit['pos']) == corner, hit
+            click('use', name)
+        volumes = glue(center)
+        assert len(volumes) == 1 and volumes[0]['position'] == [1016.5, 100.0, 66.5], volumes
+        assert 'From:[-9.5d,0.0d,-0.5d]' in volumes[0]['nbt'], volumes
+        assert 'To:[9.5d,1.0d,0.5d]' in volumes[0]['nbt'], volumes
+        damage = held()
+        assert '"minecraft:damage": 2' in damage[0], damage
+        hit = aim((1025.5, 99, 63.5), (1025.5, 100.5, 66.5))
+        assert tuple(hit['pos']) == boundary_end, hit
+        click('attack', 'boundary-remove')
+        assert not glue(center) and held() == damage
+        result['three_columns'] = {'damage': 2, 'volume': [*boundary_start, *boundary_end], 'removed': True}
         result['passed'] = True
     finally:
+        cmd('forceload remove 992 48 1039 79')
+        call('tick', frozen=False)
         (work / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         (work / 'transcript.json').write_text(json.dumps(host.trace, indent=2) + '\n')
         print(json.dumps(dict(passed=result['passed'], result=str(work / 'result.json'))), flush=True)

@@ -62,7 +62,7 @@ def scenarios(session, reference, report):
         stock = ' '.join(command('data get entity @s SelectedItem.count'))
         return int(re.search(r'\b(\d+)\s*$', stock)[1])
 
-    def check(name, *, pos=TARGET, placement=True, **aim):
+    def check(name, *, pos=TARGET, placement=True, reference_name=None, **aim):
         before = call('state')['held']['count']
         before_server = server_stock()
         tap(**aim)
@@ -70,21 +70,18 @@ def scenarios(session, reference, report):
         server_count = server_stock()
         stack = call('inventory')['offhand']
         damage = stack.get('damage', 0) if stack and stack.get('item') == GLUE else None
-        actual = dict(block=call('block', *pos)['block'], damage=damage, volumes=saved(pos),
+        against = aim.get('aimed', SUPPORT)
+        actual = dict(block=call('block', *pos)['block'], damage=damage, volumes=saved(against),
                       consumed=before - snapshot['held']['count'],
                       server_consumed=before_server - server_count)
         report['cases'][name] = actual
-        expected = reference[name]
+        expected = reference[reference_name or name]
         assert actual['block'] == expected['block'], (name, actual, expected)
         expected_spent = int(placement and snapshot['gamemode'] != 'creative')
         assert actual['consumed'] == actual['server_consumed'] == expected_spent, (name, actual)
-        if name == 'crosses_column_boundary':
-            assert not actual['volumes'] and actual['damage'] == 0 and not saved(WIDE), actual
-            actual['known_java_difference'] = 'Cross-column glue volumes are not supported'
-        else:
-            assert actual['damage'] == expected['damage'], (name, actual, expected)
-            wanted = [[*SUPPORT, *TARGET]] if expected['entities'] else []
-            assert actual['volumes'] == wanted, (name, actual, expected)
+        assert actual['damage'] == expected['damage'], (name, actual, expected)
+        wanted = [[*against, *pos]] if expected['entities'] else []
+        assert actual['volumes'] == wanted, (name, actual, expected)
 
     command('tp @s ' + xyz(VIEW))
     wait_loaded(call, [TARGET, WIDE_TARGET])
@@ -130,16 +127,24 @@ def scenarios(session, reference, report):
     equip()
     check('crosses_column_boundary', pos=WIDE_TARGET, aimed=WIDE,
           pos_view=(1267.4, 104, 109.5))
+    session.restart()
+    wait_loaded(call, [WIDE, WIDE_TARGET])
+    assert saved(WIDE) == [[*WIDE, *WIDE_TARGET]] and not saved(WIDE_TARGET)
+    assert call('inventory')['offhand']['damage'] == 1
+    command(place(WIDE_TARGET, AIR))
+    check('cross_column_replacement', pos=WIDE_TARGET, aimed=WIDE, reference_name='already_glued',
+          pos_view=(1267.4, 104, 109.5))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ('game', 'resources', 'ctl', 'reference'):
         parser.add_argument('--' + key, required=True, type=Path)
+    parser.add_argument('--create-jar', type=Path)
     args = parser.parse_args()
     java = json.loads(args.reference.read_text())
     assert java['passed'] and java['source'] == PINS['create_revision']
-    session = NativeCheckSession(args.game, args.resources, args.ctl, None,
+    session = NativeCheckSession(args.game, args.resources, args.ctl, args.create_jar,
                                  name='glue-offhand', world='SuperGlueOffhand')
     print(session.scratch, flush=True)
     report = dict(passed=False, source=java['source'], cases={})

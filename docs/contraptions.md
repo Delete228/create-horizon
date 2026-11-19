@@ -40,9 +40,12 @@ half-turn about X or Z flips their top or bottom state at landing. A vertical
 Mechanical Bearing can carry a Deployer.
 
 A Mechanical Bearing, Windmill Bearing or Rope Pulley can carry up to 2,048
-blocks of eligible plain stone, slime, glass, terracotta, wool or concrete.
-The source and landing positions must fit in one loaded column. Bearings also
-check their snapped rotations. A dry vertical Mechanical Piston can also
+eligible full blocks, including stone, slime, glass, terracotta, wool, concrete,
+logs, planks and the listed Create building blocks. The source and landing
+positions must fit in one loaded column. Bearings check their snapped
+rotations. An upright Mechanical Bearing or Windmill Bearing can carry a
+payload taller than one section because its axis stays in the same column.
+A dry vertical Mechanical Piston can also
 carry 2,048 total blocks, including its full moving head and pole train.
 A Gantry accepts 2,047 eligible plain blocks and the carriage when the cargo
 fits in its column across the rail. Other cargo and drivers retain the
@@ -163,26 +166,28 @@ on a block or change the held item to clear the first corner. With glue in hand,
 attack a block through an existing volume to remove that volume. Survival uses
 the two durability calls in Create 6.0.10. Creative leaves the item intact.
 
-Volumes currently fit in one loaded chunk column. Mechanical and Windmill
-Bearings transfer them with their payload and restore them at the snapped
-landing pose. Gantry, dry Rope Pulley and Mechanical Pistons transfer volumes
+Stationary volumes span loaded chunk columns and are saved in the column of
+their minimum corner. Mechanical and Windmill Bearings transfer a volume within
+the controller's column and restore it at the snapped landing pose. Gantry,
+dry Rope Pulley and Mechanical Pistons also transfer single-column volumes
 relative to their current cargo origin, including starts away from zero stroke.
 A piston carries glue on its cargo. A volume that crosses its head or pole
 is refused before assembly.
 A volume that would be split or include a stationary block stops capture.
 The mounted volume shares the chunk save with the structure. The first corner
 emits a slime-ball burst on the clicked face. Confirming or removing the volume
-emits particles at half-block intervals along its edges. Selection outlines
-and transfer on other drivers remain open.
+emits particles at half-block intervals along its edges. Hold Super Glue in
+the main hand to see the saved volume edges. The original textured faces,
+selection preview and transfer across columns remain open.
 
 Hold Super Glue in your offhand while placing an ordinary block to glue it
 to the face you placed it against. A new connection uses one point of durability in
 survival. Replacing a block inside an existing glue volume uses none.
 A placement ray that hits a nonadjacent block cancels the placement. A ray
 that misses allows ordinary placement without glue.
-Offhand placement works within one loaded chunk column. Fluid-specific and
-Create alias placement paths, custom glue entity data, and the face burst
-for other players tracking the placement are still pending.
+Offhand placement also applies across a chunk boundary. Fluid-specific and
+Create alias placement paths, custom glue entity data, and the face burst for
+other players tracking the placement are still pending.
 
 ## Mounted inventory
 
@@ -278,10 +283,12 @@ coupling corrections. The pinned Java sources are `CartAssemblerBlock`,
 `CartAssemblerBlockEntity`, `MountedContraption`, `OrientedContraptionEntity`,
 `CouplingHandler` and `CouplingPhysics`.
 
-The native adapter still needs cart-aware rail lookup and collision shapes,
-an authoritative rail-pass callback, and a moving payload saved and synced
-with the cart. Coupled movement also needs the two carts' persistent links and
-controller motion. The current implementation is exercised by Rust unit tests.
+Horizon Nightly 9f42064 has entity ticks and motion handles, but its minecart
+rail lookup only accepts vanilla rail IDs. In-development rail registration
+and `BlockPart::minecart_pass` are part of [Horizon #16941](https://github.com/horizon-rust/horizon/pull/16941).
+Cart-specific collision context, a durable mounted payload, and the two carts'
+persistent links still need integration. The current engine is exercised by
+Rust unit tests and the Java reference checks below.
 
 ## Verification
 
@@ -321,10 +328,12 @@ controller motion. The current implementation is exercised by Rust unit tests.
   bit with `CouplingPhysics.followLinkOnRail` in the original JAR.
 - `tools/super_glue_reference_checks.py` observes the original selection,
   durability and removal. `tools/super_glue_native_checks.py --transfer` reads
-  saved volumes before and after restart, removal and bearing landing.
+  saved volumes before and after restart, removal and bearing landing, and
+  checks selection and removal across three columns.
 - `tools/super_glue_offhand_checks.py` and
   `tools/super_glue_offhand_native_checks.py` check ordinary block placement,
-  survival durability, nonadjacent cancellation and a refused support face.
+  survival durability, nonadjacent cancellation, a refused support face and
+  placement across a chunk boundary.
 - `tools/sticker_checks.py` compares rising and falling redstone edges,
   placement next to a powered block and five bearing capture layouts.
 - `tools/contraption_collision_checks.py --player --piston --side` verifies

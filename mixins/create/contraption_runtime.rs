@@ -30,7 +30,7 @@ use horizon_client::collisions::LookupCollisions;
 use horizon_client_render::create_contraption_scene::{
     ACTIVE, ACTOR_VISUAL_KEY, ClockHand, KEY, MAX_BLOCKS, MAX_PACKED_BLOCKS, MAX_RECORDS,
     POSE_KEY, POSES as POSE_ATTACHMENT, RECORDS, Record, StrokeKind, TANK_STORAGE_KEY, apply_scene_sync, dry_slab_type,
-    dry_straight_stair, plain_packed_state, plan_scene_update, read, solid_create_payload,
+    dry_straight_stair, plain_packed_state, plan_scene_update, read, rotary_local_limits,
     vanilla_stair,
 };
 use horizon_core::position::BlockPos;
@@ -365,17 +365,10 @@ pub(super) fn commit(
     true
 }
 
-// These 1.21.1 wood families carry the same plain or pillar states in Horizon.
-const WOOD_FAMILIES: &[&str] = &[
-    "oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "bamboo",
-    "crimson", "warped",
-];
-
 fn supported(state: &BlockState) -> bool {
     if super::create_port_sail::from_state(state).is_some()
         || dry_slab_type(state).is_some()
         || dry_straight_stair(state)
-        || solid_create_payload(state)
         || plain_packed_state(state)
     {
         return true;
@@ -387,34 +380,8 @@ fn supported(state: &BlockState) -> bool {
             .is_some_and(|wet| wet == "false"),
         "create:mechanical_saw" => true,
         sticker::BLOCK => sticker::decode(state).is_some(),
-        name => {
-            let Some(name) = name.strip_prefix("minecraft:") else {
-                return false;
-            };
-            if state.properties.is_empty() {
-                return name == "honey_block" || name
-                    .strip_suffix("_planks")
-                    .is_some_and(|wood| WOOD_FAMILIES.contains(&wood));
-            }
-            let wood = name.strip_prefix("stripped_").unwrap_or(name);
-            let pillar = ["_log", "_wood", "_stem", "_hyphae", "_block"]
-                .iter()
-                .any(|suffix| {
-                    wood.strip_suffix(suffix).is_some_and(|kind| {
-                        if *suffix == "_block" {
-                            kind == "bamboo"
-                        } else {
-                            WOOD_FAMILIES.contains(&kind)
-                        }
-                    })
-                });
-            pillar
-                && state.properties.len() == 1
-                && state
-                    .properties
-                    .get("axis")
-                    .is_some_and(|axis| matches!(axis.as_str(), "x" | "y" | "z"))
-        }
+        "minecraft:honey_block" => state.properties.is_empty(),
+        _ => false,
     }
 }
 
@@ -480,6 +447,9 @@ impl CaptureView for Capture<'_, '_> {
                 "minecraft:honey_block" => Adhesion::Honey,
                 _ => Adhesion::None,
             },
+            // AttachedActorBlock carries the tool with the block behind it.
+            attached: contraption_attachment_faces(block),
+            unsupported_faces: Direction::ALL.map(|face| !sticker::target_supports(block, face)),
             ..BlockRules::default()
         };
         Cell::Block(rules)
@@ -562,6 +532,16 @@ impl CaptureView for Capture<'_, '_> {
     }
 }
 
+fn contraption_attachment_faces(block: &BlockState) -> [bool; 6] {
+    let mut attached = [false; 6];
+    if matches!(block.name.as_str(), "create:mechanical_harvester" | actors::PLOUGH)
+        && let Some(direction) = actor_facing(block)
+    {
+        attached[direction.opposite() as usize] = true;
+    }
+    attached
+}
+
 pub(super) struct MountedCapture<'g, 'a> {
     base: Capture<'g, 'a>,
     allow_chest: bool,
@@ -571,15 +551,10 @@ pub(super) struct MountedCapture<'g, 'a> {
     allow_chassis: bool,
     allow_sticker: bool,
     allow_tank: bool,
-    glue: &'g [create_engine::contraption::glue::Volume],
 }
 
 impl<'g, 'a> MountedCapture<'g, 'a> {
-    pub(super) fn for_linear(
-        game: &'g Game<'a>,
-        glue: &'g [create_engine::contraption::glue::Volume],
-        allow_psi: bool,
-    ) -> Self {
+    pub(super) fn for_linear(game: &'g Game<'a>, allow_psi: bool) -> Self {
         Self {
             base: Capture(game),
             allow_chest: true,
@@ -589,17 +564,13 @@ impl<'g, 'a> MountedCapture<'g, 'a> {
             allow_chassis: true,
             allow_sticker: false,
             allow_tank: false,
-            glue,
         }
     }
 
-    pub(super) fn for_rope_pulley(
-        game: &'g Game<'a>,
-        glue: &'g [create_engine::contraption::glue::Volume],
-    ) -> Self {
+    pub(super) fn for_rope_pulley(game: &'g Game<'a>) -> Self {
         Self {
             allow_tank: true,
-            ..Self::for_linear(game, glue, true)
+            ..Self::for_linear(game, true)
         }
     }
 }
@@ -684,7 +655,7 @@ impl CaptureView for MountedCapture<'_, '_> {
     }
 
     fn glued(&self, p: Pos, face: Direction) -> bool {
-        self.glue.iter().any(|volume| volume.glues(p, face))
+        super::create_port_super_glue::glued(self.base.0, p, face)
     }
 
     fn expand(
@@ -750,7 +721,6 @@ fn assemble(
     }
     let allow_mounted_data = !windmill && facing.axis() == Axis::Y;
     let shape = {
-        let glue = super::create_port_super_glue::read(game, key).ok()?;
         let capture = MountedCapture {
             base: Capture(game),
             allow_chest: allow_mounted_data,
@@ -760,7 +730,6 @@ fn assemble(
             allow_chassis: allow_mounted_data,
             allow_sticker: !windmill,
             allow_tank: allow_mounted_data,
-            glue: &glue,
         };
         Assembly::capture(&capture, anchor, Some(controller), None, MAX_PACKED_BLOCKS).ok()?
     };
@@ -792,12 +761,13 @@ fn assemble(
         0.0
     };
     let axis = facing.axis();
+    let limits = rotary_local_limits(axis.index());
     for degrees in [0.0, 90.0, 180.0, 270.0] {
         let turn = Rotation::new(anchor, axis, degrees).unwrap().snapped();
         if shape.blocks().iter().any(|&(local, _)| {
             turn.place(anchor, local)
                 .is_none_or(|p| column(p) != key || !resident(game, p))
-                || local.iter().any(|v| v.unsigned_abs() > 15)
+                || local.iter().zip(limits).any(|(v, limit)| v.unsigned_abs() > limit)
         }) {
             return None;
         }
@@ -1854,6 +1824,26 @@ pub(super) fn tick_windmill(
 mod payload_tests {
     use super::*;
     use horizon_client_render::create_contraption_scene::full_cube_payload;
+
+    #[test]
+    fn mounted_tools_attach_behind_and_do_not_drag_from_their_working_face() {
+        for (name, attaches) in [
+            ("create:mechanical_harvester", true),
+            (actors::PLOUGH, true),
+            ("create:mechanical_drill", false),
+            ("create:mechanical_saw", false),
+            (psi::BLOCK, false),
+        ] {
+            let block = BlockState {
+                name: name.into(),
+                properties: [("facing".into(), "east".into())].into(),
+            };
+            for face in Direction::ALL {
+                assert_eq!(contraption_attachment_faces(&block)[face as usize], attaches && face == Direction::West, "{name}");
+                assert_eq!(sticker::target_supports(&block, face), face != Direction::East, "{name}");
+            }
+        }
+    }
 
     #[test]
     fn dry_slab_landing_matches_java_structure_transform() {

@@ -17,7 +17,7 @@ use horizon_world::{
     attachments::{AttachmentCodec, AttachmentError, AttachmentType, Holder},
     nbt::{Compound, Tag},
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 type Mounted = BTreeMap<Pos, Vec<Volume>>;
 const MOUNTED: AttachmentType<Mounted> = AttachmentType {
@@ -165,11 +165,14 @@ pub(super) fn capture(
     if mounted.contains_key(&record.controller) {
         return Err(error);
     }
+    let footprint = Footprint::at(record, origin, QuarterTurn::IDENTITY).ok_or(error)?;
+    if intersects_static(game, &footprint.cargo, Some(key))? {
+        return Err(error);
+    }
     let static_volumes = glue::read(game, key)?;
     if static_volumes.is_empty() {
         return Ok(None);
     }
-    let footprint = Footprint::at(record, origin, QuarterTurn::IDENTITY).ok_or(error)?;
     let mut retained = Vec::new();
     let mut moving = Vec::new();
     for &volume in static_volumes.iter() {
@@ -239,21 +242,37 @@ pub(super) fn landing(
 /// transfer it. Supported drivers remove their verified static data first.
 pub(super) fn blocked(
     game: &Game<'_>,
-    key: [i32; 2],
+    _key: [i32; 2],
     cells: impl IntoIterator<Item = Pos>,
 ) -> bool {
-    let mut cells = cells.into_iter().peekable();
-    if cells.peek().is_none() {
-        return false;
+    intersects_static(game, &cells.into_iter().collect(), None).unwrap_or(true)
+}
+
+fn intersects_static(
+    game: &Game<'_>,
+    cells: &HashSet<Pos>,
+    except: Option<[i32; 2]>,
+) -> Result<bool, AttachmentError> {
+    let owners = cells
+        .iter()
+        .flat_map(|&position| glue::possible_owners(position))
+        .collect::<BTreeSet<_>>();
+    for owner in owners {
+        if Some(owner) == except {
+            continue;
+        }
+        let volumes = match glue::read(game, owner) {
+            Ok(volumes) => volumes,
+            Err(AttachmentError::MissingHolder) => continue,
+            Err(error) => return Err(error),
+        };
+        if volumes.iter().any(|volume| {
+            !volume.is_single_block() && cells.iter().any(|&position| volume.contains(position))
+        }) {
+            return Ok(true);
+        }
     }
-    match glue::read(game, key) {
-        Ok(volumes) => cells.any(|position| {
-            volumes
-                .iter()
-                .any(|volume| !volume.is_single_block() && volume.contains(position))
-        }),
-        Err(_) => true,
-    }
+    Ok(false)
 }
 
 pub(super) fn commit(
